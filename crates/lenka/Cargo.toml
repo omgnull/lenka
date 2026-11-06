@@ -1,0 +1,71 @@
+[package]
+name = "lenka"
+description = "AI-first project management and collaboration tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "lenka"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lenka"
+path = "src/main.rs"
+
+[features]
+default = ["tasks", "artifacts", "memory", "git", "mcp", "desktop"]
+tasks = ["dep:lenka-tasks"]
+artifacts = ["tasks", "dep:lenka-artifacts"]
+memory = ["dep:lenka-memory"]
+git = ["dep:lenka-git"]
+mcp = ["dep:lenka-mcp"]
+desktop = ["dep:lenka-desktop"]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+lenka-artifact-fs.workspace = true
+lenka-artifacts = { workspace = true, optional = true }
+lenka-core.workspace = true
+lenka-desktop = { workspace = true, optional = true }
+lenka-driver-local.workspace = true
+lenka-git = { workspace = true, optional = true }
+lenka-mcp = { workspace = true, optional = true }
+lenka-memory = { workspace = true, optional = true }
+lenka-plugin-api.workspace = true
+lenka-tasks = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["process"] }
+
+[[test]]
+name = "cli"
+required-features = ["tasks", "artifacts", "memory"]
+
+[[test]]
+name = "git"
+required-features = ["tasks", "artifacts", "git"]
+
+[[test]]
+name = "hook"
+required-features = ["tasks"]
+
+[[test]]
+name = "mcp"
+required-features = ["tasks", "artifacts", "memory", "mcp"]
+
+[[test]]
+name = "contract"
+required-features = ["tasks", "artifacts", "mcp"]

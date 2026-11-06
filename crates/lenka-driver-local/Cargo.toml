@@ -1,0 +1,20 @@
+[package]
+name = "lenka-driver-local"
+description = "Local directory storage driver of lenka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lenka-core.workspace = true
+lenka-plugin-api.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

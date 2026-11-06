@@ -23,6 +23,10 @@ gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
 
 Dependabot updates the pinned SHAs. CI installs Rust with `rustup` from the runner image, not with a third-party action.
 
+## Workspace builds in CI
+
+`--all-features` does not find a feature combination that fails to compile. CI therefore also builds the minimal feature set and each plugin alone. Add a new plugin feature to the `features` job in `.github/workflows/ci.yml`.
+
 ## Lints in CI
 
 CI runs clippy with `-D warnings`, so a lint at the `warn` level stops CI when it fires. Run the clippy command in [`CLAUDE.md`](../../CLAUDE.md#commands) after you add a lint to `Cargo.toml`.
