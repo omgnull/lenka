@@ -308,6 +308,8 @@ fn person_options_change_type_coordinator_status_and_claims() -> TestResult {
             "1",
             "--type",
             "bug",
+            "--reason",
+            "This is a bug.",
             "--coordinated",
             "true",
         ],
@@ -854,5 +856,28 @@ fn the_guidance_says_that_a_name_selects_one_inbox() -> TestResult {
     let repo = machine.repo("api")?;
     let output = machine.ok(&repo, &["init"])?;
     assert!(output.contains("the same LENKA_AGENT"), "{output}");
+    Ok(())
+}
+
+#[test]
+fn a_person_lets_an_agent_continue_a_loop_with_one_option() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let created = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&created, "task");
+    let args = [
+        "task",
+        "update",
+        id,
+        "--version",
+        "1",
+        "--loop-until-done",
+        "true",
+    ];
+    machine.json(&repo, &args)?;
+    let shown = machine.json(&repo, &["task", "show", id])?;
+    assert_eq!(shown["task"]["loop_until_done"], true);
+    let printed = machine.ok(&repo, &["task", "show", id])?;
+    assert!(printed.contains("until the task is done"), "{printed}");
     Ok(())
 }

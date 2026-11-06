@@ -356,7 +356,7 @@ impl ArtifactService {
         let checks = vec![TextCheck::new("reason", reason)];
         secret::check(&checks, SecretPolicy::Enforce)?;
         self.tasks.check_artifact_coordinator(id, caller, claim)?;
-        let loop_op = self.tasks.check_artifact_loop(caller, &id.to_string())?;
+        let loop_op = self.tasks.check_artifact_loop(caller, id)?;
         self.tasks.with_artifact_write(|locked, routing, now| {
             let mut record = read_artifact(&self.project, id)?.ok_or_else(|| missing(id))?;
             locked.check_version("The artifact", record.version, expected_version)?;

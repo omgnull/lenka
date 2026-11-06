@@ -446,6 +446,8 @@ mod tests {
                     status: Status::Todo,
                     stage: stage.to_owned(),
                     unblocked: false,
+                    loop_stopped: false,
+                    loop_until_done: false,
                 },
                 has_plan: false,
                 stamps: [None, None, None],

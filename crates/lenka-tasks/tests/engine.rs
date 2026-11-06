@@ -2540,3 +2540,388 @@ fn a_refused_person_learns_about_the_override() -> Result<()> {
     assert!(message.contains("task.entry.add"), "{message}");
     Ok(())
 }
+
+fn text_change(version: u64) -> TaskPatch {
+    TaskPatch {
+        expected_version: version,
+        description: Some(format!("Text {version}")),
+        reason: Some("A change.".to_owned()),
+        ..TaskPatch::default()
+    }
+}
+
+/// Makes agent changes until the loop limit stops the task.
+fn reach_loop_limit(service: &TaskService, agent: &Caller, id: TaskId) -> Result<()> {
+    for version in 1..=5 {
+        service.update(agent, id, text_change(version))?;
+    }
+    assert_eq!(
+        code(service.update(agent, id, text_change(6))),
+        ErrorCode::LoopLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn an_agent_cannot_claim_a_task_at_the_loop_limit_until_a_person_acts() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+
+    assert_eq!(
+        code(service.claim(&agent, Some(id), None, None)),
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(
+        code(service.update(&agent, id, text_change(6))),
+        ErrorCode::LoopLimit
+    );
+    // Time does not end the stop, and neither does a loss of the runtime data.
+    fx.clock.advance_ms(3 * HOUR_MS);
+    let loops = fx.data_dir("api").join(".runtime/loops");
+    fs::remove_dir_all(&loops).map_err(|err| LenkaError::io("remove", &err))?;
+    assert_eq!(
+        code(service.claim(&agent, Some(id), None, None)),
+        ErrorCode::LoopLimit
+    );
+    assert_eq!(
+        code(service.update(&agent, id, text_change(6))),
+        ErrorCode::LoopLimit
+    );
+    let state = fs::read_to_string(task_file(&fx, id, "state.toml"))
+        .map_err(|err| LenkaError::io("read", &err))?;
+    assert!(state.contains("loop_stopped = true"), "{state}");
+    Ok(())
+}
+
+#[test]
+fn a_status_change_by_a_person_ends_the_loop_stop() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    let state = service.set_status(&human, id, Status::Todo, &ClaimRef::Implicit)?;
+    assert!(!state.loop_stopped);
+    service.claim(&agent, Some(id), None, None)?;
+    Ok(())
+}
+
+#[test]
+fn a_claim_by_a_person_ends_the_loop_stop() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    service.claim(&human, Some(id), None, None)?;
+    service.finish(&human, id, &ClaimRef::Implicit, &Finish::Released)?;
+    service.claim(&agent, Some(id), None, None)?;
+    // The person also started a new count.
+    service.update(&agent, id, text_change(6))?;
+    Ok(())
+}
+
+#[test]
+fn a_person_can_let_an_agent_continue_the_loop_until_the_task_is_done() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    let mark = |value: bool, version: u64| TaskPatch {
+        expected_version: version,
+        loop_until_done: Some(value),
+        ..TaskPatch::default()
+    };
+    // An agent cannot set this mark.
+    assert_eq!(
+        code(service.update(&agent, id, mark(true, 6))),
+        ErrorCode::ActorDenied
+    );
+
+    let meta = service.update(&human, id, mark(true, 6))?;
+    assert!(meta.state.loop_until_done);
+    assert!(!meta.state.loop_stopped);
+    assert_ne!(meta.state.status, Status::Paused, "the task is ready again");
+    assert_eq!(ready_ids(&service, &agent)?.len(), 1);
+
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let handle = ClaimRef::Handle(claim.handle);
+    let mut version = meta.state.version;
+    for _ in 0..20 {
+        let patch = TaskPatch {
+            claim: handle.clone(),
+            ..text_change(version)
+        };
+        version = service.update(&agent, id, patch)?.state.version;
+    }
+    let done = service.finish(&agent, id, &handle, &finish_done())?;
+    assert!(!done.state.loop_until_done, "the mark ends with the task");
+
+    // A reopened task has the limit again.
+    service.set_status(&human, id, Status::Todo, &ClaimRef::Implicit)?;
+    for _ in 0..5 {
+        version = service
+            .update(&agent, id, text_change(version))?
+            .state
+            .version;
+    }
+    assert_eq!(
+        code(service.update(&agent, id, text_change(version))),
+        ErrorCode::LoopLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn a_person_can_remove_the_loop_mark() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    let on = TaskPatch {
+        expected_version: 1,
+        loop_until_done: Some(true),
+        ..TaskPatch::default()
+    };
+    let version = service.update(&human, id, on)?.state.version;
+    let off = TaskPatch {
+        expected_version: version,
+        loop_until_done: Some(false),
+        ..TaskPatch::default()
+    };
+    let meta = service.update(&human, id, off)?;
+    assert!(!meta.state.loop_until_done);
+    let mut version = meta.state.version;
+    for _ in 0..5 {
+        version = service
+            .update(&agent, id, text_change(version))?
+            .state
+            .version;
+    }
+    assert_eq!(
+        code(service.update(&agent, id, text_change(version))),
+        ErrorCode::LoopLimit
+    );
+    Ok(())
+}
+
+#[test]
+fn a_closed_task_changes_only_by_an_explicit_reopen() -> Result<()> {
+    for closed in [Status::Done, Status::Cancelled] {
+        let fx = fixture()?;
+        let service = fx.project("api")?;
+        let (agent, human) = (fx.agent("a"), fx.human());
+        feature_stages(&service)?;
+        let id = service
+            .create(
+                &human,
+                NewTask {
+                    kind: "feature".to_owned(),
+                    ..task("T")
+                },
+            )?
+            .id();
+        if closed == Status::Done {
+            service.finish(&human, id, &ClaimRef::Override, &finish_done())?;
+        } else {
+            service.set_status(&human, id, closed, &ClaimRef::Implicit)?;
+        }
+        let before = fs::read_dir(task_file(&fx, id, "entries")).map_or(0, Iterator::count);
+
+        for who in [&agent, &human] {
+            let patch = TaskPatch {
+                expected_version: 1,
+                title: Some("New".to_owned()),
+                ..TaskPatch::default()
+            };
+            assert_eq!(
+                code(service.update(who, id, patch)),
+                ErrorCode::InvalidArgument,
+                "update by {}",
+                who.label
+            );
+        }
+        assert_eq!(
+            code(service.advance(&human, id, &ClaimRef::Override, "It works.", None)),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(service.finish(&human, id, &ClaimRef::Override, &finish_done())),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(service.finish(&human, id, &ClaimRef::Override, &Finish::Released)),
+            ErrorCode::InvalidArgument
+        );
+        let detail = service.detail(id, &[])?;
+        assert_eq!(detail.meta.state.status, closed);
+        assert_eq!(detail.meta.state.version, 1);
+        assert_eq!(
+            fs::read_dir(task_file(&fx, id, "entries")).map_or(0, Iterator::count),
+            before,
+            "a refused finish adds no evidence"
+        );
+
+        let state = service.set_status(&human, id, Status::Todo, &ClaimRef::Implicit)?;
+        assert_eq!(state.status, Status::Todo);
+        assert!(!state.unblocked, "a reopened task blocks its dependents");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_closed_parent_has_no_open_children() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let parent = create(&service, &human, "Parent")?;
+    let child = |parent: TaskId| NewTask {
+        parent: Some(parent),
+        ..task("Child")
+    };
+    let first = service.create(&human, child(parent))?.id();
+    assert_eq!(
+        code(service.set_status(&human, parent, Status::Cancelled, &ClaimRef::Implicit)),
+        ErrorCode::Blocked
+    );
+    service.set_status(&human, first, Status::Cancelled, &ClaimRef::Implicit)?;
+    service.finish(&human, parent, &ClaimRef::Override, &finish_done())?;
+
+    assert_eq!(
+        code(service.create(&human, child(parent))),
+        ErrorCode::InvalidArgument
+    );
+    let free = create(&service, &human, "Free")?;
+    let patch = TaskPatch {
+        expected_version: 1,
+        parent: Some(Some(parent)),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&human, free, patch)),
+        ErrorCode::InvalidArgument
+    );
+    // A child cannot open again below a closed parent.
+    assert_eq!(
+        code(service.set_status(&human, first, Status::Todo, &ClaimRef::Implicit)),
+        ErrorCode::InvalidArgument
+    );
+    Ok(())
+}
+
+#[test]
+fn a_type_change_updates_the_state_and_the_claim_and_gives_a_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    feature_stages(&service)?;
+    let id = create(&service, &human, "T")?;
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let patch = TaskPatch {
+        expected_version: 1,
+        kind: Some("feature".to_owned()),
+        reason: Some("This is a larger task.".to_owned()),
+        claim: ClaimRef::Override,
+        ..TaskPatch::default()
+    };
+    let meta = service.update(&human, id, patch)?;
+    let stage = meta.state.stage.clone();
+    assert!(!meta.state.unblocked);
+
+    let notes = service.call_notes(&agent)?;
+    assert_eq!(notes.unread.len(), 1);
+    assert_eq!(notes.unread[0].changed, vec!["type"]);
+    let holder = fs::read_to_string(
+        fx.data_dir("api")
+            .join(".runtime/claims")
+            .join(format!("{id}.toml")),
+    )
+    .map_err(|err| LenkaError::io("read", &err))?;
+    assert!(holder.contains(&format!("stage = \"{stage}\"")), "{holder}");
+    assert!(holder.contains(&claim.handle));
+    Ok(())
+}
+
+#[test]
+fn a_type_change_makes_a_task_block_its_dependents_again() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    feature_stages(&service)?;
+    let new = NewTask {
+        kind: "feature".to_owned(),
+        ..task("T")
+    };
+    let id = service.create(&human, new)?.id();
+    for _ in 0..2 {
+        service.advance(&human, id, &ClaimRef::Implicit, "It works.", None)?;
+    }
+    assert!(service.detail(id, &[])?.meta.state.unblocked);
+    let patch = TaskPatch {
+        expected_version: 1,
+        kind: Some("task".to_owned()),
+        reason: Some("This is a small task.".to_owned()),
+        ..TaskPatch::default()
+    };
+    let meta = service.update(&human, id, patch)?;
+    assert!(!meta.state.unblocked, "{:?}", meta.state);
+    Ok(())
+}
+
+#[test]
+fn a_type_update_can_repair_a_stage_that_the_type_does_not_have() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = create(&service, &human, "T")?;
+    let stage = service.detail(id, &[])?.meta.state.stage;
+    hand_edit(
+        &fx,
+        id,
+        "state.toml",
+        &format!("stage = \"{stage}\""),
+        "stage = \"gone\"",
+    )?;
+    let kind = service.detail(id, &[])?.meta.front.kind;
+    let patch = TaskPatch {
+        expected_version: 1,
+        kind: Some(kind),
+        ..TaskPatch::default()
+    };
+    let meta = service.update(&human, id, patch)?;
+    assert_eq!(meta.state.stage, stage);
+    Ok(())
+}
+
+#[test]
+fn an_invalid_blocker_with_no_record_stops_a_claim() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let blocker = create(&service, &human, "Blocker")?;
+    let id = service
+        .create(
+            &human,
+            NewTask {
+                blocked_by: vec![Link::Local(blocker)],
+                ..task("T")
+            },
+        )?
+        .id();
+    // All files of the blocker are invalid, so no record remains.
+    let root = fx.data_dir("api").join("tasks").join(blocker.to_string());
+    fs::remove_dir_all(root.join("versions")).map_err(|err| LenkaError::io("remove", &err))?;
+    fs::write(root.join("task.md"), "not a task").map_err(|err| LenkaError::io("write", &err))?;
+    fs::write(root.join("state.toml"), "not a state")
+        .map_err(|err| LenkaError::io("write", &err))?;
+    service.reindex(&human)?;
+    assert_eq!(
+        code(service.claim(&agent, Some(id), None, None)),
+        ErrorCode::Blocked
+    );
+    Ok(())
+}

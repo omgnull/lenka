@@ -163,6 +163,8 @@ fn load_with_open_state(driver: &dyn StorageDriver, id: TaskId) -> Option<TaskMe
         status: crate::model::Status::Todo,
         stage: String::new(),
         unblocked: false,
+        loop_stopped: false,
+        loop_until_done: false,
     };
     Some(TaskMeta {
         front,

@@ -229,6 +229,12 @@ pub struct State {
     /// Tells if the task completed its `unblocks` stage.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unblocked: bool,
+    /// Tells if the loop limit stopped this task. An agent cannot claim it until a person acts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_stopped: bool,
+    /// Tells if a person lets an agent continue the loop until the task is done.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub loop_until_done: bool,
 }
 
 /// The kind of an entry.

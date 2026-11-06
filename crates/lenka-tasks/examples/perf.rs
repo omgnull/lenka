@@ -91,6 +91,8 @@ fn generate(dir: &Path, count: usize) -> Result<()> {
             },
             stage: "work".to_owned(),
             unblocked: false,
+            loop_stopped: false,
+            loop_until_done: false,
         };
         let state_text =
             toml::to_string(&state).map_err(|err| LenkaError::invalid_file(err.to_string()))?;
@@ -189,6 +191,8 @@ fn run(dir: &Path) -> Result<()> {
     let rows = service.board_rows()?;
     let targets: Vec<(TaskId, u64)> = rows
         .iter()
+        // A closed task cannot change.
+        .filter(|row| !row.meta.state.status.is_closed())
         .take(200)
         .map(|row| (row.meta.id(), row.meta.state.version))
         .collect();

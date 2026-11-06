@@ -232,6 +232,10 @@ pub struct UpdateArgs {
     /// Set the coordinator rule of this task tree.
     #[arg(long, action = ArgAction::Set)]
     coordinated: Option<bool>,
+    /// Let an agent continue the loop on this task until the task is done. This also ends a stop
+    /// by the loop limit.
+    #[arg(long, action = ArgAction::Set)]
+    loop_until_done: Option<bool>,
     /// Store the text even if it matches a secret pattern.
     #[arg(long)]
     allow_secret: bool,
@@ -389,6 +393,14 @@ fn print_detail(value: &Value) {
             text(task, "type"),
         );
         println!("{}  ({})", text(data, "title"), text(data, "author"));
+        if task["loop_stopped"] == true {
+            println!(
+                "The loop limit stopped this task. An agent cannot claim it until a person acts."
+            );
+        }
+        if task["loop_until_done"] == true {
+            println!("An agent can continue the loop on this task until the task is done.");
+        }
         for key in ["claim", "active_blockers", "warnings", "soft_links"] {
             if !data[key].is_null() {
                 println!("{key}: {}", data[key]);
@@ -695,6 +707,7 @@ fn update(
         due: optional_day(args.due.as_deref())?,
         kind: args.kind,
         coordinated: args.coordinated,
+        loop_until_done: args.loop_until_done,
         secret_policy: policy(args.allow_secret),
     };
     let meta = service.update(caller, id, patch)?;

@@ -865,6 +865,8 @@ fn synthetic_rows(count: usize) -> Vec<BoardRow> {
                     status: Status::Todo,
                     stage: "work".to_owned(),
                     unblocked: false,
+                    loop_stopped: false,
+                    loop_until_done: false,
                 },
                 has_plan: false,
                 stamps: [None, None, None],

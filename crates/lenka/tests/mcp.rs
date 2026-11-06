@@ -404,3 +404,73 @@ async fn a_hand_edit_is_a_version_before_an_automatic_commit() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn an_agent_sees_the_loop_stop_and_cannot_claim_the_task() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let created = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&created, "task").to_owned();
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    let change = |version: u64| json!({"task": id, "version": version, "description": format!("Text {version}"), "reason": "A change."});
+    for version in 1..=5 {
+        call_ok(&client, "task.update", change(version)).await?;
+    }
+    let error = call_error(&client, "task.update", change(6)).await?;
+    assert_eq!(error["code"], "loop_limit");
+    let error = call_error(&client, "task.claim", json!({"task": id})).await?;
+    assert_eq!(error["code"], "loop_limit");
+    let shown = call_ok(&client, "task.show", json!({"task": id})).await?;
+    assert_eq!(shown["task"]["loop_stopped"], true);
+
+    // The person acts, and the same running server sees it.
+    machine.json(&repo, &["task", "status", &id, "todo"])?;
+    call_ok(&client, "task.claim", json!({"task": id})).await?;
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_artifact_of_a_marked_task_has_no_loop_limit() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let file = repo.join("design.txt");
+    fs::write(&file, "text 0")?;
+    let path = file.to_string_lossy().into_owned();
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    let created = call_ok(&client, "artifact.create", json!({"path": path})).await?;
+    let artifact = text(&created, "artifact").to_owned();
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    let linked = json!({"task": id, "version": 1, "artifacts_add": [artifact]});
+    let linked = call_ok(&client, "task.update", linked).await?;
+
+    let update = |version: u64| -> TestResult<Value> {
+        fs::write(&file, format!("text {version}"))?;
+        Ok(json!({
+            "artifact": artifact, "version": version, "path": path, "reason": "A change.",
+        }))
+    };
+    for version in 1..=5 {
+        call_ok(&client, "artifact.update", update(version)?).await?;
+    }
+    let error = call_error(&client, "artifact.update", update(6)?).await?;
+    assert_eq!(error["code"], "loop_limit");
+
+    let version = linked["version"].to_string();
+    let mark = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        &version,
+        "--loop-until-done",
+        "true",
+    ];
+    machine.json(&repo, &mark)?;
+    for version in 6..=8 {
+        call_ok(&client, "artifact.update", update(version)?).await?;
+    }
+    client.cancel().await?;
+    Ok(())
+}

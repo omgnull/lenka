@@ -162,6 +162,8 @@ pub struct TaskPatch {
     pub kind: Option<String>,
     /// A new coordinator setting. Only a person can change it.
     pub coordinated: Option<bool>,
+    /// Lets an agent continue the loop until the task is done. Only a person can set this.
+    pub loop_until_done: Option<bool>,
     /// The policy of the secret check. Only a person can override it.
     pub secret_policy: SecretPolicy,
 }
@@ -797,6 +799,9 @@ impl TaskService {
             {
                 return Err(LenkaError::not_found("The parent task does not exist."));
             }
+            if let Some(parent) = new.parent {
+                check_parent_open(index, parent)?;
+            }
             self.check_links(index, id, &new.blocked_by, &new.relates)?;
             // A new task has no children, and only its ancestors wait for it. A blocker that waits
             // for the parent therefore makes a group of tasks wait for itself.
@@ -836,6 +841,8 @@ impl TaskService {
                 status,
                 stage: stages[0].name.clone(),
                 unblocked: false,
+                loop_stopped: false,
+                loop_until_done: false,
             };
             let meta = VersionMeta {
                 version: 1,
@@ -930,16 +937,22 @@ impl TaskService {
     pub fn update(&self, caller: &Caller, id: TaskId, patch: TaskPatch) -> Result<TaskMeta> {
         check_patch_input(&patch)?;
         let policy = policy_for(caller, patch.secret_policy)?;
-        if caller.actor != Actor::Human && (patch.kind.is_some() || patch.coordinated.is_some()) {
+        if caller.actor != Actor::Human
+            && (patch.kind.is_some()
+                || patch.coordinated.is_some()
+                || patch.loop_until_done.is_some())
+        {
             return Err(LenkaError::new(
                 ErrorCode::ActorDenied,
-                "Only a person can change the type or the coordinator setting of a task.",
+                "Only a person can change the type, the coordinator setting, or the loop mark of a task.",
             ));
         }
         self.with_write(|locked, index, now| {
             self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
+            check_not_closed(&meta)?;
+            check_loop_not_stopped(&meta, caller)?;
             locked.check_version("The task", meta.state.version, patch.expected_version)?;
             check_write_claim(index, id, caller, &patch.claim, now)?;
 
@@ -982,16 +995,37 @@ impl TaskService {
             let mut new_state = meta.state.clone();
             if let Some(kind) = &patch.kind {
                 let stages = self.stages_of(kind)?;
-                if !stages.iter().any(|stage| stage.name == new_state.stage) {
-                    new_state.stage = stages[0].name.clone();
+                let found = stages.iter().position(|stage| stage.name == new_state.stage);
+                let position = found.unwrap_or(0);
+                new_state.stage = stages[position].name.clone();
+                if found.is_none() || *kind != meta.front.kind {
+                    new_state.unblocked = stages[..position].iter().any(|stage| stage.unblocks);
                 }
                 front.kind.clone_from(kind);
             }
+            let loop_mark = patch.loop_until_done == Some(true);
+            if let Some(mark) = patch.loop_until_done {
+                new_state.loop_until_done = mark;
+            }
+            if loop_mark {
+                new_state.loop_stopped = false;
+                if meta.state.loop_stopped && new_state.status == Status::Paused {
+                    new_state.status = self.status_after_release(&meta);
+                }
+            }
 
-            let changed = changed_parts(&old_body, &body, old_plan.as_deref(), plan.as_deref());
+            let mut changed = changed_parts(&old_body, &body, old_plan.as_deref(), plan.as_deref());
+            if front.kind != meta.front.kind {
+                changed.push("type".to_owned());
+            }
             let body_text = if body == old_body { old_body_text.clone() } else { body.to_text() };
             let same_front = front == meta.front;
-            if changed.is_empty() && same_front && body == old_body && plan == old_plan {
+            if changed.is_empty()
+                && same_front
+                && new_state == meta.state
+                && body == old_body
+                && plan == old_plan
+            {
                 return Ok(meta);
             }
             let material = !changed.is_empty();
@@ -1006,11 +1040,15 @@ impl TaskService {
             {
                 check_coordinator(index, coordinator, caller, &patch.claim, now)?;
             }
-            if material && caller.actor == Actor::Agent {
+            let counts_for_loop =
+                material && caller.actor == Actor::Agent && !meta.state.loop_until_done;
+            if counts_for_loop {
                 let limit = self.project.config().limits.loop_limit;
                 let recent = read_loop_counts(self.project.driver(), &id.to_string(), now)?;
                 if recent.len() >= limit as usize {
-                    let ops = self.pause_ops(index, &meta, caller, now)?;
+                    let mut stopped = meta.state.clone();
+                    stopped.loop_stopped = true;
+                    let ops = self.pause_ops(index, id, stopped, caller, now)?;
                     locked.commit(&Commit {
                         ops,
                         ..Commit::default()
@@ -1037,6 +1075,19 @@ impl TaskService {
                 material,
             };
             let mut ops = version_ops(id, version, &task_text, plan.as_deref(), &version_meta)?;
+            if loop_mark {
+                ops.push(Op::Remove {
+                    path: loops_path(&id.to_string()),
+                });
+            }
+            if let Some(active) = index.claims.get(&id)
+                && active.stage != new_state.stage
+            {
+                let mut moved = active.clone();
+                moved.stage.clone_from(&new_state.stage);
+                ops.push(put(claim_path(id), toml_text(&moved)?));
+                ops.push(feed_op(&simple_event(FeedKind::Claim, id, version, caller, now))?);
+            }
             if plan.is_none() && old_plan.is_some() {
                 ops.push(Op::Remove {
                     path: format!("{}/plan.md", root_of(id)),
@@ -1053,7 +1104,7 @@ impl TaskService {
                     &version_meta,
                     now,
                 )?);
-                if caller.actor == Actor::Agent {
+                if counts_for_loop {
                     ops.push(loop_count_op(self.project.driver(), &id.to_string(), now)?);
                 }
             }
@@ -1094,6 +1145,7 @@ impl TaskService {
                 if !index.tasks.contains_key(&target) {
                     return Err(LenkaError::not_found("The parent task does not exist."));
                 }
+                check_parent_open(index, target)?;
                 if index.parent_makes_cycle(id, target) {
                     return Err(cycle_error());
                 }
@@ -1137,12 +1189,11 @@ impl TaskService {
     fn pause_ops(
         &self,
         index: &Index,
-        meta: &TaskMeta,
+        id: TaskId,
+        mut state: State,
         caller: &Caller,
         now: Timestamp,
     ) -> Result<Vec<Op>> {
-        let id = meta.id();
-        let mut state = meta.state.clone();
         state.status = Status::Paused;
         let mut ops = vec![put(
             format!("{}/state.toml", root_of(id)),
@@ -1170,15 +1221,30 @@ impl TaskService {
         Ok(ops)
     }
 
-    /// Records a material agent change for a key, such as an artifact, and checks the loop limit.
+    /// Records a material agent change of an artifact, and checks the loop limit.
     ///
     /// # Errors
     ///
     /// Returns [`ErrorCode::LoopLimit`] if the limit is reached.
-    pub fn check_artifact_loop(&self, caller: &Caller, key: &str) -> Result<Option<Op>> {
+    pub fn check_artifact_loop(&self, caller: &Caller, artifact: ArtifactId) -> Result<Option<Op>> {
         if caller.actor != Actor::Agent {
             return Ok(None);
         }
+        {
+            let index = self.read_index()?;
+            let marked = index.artifact_users.get(&artifact).is_some_and(|users| {
+                users.iter().any(|task| {
+                    index
+                        .tasks
+                        .get(task)
+                        .is_some_and(|meta| meta.state.loop_until_done)
+                })
+            });
+            if marked {
+                return Ok(None);
+            }
+        }
+        let key = &artifact.to_string();
         let limit = self.project.config().limits.loop_limit;
         let now = self.now();
         let recent = read_loop_counts(self.project.driver(), key, now)?;
@@ -1186,7 +1252,7 @@ impl TaskService {
             return Err(LenkaError::new(
                 ErrorCode::LoopLimit,
                 format!(
-                    "This artifact reached the limit of {limit} material agent changes in one hour. A person must act."
+                    "This artifact reached the limit of {limit} material agent changes in one hour. Wait, or ask a person to make the change."
                 ),
             ));
         }
@@ -1618,9 +1684,16 @@ impl TaskService {
                 caller,
                 now,
             ))?);
-            if meta.state.status != Status::InProgress {
-                let mut state = meta.state.clone();
-                state.status = Status::InProgress;
+            let mut state = meta.state.clone();
+            state.status = Status::InProgress;
+            // A claim by a person is the action that the loop limit waits for.
+            state.loop_stopped = state.loop_stopped && caller.actor != Actor::Human;
+            if meta.state.loop_stopped && !state.loop_stopped {
+                ops.push(Op::Remove {
+                    path: loops_path(&id.to_string()),
+                });
+            }
+            if state != meta.state {
                 ops.push(put(
                     format!("{}/state.toml", root_of(id)),
                     toml_text(&state)?,
@@ -1671,6 +1744,14 @@ impl TaskService {
         Ok(claim)
     }
 
+    /// Returns the status of a task with no holder that is not paused.
+    fn status_after_release(&self, meta: &TaskMeta) -> Status {
+        match self.stage_position(meta) {
+            Ok((_, position)) if position > 0 => Status::InProgress,
+            _ => Status::Todo,
+        }
+    }
+
     fn check_can_claim(
         &self,
         index: &Index,
@@ -1688,6 +1769,7 @@ impl TaskService {
                 meta.state.status.as_str()
             )));
         }
+        check_loop_not_stopped(meta, caller)?;
         if let Some(existing) = index.active_claim(id, now)
             && existing.agent_key != caller.agent_key
         {
@@ -1767,6 +1849,7 @@ impl TaskService {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| task_missing(id))?;
+            check_not_closed(&meta)?;
             let (stages, position) = self.stage_position(&meta)?;
             let active = check_stage_claim(index, id, caller, claim, now)?;
             if !caller.actor.can_do(stages[position].actor) && caller.actor != Actor::Human {
@@ -1889,6 +1972,7 @@ impl TaskService {
             self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
+            check_not_closed(&meta)?;
             let (stages, position) = self.stage_position(&meta)?;
             let active = check_stage_claim(index, id, caller, claim, now)?;
             let mut state = meta.state.clone();
@@ -1899,7 +1983,7 @@ impl TaskService {
                     if active.is_none() && !matches!(claim, ClaimRef::Override) {
                         return Err(claim_lost());
                     }
-                    state.status = if position == 0 { Status::Todo } else { Status::InProgress };
+                    state.status = self.status_after_release(&meta);
                 }
                 Finish::Done { evidence, unchecked_reason } => {
                     if let Some(active) = &active {
@@ -1960,6 +2044,8 @@ impl TaskService {
                     )?);
                     state.status = Status::Done;
                     state.unblocked = true;
+                    state.loop_stopped = false;
+                    state.loop_until_done = false;
                 }
             }
             ops.push(put(format!("{}/state.toml", root_of(id)), toml_text(&state)?));
@@ -2000,10 +2086,8 @@ impl TaskService {
                 .cloned()
                 .ok_or_else(|| task_missing(id))?;
             check_write_claim(index, id, caller, claim, now)?;
-            if meta.state.status.is_closed() {
-                return Err(LenkaError::invalid_argument("A closed task cannot pause."));
-            }
-            let ops = self.pause_ops(index, &meta, caller, now)?;
+            check_not_closed(&meta)?;
+            let ops = self.pause_ops(index, id, meta.state.clone(), caller, now)?;
             locked.commit(&Commit {
                 ops,
                 ..Commit::default()
@@ -2047,9 +2131,24 @@ impl TaskService {
                 .cloned()
                 .ok_or_else(|| task_missing(id))?;
             check_write_claim(index, id, caller, claim, now)?;
+            if status.is_closed() && has_open_children(index, id) {
+                return Err(LenkaError::new(
+                    ErrorCode::Blocked,
+                    "The task has open children. Complete or cancel them first.",
+                ));
+            }
+            if !status.is_closed()
+                && let Some(parent) = meta.front.parent
+            {
+                check_parent_open(index, parent)?;
+            }
             let mut state = meta.state.clone();
             state.status = status;
-            if meta.state.status == Status::Done {
+            state.loop_stopped = false;
+            if status.is_closed() {
+                state.loop_until_done = false;
+            }
+            if meta.state.status.is_closed() {
                 // A reopened task blocks its dependents again.
                 state.unblocked = false;
             }
@@ -2713,6 +2812,46 @@ fn cycle_error() -> LenkaError {
     )
 }
 
+/// Refuses a change of a closed task. Only [`TaskService::set_status`] opens a closed task.
+fn check_not_closed(meta: &TaskMeta) -> Result<()> {
+    if meta.state.status.is_closed() {
+        return Err(LenkaError::invalid_argument(format!(
+            "The task {} is {}, so it cannot change. A person can open it again with a status change.",
+            meta.id().short(),
+            meta.state.status.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an agent on a task that the loop limit stopped.
+fn check_loop_not_stopped(meta: &TaskMeta, caller: &Caller) -> Result<()> {
+    if caller.actor != Actor::Human && meta.state.loop_stopped {
+        return Err(LenkaError::new(
+            ErrorCode::LoopLimit,
+            format!(
+                "The loop limit stopped the task {}. A person must act: change its status, claim it, or let the agent continue until the task is done.",
+                meta.id().short()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses a closed parent. A closed parent has no open children.
+fn check_parent_open(index: &Index, parent: TaskId) -> Result<()> {
+    if let Some(meta) = index.tasks.get(&parent)
+        && meta.state.status.is_closed()
+    {
+        return Err(LenkaError::invalid_argument(format!(
+            "The parent task {} is {}. Open it first.",
+            parent.short(),
+            meta.state.status.as_str()
+        )));
+    }
+    Ok(())
+}
+
 fn check_not_invalid(index: &Index, id: TaskId) -> Result<()> {
     match index.invalid.get(&id) {
         Some(reason) => Err(LenkaError::invalid_file(reason.clone())),
@@ -3108,13 +3247,13 @@ fn active_blockers(
         for link in &meta.front.blocked_by {
             match link {
                 Link::Local(target) => {
-                    if local_blocks(index, *target)
-                        && let Some(found) = index.tasks.get(target)
-                    {
+                    if local_blocks(index, *target) {
+                        // A task with invalid files can have no record, but it still blocks.
+                        let found = index.tasks.get(target);
                         result.push(BlockerView {
                             id: target.short(),
-                            title: Some(found.front.title.clone()),
-                            status: Some(found.state.status),
+                            title: found.map(|meta| meta.front.title.clone()),
+                            status: found.map(|meta| meta.state.status),
                             via_parent: via_parent.clone(),
                         });
                     }

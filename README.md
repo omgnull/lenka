@@ -162,6 +162,8 @@ lenka protects against mistakes and untrusted files. It does not protect against
 
 - Task text can be a prompt injection. Tool results put task text in fields that are labeled as untrusted data, with the author beside the text. This reduces the risk, but it does not remove it.
 - The secret check finds common patterns only. Do not put secrets in tasks.
+- After the loop limit, an agent cannot claim or change the task until a person acts. To act, change the status, claim the task, or run `lenka task update <id> --version <n> --loop-until-done true`. That option lets the agent continue until the task is done.
+- A closed task cannot change. A person can open it again with `lenka task status <id> todo`.
 - A person and an agent with no name are two identities, also in one directory. A person must use `--override` to change a task that an agent holds, and the agent then gets a notice. Set `LENKA_AGENT` only to act as that named agent.
 - lenka refuses control characters in stored text, except line breaks and tabs in a body. A reason has a limit of 4 KiB, and a label or a media type has a limit of 256 bytes. One reply holds at most 50 notices and 64 KiB of notice text, and later replies show the others.
 - A delete changes only the current files. Committed bytes stay in the Git history, so rotate an exposed secret.

@@ -684,6 +684,12 @@ pub fn detail_json(detail: &TaskDetail, parts: &[&str]) -> Value {
         "has_plan": meta.has_plan,
     });
     if let Some(object) = task.as_object_mut() {
+        if meta.state.loop_stopped {
+            object.insert("loop_stopped".to_owned(), json!(true));
+        }
+        if meta.state.loop_until_done {
+            object.insert("loop_until_done".to_owned(), json!(true));
+        }
         if let Some(start) = meta.front.start {
             object.insert("start".to_owned(), json!(start.to_string()));
         }
