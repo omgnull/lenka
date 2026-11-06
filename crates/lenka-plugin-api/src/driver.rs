@@ -159,6 +159,14 @@ pub trait StorageDriver: Send + Sync + fmt::Debug {
     /// Returns an error if the document cannot be read.
     fn read_from(&self, path: &DocPath, offset: u64) -> Result<Vec<u8>>;
 
+    /// Reads at most this count of bytes from the start of a document. A missing document gives an
+    /// empty result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be read.
+    fn read_start(&self, path: &DocPath, max_bytes: u64) -> Result<Vec<u8>>;
+
     /// Lists the names directly under a directory, sorted. A missing directory gives no names.
     /// Symlinks are not in the result.
     ///

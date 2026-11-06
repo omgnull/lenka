@@ -370,7 +370,8 @@ MCP setup:
   claude mcp add lenka -- lenka mcp
 
 Other clients: run `lenka mcp` as a stdio server. Set LENKA_AGENT to name an agent.
-Change notices in Claude Code: run `lenka hook install`.
+Change notices in Claude Code: run `lenka hook install`. Each agent name has its own
+inbox, so set the same LENKA_AGENT value for the MCP server and for the hook.
 ";
 
 fn attach(context: &RunContext, name: &str) -> anyhow::Result<()> {
@@ -560,15 +561,37 @@ fn git_enable(
     Ok(())
 }
 
+/// Records the hand edits, so that the pushed data needs no new version on another clone, and
+/// returns the task versions. A problem here must not stop a sync, because a sync can repair it.
+#[cfg(all(feature = "git", feature = "tasks"))]
+fn versions_before_sync(
+    project: &std::sync::Arc<lenka_core::Project>,
+) -> lenka_tasks::TaskVersions {
+    let versions = lenka_tasks::service_of(project).and_then(|tasks| {
+        tasks.record_all_external_edits()?;
+        tasks.task_versions()
+    });
+    versions.unwrap_or_else(|error| {
+        eprintln!("Warning: lenka did not read the tasks before the sync: {error}");
+        lenka_tasks::TaskVersions::default()
+    })
+}
+
 #[cfg(feature = "git")]
 fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
     require_plugin(host, "git")?;
     let caller = context.person()?;
     let project = host.project_for(&caller, None)?;
+    #[cfg(feature = "tasks")]
+    let before = versions_before_sync(&project);
     let report = lenka_git::sync(&project)?;
     if report.merged {
         #[cfg(feature = "tasks")]
-        lenka_tasks::service_of(&project)?.reindex(&caller)?;
+        {
+            let tasks = lenka_tasks::service_of(&project)?;
+            tasks.reindex(&caller)?;
+            tasks.notify_merged_changes(&before)?;
+        }
         lenka_git::mark_indexed(&project)?;
     }
     let value = serde_json::to_value(&report)?;

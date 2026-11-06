@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use lenka_plugin_api::{Actor, Caller, ErrorCode, LenkaError, ProjectScope, Result};
 
 use crate::gitdir;
-use crate::notices::agent_key;
+use crate::notices::{agent_key, person_key};
 use crate::settings::{
     CLONE_FILE, CloneFile, PLAIN_CLONE_FILE, PROJECT_FILE, Paths, ProjectConfig, ProjectEntry,
     ProjectsFile, validate_project_name,
@@ -284,11 +284,15 @@ pub struct CallerSetup {
 ///
 /// Returns an error if the clone file is not valid.
 pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
-    let worktree = gitdir::locate(cwd).map_or_else(
-        || gitdir::real_path(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
-        |location| location.worktree,
-    );
-    let clone = match find_clone_file(cwd) {
+    let clone_file = find_clone_file(cwd);
+    // A plain directory has one identity in all of its subdirectories, as a Git worktree has.
+    let plain_root = clone_file.as_deref().and_then(Path::parent);
+    let worktree = match (gitdir::locate(cwd), plain_root) {
+        (Some(location), _) => location.worktree,
+        (None, Some(root)) => root.to_path_buf(),
+        (None, None) => gitdir::real_path(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+    };
+    let clone = match clone_file {
         Some(file) => CloneFile::load(&file)?,
         None => None,
     };
@@ -300,7 +304,11 @@ pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
     Ok(Caller {
         actor: setup.actor,
         label: setup.label,
-        agent_key: agent_key(&worktree, setup.agent.as_deref()),
+        agent_key: match (setup.actor, setup.agent.as_deref()) {
+            // A name selects an inbox, so a person with a name acts as that agent.
+            (Actor::Human, None) => person_key(&worktree),
+            (_, agent) => agent_key(&worktree, agent),
+        },
         worktree,
         scope,
         default_project: setup.project.or(default_project),
@@ -310,6 +318,43 @@ pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup(actor: Actor, agent: Option<&str>) -> CallerSetup {
+        CallerSetup {
+            actor,
+            label: "x".to_owned(),
+            project: None,
+            agent: agent.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_person_and_an_agent_in_one_directory_have_two_keys() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let person = caller_for(temp.path(), setup(Actor::Human, None))?;
+        let agent = caller_for(temp.path(), setup(Actor::Agent, None))?;
+        assert_ne!(person.agent_key, agent.agent_key);
+        // A name selects one inbox, so a person can act as a named agent.
+        let named_person = caller_for(temp.path(), setup(Actor::Human, Some("a")))?;
+        let named_agent = caller_for(temp.path(), setup(Actor::Agent, Some("a")))?;
+        assert_eq!(named_person.agent_key, named_agent.agent_key);
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_directory_has_one_identity_in_its_subdirectories() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        let sub = cwd.join("sub");
+        fs::create_dir_all(&sub).map_err(|err| LenkaError::io("mkdir", &err))?;
+        create_project(&paths, &cwd, Some("api"), &Location::Shared)?;
+        let root = caller_for(&cwd, setup(Actor::Agent, None))?;
+        let below = caller_for(&sub, setup(Actor::Agent, None))?;
+        assert_eq!(root.agent_key, below.agent_key);
+        assert_eq!(root.worktree, below.worktree);
+        Ok(())
+    }
 
     #[test]
     fn create_attach_and_caller_outside_git() -> Result<()> {

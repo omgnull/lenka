@@ -940,3 +940,101 @@ fn a_temporary_file_from_a_stopped_process_stays_out_of_git() -> TestResult {
     pair.second.ok(&second, &["init"])?;
     Ok(())
 }
+
+/// Edits a task file by hand, and returns the full task ID. The file keeps its size and its time,
+/// so only a compare of the text finds this edit.
+fn hand_edit(dir: &Path, short: &str, from: &str, to: &str) -> TestResult<String> {
+    let full = fs::read_dir(dir.join("tasks"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.contains(short))
+        .ok_or("the task directory exists")?;
+    let file = dir.join("tasks").join(&full).join("task.md");
+    let old = fs::read_to_string(&file)?;
+    assert!(old.contains(from), "{old}");
+    assert_eq!(from.len(), to.len());
+    let time = fs::metadata(&file)?.modified()?;
+    fs::write(&file, old.replace(from, to))?;
+    fs::File::options()
+        .write(true)
+        .open(&file)?
+        .set_modified(time)?;
+    Ok(full)
+}
+
+#[test]
+fn a_hand_edit_is_a_version_before_a_sync_so_clones_do_not_conflict() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let task = pair.first.json(
+        &first,
+        &["task", "create", "A task", "--description", "Old text."],
+    )?;
+    let id = text(&task, "task").to_owned();
+    pair.first.json(&first, &["sync"])?;
+    pair.second.json(&second, &["sync"])?;
+    // This read stores an index snapshot with the current file stamps.
+    pair.first.json(&first, &["task", "show", &id])?;
+
+    hand_edit(
+        &first.join(".git/lenka-data"),
+        &id,
+        "Old text.",
+        "New text.",
+    )?;
+    let (done, _) = sync_report(&pair.first, &first)?;
+    assert!(done);
+    let files = remote_files(&pair.first, &pair.remote)?;
+    assert!(files.contains("versions/000002/meta.toml"), "{files}");
+
+    // Both clones now read the task and sync. No clone needs a second version 2.
+    pair.second.json(&second, &["sync"])?;
+    pair.second.json(&second, &["task", "show", &id])?;
+    pair.first.json(&first, &["task", "show", &id])?;
+    for (machine, repo) in [(&pair.first, &first), (&pair.second, &second)] {
+        let (done, report) = sync_report(machine, repo)?;
+        assert!(done, "{report}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_merged_change_stops_a_finish_until_the_holder_reads_it() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let task = pair.first.json(&first, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    pair.first.json(&first, &["sync"])?;
+    pair.second.json(&second, &["sync"])?;
+    pair.second.json(&second, &["task", "claim", &id])?;
+    pair.second.json(&second, &["sync"])?;
+    pair.first.json(&first, &["sync"])?;
+
+    pair.first.json(
+        &first,
+        &[
+            "task",
+            "update",
+            &id,
+            "--version",
+            "1",
+            "--description",
+            "Do not ship this.",
+            "--reason",
+            "The requirement changed.",
+        ],
+    )?;
+    pair.first.json(&first, &["sync"])?;
+    let (done, report) = sync_report(&pair.second, &second)?;
+    assert!(done, "{report}");
+    assert_eq!(report["merged"], Value::Bool(true));
+
+    let refused = pair
+        .second
+        .fails(&second, &["task", "finish", &id, "--evidence", "It works."])?;
+    assert!(refused.contains("unread_changes"), "{refused}");
+    pair.second.json(&second, &["task", "show", &id])?;
+    pair.second
+        .json(&second, &["task", "finish", &id, "--evidence", "It works."])?;
+    Ok(())
+}

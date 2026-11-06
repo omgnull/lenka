@@ -2166,6 +2166,7 @@ fn a_large_inbox_does_not_stop_reads_or_a_finish() -> Result<()> {
     let notes = service.call_notes(&agent)?;
     assert!(!notes.unread.is_empty());
     let claim = service.claim(&agent, Some(id), None, None)?;
+    service.show(&agent, id, &[])?;
     let finish = Finish::Done {
         evidence: "It works.".to_owned(),
         unchecked_reason: None,
@@ -2249,5 +2250,293 @@ fn a_very_long_feed_line_does_not_stop_the_index() -> Result<()> {
     let rows = service.list(&human, &lenka_tasks::ListFilter::default())?;
     let titles = format!("{rows:?}");
     assert!(titles.contains("Second"), "{first} {second}: {titles}");
+    Ok(())
+}
+
+fn task_file(fx: &Fixture, id: TaskId, name: &str) -> PathBuf {
+    fx.data_dir("api")
+        .join("tasks")
+        .join(id.to_string())
+        .join(name)
+}
+
+fn hand_edit(fx: &Fixture, id: TaskId, name: &str, from: &str, to: &str) -> Result<()> {
+    let file = task_file(fx, id, name);
+    let text = fs::read_to_string(&file).map_err(|err| LenkaError::io("read", &err))?;
+    assert!(text.contains(from), "{text}");
+    // A file system can have a coarse clock, and a person is never this fast.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    fs::write(&file, text.replace(from, to)).map_err(|err| LenkaError::io("write", &err))
+}
+
+fn described(service: &TaskService, who: &Caller, title: &str) -> Result<TaskId> {
+    let meta = service.create(
+        who,
+        NewTask {
+            description: "Text.".to_owned(),
+            ..task(title)
+        },
+    )?;
+    Ok(meta.id())
+}
+
+fn finish_done() -> Finish {
+    Finish::Done {
+        evidence: "It works.".to_owned(),
+        unchecked_reason: None,
+    }
+}
+
+#[test]
+fn a_new_claim_does_not_drop_an_unread_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let human = fx.human();
+    let id = create(&service, &human, "T")?;
+    service.claim(&agent, Some(id), None, Some(1))?;
+    service.update(
+        &human,
+        id,
+        TaskPatch {
+            expected_version: 1,
+            description: Some("Do not ship this.".to_owned()),
+            reason: Some("The requirement changed.".to_owned()),
+            claim: ClaimRef::Override,
+            ..TaskPatch::default()
+        },
+    )?;
+    // The claim ends by timeout, and the agent claims again.
+    fx.clock.advance_ms(2 * 60 * 1000);
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    assert_eq!(
+        code(service.finish(
+            &agent,
+            id,
+            &ClaimRef::Handle(claim.handle.clone()),
+            &finish_done()
+        )),
+        ErrorCode::UnreadChanges
+    );
+    service.show(&agent, id, &[])?;
+    service.finish(&agent, id, &ClaimRef::Handle(claim.handle), &finish_done())?;
+    Ok(())
+}
+
+#[test]
+fn each_state_write_records_a_hand_edit_first() -> Result<()> {
+    type Write<'a> = Box<dyn Fn(&TaskService, &Caller, TaskId) -> Result<()> + 'a>;
+    let writes: Vec<(&str, Write<'_>)> = vec![
+        (
+            "claim",
+            Box::new(|service, who, id| service.claim(who, Some(id), None, None).map(|_| ())),
+        ),
+        (
+            "update",
+            Box::new(|service, who, id| {
+                let detail = TaskPatch {
+                    expected_version: 1,
+                    title: Some("New".to_owned()),
+                    ..TaskPatch::default()
+                };
+                service.update(who, id, detail).map(|_| ())
+            }),
+        ),
+        (
+            "advance",
+            Box::new(|service, who, id| {
+                service
+                    .advance(who, id, &ClaimRef::Implicit, "It works.", None)
+                    .map(|_| ())
+            }),
+        ),
+        (
+            "finish",
+            Box::new(|service, who, id| {
+                service
+                    .finish(who, id, &ClaimRef::Implicit, &finish_done())
+                    .map(|_| ())
+            }),
+        ),
+        (
+            "pause",
+            Box::new(|service, who, id| service.pause(who, id, &ClaimRef::Implicit).map(|_| ())),
+        ),
+        (
+            "status",
+            Box::new(|service, who, id| {
+                service
+                    .set_status(who, id, Status::Cancelled, &ClaimRef::Implicit)
+                    .map(|_| ())
+            }),
+        ),
+    ];
+    for (name, write) in writes {
+        let fx = fixture()?;
+        let service = fx.project("api")?;
+        let human = fx.human();
+        let id = described(&service, &human, "T")?;
+        if name == "advance" {
+            feature_stages(&service)?;
+            service.update(
+                &human,
+                id,
+                TaskPatch {
+                    expected_version: 1,
+                    kind: Some("feature".to_owned()),
+                    reason: Some("A new type.".to_owned()),
+                    ..TaskPatch::default()
+                },
+            )?;
+        }
+        let version = service.detail(id, &[])?.meta.state.version;
+        hand_edit(&fx, id, "task.md", "Text.", "Edited by hand.")?;
+        let _ = write(&service, &human, id);
+        let root = fx.data_dir("api").join("tasks").join(id.to_string());
+        let meta = root.join(format!("versions/{:06}/meta.toml", version + 1));
+        let recorded = fs::read_to_string(&meta).unwrap_or_default();
+        assert!(recorded.contains("external"), "{name}: {recorded}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_hand_edit_reaches_the_holder_before_a_finish() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = described(&service, &agent, "T")?;
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    hand_edit(&fx, id, "task.md", "Text.", "Do not ship this.")?;
+    assert_eq!(
+        code(service.finish(&agent, id, &ClaimRef::Handle(claim.handle), &finish_done())),
+        ErrorCode::UnreadChanges
+    );
+    Ok(())
+}
+
+#[test]
+fn a_state_write_reads_a_hand_edit_of_the_state_file() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = create(&service, &agent, "T")?;
+    service.list(&agent, &lenka_tasks::ListFilter::default())?;
+    hand_edit(
+        &fx,
+        id,
+        "state.toml",
+        "status = \"todo\"",
+        "status = \"cancelled\"",
+    )?;
+    assert!(service.claim(&agent, Some(id), None, None).is_err());
+    let state = fs::read_to_string(task_file(&fx, id, "state.toml"))
+        .map_err(|err| LenkaError::io("read", &err))?;
+    assert!(state.contains("cancelled"), "{state}");
+    Ok(())
+}
+
+#[test]
+fn a_lower_version_in_the_state_file_keeps_the_history() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = described(&service, &agent, "T")?;
+    for version in 1..=3 {
+        service.update(
+            &agent,
+            id,
+            TaskPatch {
+                expected_version: version,
+                description: Some(format!("Revision {version}.")),
+                reason: Some("A change.".to_owned()),
+                ..TaskPatch::default()
+            },
+        )?;
+    }
+    let old = task_file(&fx, id, "versions/000002/task.md");
+    let before = fs::read_to_string(&old).map_err(|err| LenkaError::io("read", &err))?;
+    // A person restores an old state file from a backup.
+    hand_edit(&fx, id, "state.toml", "version = 4", "version = 1")?;
+
+    let patch = TaskPatch {
+        expected_version: 1,
+        description: Some("Late.".to_owned()),
+        reason: Some("A change.".to_owned()),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&agent, id, patch)),
+        ErrorCode::StaleVersion
+    );
+    assert_eq!(service.detail(id, &[])?.meta.state.version, 4);
+    assert_eq!(
+        fs::read_to_string(&old).map_err(|err| LenkaError::io("read", &err))?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn a_lost_feed_does_not_hide_a_change_from_a_running_process() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let lost = create(&service, &agent, "Lost")?;
+    let other_task = create(&service, &agent, "Other")?;
+    let feed = fx.data_dir("api").join(".runtime/feed.jsonl");
+    fs::remove_file(&feed).map_err(|err| LenkaError::io("remove", &err))?;
+    let other_host = build_host(&fx.paths, &fx.clock)?;
+    let other = service_of(&other_host.open_by_name("api")?)?;
+    let change = |id: TaskId, version: u64| {
+        service.update(
+            &agent,
+            id,
+            TaskPatch {
+                expected_version: version,
+                title: Some(format!("Title {version}")),
+                reason: Some("A change.".to_owned()),
+                ..TaskPatch::default()
+            },
+        )
+    };
+    change(other_task, 1)?;
+    change(other_task, 2)?;
+    other.refresh()?;
+
+    fs::remove_file(&feed).map_err(|err| LenkaError::io("remove", &err))?;
+    // The new feed gets past the offset of the other process, at a line end.
+    change(lost, 1)?;
+    change(other_task, 3)?;
+    change(other_task, 4)?;
+
+    other.refresh()?;
+    let rows = other.list(&agent, &lenka_tasks::ListFilter::default())?;
+    let row = rows.iter().find(|row| row.id == lost.short());
+    assert_eq!(row.map(|row| row.title.as_str()), Some("Title 1"));
+    Ok(())
+}
+
+#[test]
+fn a_refused_person_learns_about_the_override() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let human = fx.human();
+    let id = create(&service, &human, "T")?;
+    service.claim(&agent, Some(id), None, None)?;
+    let patch = |reason: &str| TaskPatch {
+        expected_version: 1,
+        description: Some("New.".to_owned()),
+        reason: Some(reason.to_owned()),
+        ..TaskPatch::default()
+    };
+    let error = service.update(&human, id, patch("A change.")).err();
+    let message = error.map(|err| err.to_string()).unwrap_or_default();
+    assert!(message.contains("--override"), "{message}");
+    let other = fx.agent("b");
+    let error = service.update(&other, id, patch("A change.")).err();
+    let message = error.map(|err| err.to_string()).unwrap_or_default();
+    assert!(message.contains("task.entry.add"), "{message}");
     Ok(())
 }

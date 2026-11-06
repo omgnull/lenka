@@ -319,3 +319,88 @@ async fn task_text_stays_in_untrusted_data_fields() -> TestResult {
     client.cancel().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_person_in_the_directory_of_an_agent_is_another_identity() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    let claim = call_ok(&client, "task.claim", json!({"task": id})).await?;
+    let handle = text(&claim, "claim").to_owned();
+
+    // A person needs the override, because the agent holds the task.
+    let update = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        "1",
+        "--description",
+        "Do not ship this.",
+        "--reason",
+        "The requirement changed.",
+    ];
+    let refused = machine.fails(&repo, &update)?;
+    assert!(refused.contains("claim_lost"), "{refused}");
+    let mut with_override = update.to_vec();
+    with_override.push("--override");
+    machine.json(&repo, &with_override)?;
+
+    // The change reaches the agent, and a read by the person does not close the notice.
+    machine.json(&repo, &["task", "show", &id])?;
+    let finish = json!({"task": id, "claim": handle, "outcome": "done", "evidence": "It works."});
+    let error = call_error(&client, "task.finish", finish).await?;
+    assert_eq!(error["code"], "unread_changes");
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hand_edit_is_a_version_before_an_automatic_commit() -> TestResult {
+    let (_temp, machine) = machine()?;
+    fs::write(
+        machine.root.join("config/plugins.toml"),
+        "enabled = [\"git\"]\n",
+    )?;
+    let repo = machine.project("api")?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let create = |title: &str| -> TestResult<String> {
+        let args = ["task", "create", title, "--description", "Old text."];
+        Ok(text(&machine.json(&repo, &args)?, "task").to_owned())
+    };
+    let edited = create("Edited")?;
+    let done = create("Done")?;
+
+    // A running server has the current stamps, so only a new check finds the edit.
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    call_ok(&client, "task.list", json!({})).await?;
+    let data = repo.join(".git/lenka-data");
+    let full = fs::read_dir(data.join("tasks"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.contains(&edited))
+        .ok_or("the task directory exists")?;
+    let file = data.join("tasks").join(&full).join("task.md");
+    let old = fs::read_to_string(&file)?;
+    fs::write(&file, old.replace("Old text.", "New text and more."))?;
+
+    let args = json!({"task": done});
+    let claim = call_ok(&client, "task.claim", args).await?;
+    let args = json!({
+        "task": done,
+        "claim": text(&claim, "claim"),
+        "outcome": "done",
+        "evidence": "It works.",
+    });
+    call_ok(&client, "task.finish", args).await?;
+    client.cancel().await?;
+
+    let tree = machine.git(&data, &["ls-tree", "-r", "--name-only", "HEAD"])?;
+    assert!(
+        tree.contains(&format!("tasks/{full}/versions/000002/meta.toml")),
+        "{tree}"
+    );
+    Ok(())
+}

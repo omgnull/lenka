@@ -846,3 +846,13 @@ fn an_artifact_with_an_invalid_record_can_be_deleted() -> TestResult {
     assert!(!record.exists());
     Ok(())
 }
+
+#[test]
+fn the_guidance_says_that_a_name_selects_one_inbox() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.repo("api")?;
+    let output = machine.ok(&repo, &["init"])?;
+    assert!(output.contains("the same LENKA_AGENT"), "{output}");
+    Ok(())
+}

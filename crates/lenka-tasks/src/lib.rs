@@ -18,6 +18,7 @@ pub use model::{
 pub use service::{
     ArtifactRouting, ArtifactView, BlockerView, BoardRow, CallNotes, CheckItem, ClaimRef,
     DoctorReport, Finish, ListFilter, NewEntry, NewTask, RelatedView, StateChange, TaskDetail,
-    TaskPatch, TaskRow, TaskService, artifact_view, is_safe_file_name, read_artifact, service_of,
+    TaskPatch, TaskRow, TaskService, TaskVersions, artifact_view, is_safe_file_name, read_artifact,
+    service_of,
 };
 pub use tools::{TasksPlugin, change_json, detail_json, plugin, task_ref, with_notes};

@@ -460,6 +460,10 @@ impl ArtifactRouting<'_> {
     }
 }
 
+/// The versions of the tasks at one time. A sync compares them with the merged versions.
+#[derive(Debug, Clone, Default)]
+pub struct TaskVersions(HashMap<TaskId, u64>);
+
 /// The task operations of one project.
 #[derive(Debug)]
 pub struct TaskService {
@@ -659,6 +663,19 @@ impl TaskService {
                 ))
             })?;
         Ok((stages, position))
+    }
+
+    /// Sends an event to the hooks. A hook can commit all data, so the hand edits become versions
+    /// first.
+    fn emit_after_edits(&self, event: &ProjectEvent) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.project.has_event_hooks()
+            && let Err(error) = self.record_all_external_edits()
+        {
+            warnings.push(error.to_string());
+        }
+        warnings.extend(self.project.emit(event));
+        warnings
     }
 
     /// Takes the lock, brings the index up to date, runs the work, and applies the result.
@@ -920,8 +937,8 @@ impl TaskService {
             ));
         }
         self.with_write(|locked, index, now| {
-            check_not_invalid(index, id)?;
             self.ingest_if_changed(locked, index, id, now)?;
+            check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
             locked.check_version("The task", meta.state.version, patch.expected_version)?;
             check_write_claim(index, id, caller, &patch.claim, now)?;
@@ -1560,6 +1577,7 @@ impl TaskService {
             let mut reader = LinkReader::default();
             let id = match task {
                 Some(id) => {
+                    self.ingest_if_changed(locked, index, id, now)?;
                     self.check_can_claim(index, id, caller, now, &mut reader)?;
                     if let Some(existing) = index.active_claim(id, now).cloned() {
                         return self
@@ -1567,9 +1585,14 @@ impl TaskService {
                     }
                     id
                 }
-                None => self
-                    .next_ready(index, caller.actor, now, &mut reader)
-                    .ok_or_else(|| LenkaError::not_found("No task is ready for this actor."))?,
+                None => {
+                    let id = self
+                        .next_ready(index, caller.actor, now, &mut reader)
+                        .ok_or_else(|| LenkaError::not_found("No task is ready for this actor."))?;
+                    self.ingest_if_changed(locked, index, id, now)?;
+                    self.check_can_claim(index, id, caller, now, &mut reader)?;
+                    id
+                }
             };
             let meta = index
                 .tasks
@@ -1737,6 +1760,7 @@ impl TaskService {
     ) -> Result<StateChange> {
         check_evidence(evidence)?;
         let state = self.with_write(|locked, index, now| {
+            self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index
                 .tasks
@@ -1832,7 +1856,7 @@ impl TaskService {
             })?;
             Ok(state)
         })?;
-        let warnings = self.project.emit(&ProjectEvent::StageChanged {
+        let warnings = self.emit_after_edits(&ProjectEvent::StageChanged {
             task: id.to_string(),
         });
         Ok(StateChange { state, warnings })
@@ -1862,6 +1886,7 @@ impl TaskService {
             }
         }
         let state = self.with_write(|locked, index, now| {
+            self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
             let (stages, position) = self.stage_position(&meta)?;
@@ -1951,7 +1976,7 @@ impl TaskService {
             Ok(state)
         })?;
         let warnings = if state.status == Status::Done {
-            self.project.emit(&ProjectEvent::TaskFinished {
+            self.emit_after_edits(&ProjectEvent::TaskFinished {
                 task: id.to_string(),
             })
         } else {
@@ -1967,6 +1992,7 @@ impl TaskService {
     /// Returns [`ErrorCode::ClaimLost`] if another holder has the claim.
     pub fn pause(&self, caller: &Caller, id: TaskId, claim: &ClaimRef) -> Result<State> {
         self.with_write(|locked, index, now| {
+            self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index
                 .tasks
@@ -2013,6 +2039,7 @@ impl TaskService {
             ));
         }
         self.with_write(|locked, index, now| {
+            self.ingest_if_changed(locked, index, id, now)?;
             check_not_invalid(index, id)?;
             let meta = index
                 .tasks
@@ -2317,9 +2344,82 @@ impl TaskService {
         }
         self.with_write(|locked, index, now| {
             for id in &edited {
-                self.record_external(locked, index, *id, now)?;
+                // A process can read during a commit of another process, so check again here.
+                self.ingest_if_changed(locked, index, *id, now)?;
             }
             Ok(())
+        })
+    }
+
+    /// Records each hand edit in the project as a new version. A Git commit needs this first, so
+    /// that the pushed data needs no new version on another clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be read or written.
+    pub fn record_all_external_edits(&self) -> Result<()> {
+        let driver = self.project.driver();
+        self.with_write(|locked, index, now| {
+            index.scan(driver)?;
+            for id in index.order.clone() {
+                self.ingest_if_changed(locked, index, id, now)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Returns the version of each task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the feed cannot be read.
+    pub fn task_versions(&self) -> Result<TaskVersions> {
+        let index = self.read_index()?;
+        Ok(TaskVersions(
+            index
+                .tasks
+                .iter()
+                .map(|(id, meta)| (*id, meta.state.version))
+                .collect(),
+        ))
+    }
+
+    /// Creates notices for the material changes that a Git merge brought. Call this after the
+    /// reindex, with the versions from before the merge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be read or written.
+    pub fn notify_merged_changes(&self, before: &TaskVersions) -> Result<()> {
+        let driver = self.project.driver();
+        self.with_write(|locked, index, now| {
+            let mut ops = Vec::new();
+            for (id, old) in &before.0 {
+                let Some(meta) = index.tasks.get(id) else {
+                    continue;
+                };
+                let newest = (old + 1..=meta.state.version)
+                    .rev()
+                    .filter_map(|version| read_version_meta(driver, *id, version))
+                    .find(|version| version.material);
+                if let Some(version) = newest {
+                    ops.extend(notice_ops(
+                        index,
+                        *id,
+                        Subject::Task(id.to_string()),
+                        &external_caller(),
+                        &version,
+                        now,
+                    )?);
+                }
+            }
+            if ops.is_empty() {
+                return Ok(());
+            }
+            locked.commit(&Commit {
+                ops,
+                ..Commit::default()
+            })
         })
     }
 
@@ -2337,6 +2437,8 @@ impl TaskService {
         Ok(())
     }
 
+    /// Brings one task up to date under the lock, before a write that depends on it. A feed line of
+    /// another write can already have updated the stamps, so this compares the text of the files.
     fn ingest_if_changed(
         &self,
         locked: &mut Locked<'_>,
@@ -2348,15 +2450,52 @@ impl TaskService {
         let Some(meta) = index.tasks.get(&id) else {
             return Ok(());
         };
-        if !stamps_differ(driver, meta) {
-            return Ok(());
+        if stamps_differ(driver, meta) {
+            index.reload(driver, id);
         }
-        index.reload(driver, id);
+        self.restore_lost_version(locked, index, id, now)?;
         if differs_from_version(driver, id) {
             self.record_external(locked, index, id, now)?;
             index.refresh(driver)?;
         }
         Ok(())
+    }
+
+    /// Raises a version in `state.toml` that is lower than the newest stored version. An old backup
+    /// of the file can cause this. Without this step, the next write replaces a stored version.
+    fn restore_lost_version(
+        &self,
+        locked: &mut Locked<'_>,
+        index: &mut Index,
+        id: TaskId,
+        now: Timestamp,
+    ) -> Result<()> {
+        let driver = self.project.driver();
+        let Some(meta) = index.tasks.get(&id) else {
+            return Ok(());
+        };
+        let newest = newest_version(driver, id, meta.state.version)?;
+        if newest == meta.state.version {
+            return Ok(());
+        }
+        let mut state = meta.state.clone();
+        state.version = newest;
+        locked.commit(&Commit {
+            ops: vec![
+                put(format!("{}/state.toml", root_of(id)), toml_text(&state)?),
+                feed_op(&FeedEvent {
+                    kind: FeedKind::State,
+                    id: id.to_string(),
+                    version: newest,
+                    author: EXTERNAL_AUTHOR.to_owned(),
+                    reason: String::new(),
+                    changed: Vec::new(),
+                    at: now,
+                })?,
+            ],
+            ..Commit::default()
+        })?;
+        index.refresh(driver)
     }
 
     fn record_external(
@@ -2404,19 +2543,11 @@ impl TaskService {
         ops.push(put(format!("{root}/state.toml"), toml_text(&state)?));
         ops.push(feed_op(&task_event(id, version, FeedKind::Task, &meta))?);
         if meta.material {
-            let external = Caller {
-                actor: Actor::Human,
-                label: EXTERNAL_AUTHOR.to_owned(),
-                worktree: std::path::PathBuf::new(),
-                agent_key: lenka_plugin_api::AgentKey(String::new()),
-                scope: lenka_plugin_api::ProjectScope::All,
-                default_project: None,
-            };
             ops.extend(notice_ops(
                 index,
                 id,
                 Subject::Task(id.to_string()),
-                &external,
+                &external_caller(),
                 &meta,
                 now,
             )?);
@@ -2794,10 +2925,12 @@ fn check_unread(
     claim: &Claim,
 ) -> Result<()> {
     let open = notices::read_inbox(driver, &claim.agent_key)?;
+    let task = claim.task.to_string();
     let unread: Vec<&Notice> = open
         .iter()
+        // A notice stays valid for a new claim on the same task. A claim can end by timeout.
         .filter(|notice| {
-            notice.claim == claim.handle && notice_subject_exists(index, driver, notice)
+            notice.claimed_task == task && notice_subject_exists(index, driver, notice)
         })
         .collect();
     if unread.is_empty() {
@@ -2847,8 +2980,14 @@ fn check_write_claim(
             Some(found) if found.agent_key != caller.agent_key => Err(LenkaError::new(
                 ErrorCode::ClaimLost,
                 format!(
-                    "{} holds this task until {}. Record a proposal with task.entry.add.",
-                    found.holder, found.expires_at
+                    "{} holds this task until {}. {}",
+                    found.holder,
+                    found.expires_at,
+                    if caller.actor == Actor::Human {
+                        "To change it now, use --override."
+                    } else {
+                        "Record a proposal with task.entry.add."
+                    }
                 ),
             )),
             Some(_) => Ok(()),
@@ -3004,6 +3143,46 @@ fn read_text(driver: &dyn lenka_plugin_api::StorageDriver, path: &str) -> Result
             .map_err(|_| LenkaError::invalid_file(format!("{path} is not valid UTF-8."))),
         None => Ok(None),
     }
+}
+
+/// The caller for a change with no author in this process. Each claim holder gets a notice.
+fn external_caller() -> Caller {
+    Caller {
+        actor: Actor::Human,
+        label: EXTERNAL_AUTHOR.to_owned(),
+        worktree: std::path::PathBuf::new(),
+        agent_key: lenka_plugin_api::AgentKey(String::new()),
+        scope: lenka_plugin_api::ProjectScope::All,
+        default_project: None,
+    }
+}
+
+fn read_version_meta(
+    driver: &dyn lenka_plugin_api::StorageDriver,
+    id: TaskId,
+    version: u64,
+) -> Option<VersionMeta> {
+    let path = format!("{}/versions/{version:06}/meta.toml", root_of(id));
+    let text = read_text(driver, &path).ok().flatten()?;
+    toml::from_str(&text).ok()
+}
+
+/// Returns the newest stored version of a task. The usual case needs one file check.
+fn newest_version(
+    driver: &dyn lenka_plugin_api::StorageDriver,
+    id: TaskId,
+    known: u64,
+) -> Result<u64> {
+    let root = root_of(id);
+    let next = DocPath::new(format!("{root}/versions/{:06}/meta.toml", known + 1))?;
+    if driver.stat(&next)?.is_none() {
+        return Ok(known);
+    }
+    let names = driver.list(&DocPath::new(format!("{root}/versions"))?)?;
+    Ok(names
+        .iter()
+        .filter_map(|name| name.parse::<u64>().ok())
+        .fold(known, u64::max))
 }
 
 fn stamps_differ(driver: &dyn lenka_plugin_api::StorageDriver, meta: &TaskMeta) -> bool {

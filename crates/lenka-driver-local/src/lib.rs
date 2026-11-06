@@ -141,6 +141,20 @@ impl StorageDriver for LocalDriver {
         Ok(bytes)
     }
 
+    fn read_start(&self, path: &DocPath, max_bytes: u64) -> Result<Vec<u8>> {
+        self.check_no_symlink(path)?;
+        let file = match File::open(self.file_of(path)) {
+            Ok(file) => file,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(LenkaError::io("Open a document", &err)),
+        };
+        let mut bytes = Vec::new();
+        file.take(max_bytes)
+            .read_to_end(&mut bytes)
+            .map_err(|err| LenkaError::io("Read a document", &err))?;
+        Ok(bytes)
+    }
+
     fn list(&self, dir: &DocPath) -> Result<Vec<String>> {
         self.check_no_symlink(dir)?;
         let reader = match fs::read_dir(self.file_of(dir)) {

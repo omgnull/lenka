@@ -19,6 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::markdown::{MAX_TEXT_BYTES, check_conflict_markers, split_front};
 use crate::model::{Claim, Link, State, TaskFront, TaskMeta};
 
+/// The count of bytes at the start of the feed that identify the file. Each event has a time and an
+/// ID, so two feeds do not start with the same bytes.
+const FEED_HEAD_BYTES: u64 = 256;
+
 /// The length of a feed text with no line end at which lenka stops to wait for the line end.
 const MAX_FEED_LINE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -195,6 +199,8 @@ pub struct Index {
     pub bad_names: Vec<String>,
     /// The offset of the next unread byte in the feed.
     pub feed_offset: u64,
+    /// The start of the feed. It identifies the file.
+    feed_head: Vec<u8>,
 }
 
 impl Index {
@@ -320,7 +326,12 @@ impl Index {
         if len == self.feed_offset {
             return Ok(());
         }
-        if len < self.feed_offset {
+        // The feed can be lost and grow again, so the length alone does not identify the file.
+        let head = driver.read_start(&feed, FEED_HEAD_BYTES)?;
+        let shared = head.len().min(self.feed_head.len());
+        let same_feed = head[..shared] == self.feed_head[..shared];
+        self.feed_head = head;
+        if len < self.feed_offset || !same_feed {
             self.feed_offset = 0;
             self.scan(driver)?;
             return Ok(());
@@ -708,6 +719,7 @@ pub fn open_index(project: &Arc<Project>) -> Result<(Index, Vec<TaskId>)> {
     let mut index = Index::default();
     let feed = DocPath::new(FEED_PATH)?;
     index.feed_offset = driver.stat(&feed)?.map_or(0, |stat| stat.len);
+    index.feed_head = driver.read_start(&feed, FEED_HEAD_BYTES)?;
     index.load_snapshot(driver);
     let changed = index.scan(driver)?;
     index.reload_claims(driver)?;

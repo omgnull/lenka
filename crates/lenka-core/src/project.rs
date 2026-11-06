@@ -261,7 +261,13 @@ impl Project {
         work(&mut locked)
     }
 
-    /// Sends an event to the plugins. A plugin failure gives a warning text, not an error, because
+    /// Tells if a plugin listens to the events of this project.
+    #[must_use]
+    pub fn has_event_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
+    /// Sends an event to the plugins. A plugin failure gives a warning text, because
     /// the data write is already complete.
     #[must_use]
     pub fn emit(&self, event: &ProjectEvent) -> Vec<String> {

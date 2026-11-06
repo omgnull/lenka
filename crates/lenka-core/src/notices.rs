@@ -132,6 +132,20 @@ pub fn agent_key(worktree: &Path, agent: Option<&str>) -> AgentKey {
     AgentKey(hex(&digest[..12]))
 }
 
+/// Calculates the identity of a person in a worktree. It differs from each agent key of that
+/// worktree, so a person gets no notices of an agent, and a read by a person closes no notices of an
+/// agent.
+#[must_use]
+pub fn person_key(worktree: &Path) -> AgentKey {
+    let mut hasher = Sha256::new();
+    hasher.update(worktree.as_os_str().as_encoded_bytes());
+    // An agent name comes from the environment, so it cannot hold a zero byte.
+    hasher.update([0, 0]);
+    hasher.update(b"person");
+    let digest = hasher.finalize();
+    AgentKey(hex(&digest[..12]))
+}
+
 /// Formats bytes in lowercase hexadecimal.
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
