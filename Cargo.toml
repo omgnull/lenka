@@ -8,4 +8,13 @@ license = "GPL-3.0-only"
 repository = "https://github.com/omgnull/lenka"
 readme = "README.md"
 
+[lints.rust]
+unsafe_code = "forbid"
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+
 [dependencies]

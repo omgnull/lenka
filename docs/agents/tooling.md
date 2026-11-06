@@ -1,0 +1,32 @@
+---
+paths:
+  - ".github/**/*"
+  - "**/Cargo.toml"
+  - "deny.toml"
+---
+
+# Tooling rules
+
+## GitHub Actions
+
+Pin every action to a full 40-character commit SHA, for compatibility and security. Never use a tag or branch such as `@v7` or `@main`, in new workflows or when editing existing ones. Add the version as a trailing comment:
+
+```yaml
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+```
+
+Get the SHA for a release from GitHub, not from memory:
+
+```sh
+gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
+```
+
+Dependabot updates the pinned SHAs. CI installs Rust with `rustup` from the runner image, not with a third-party action.
+
+## Lints in CI
+
+CI runs clippy with `-D warnings`, so a lint at the `warn` level stops CI when it fires. Run the clippy command in [`CLAUDE.md`](../../CLAUDE.md#commands) after you add a lint to `Cargo.toml`.
+
+## Dependency licenses
+
+`deny.toml` allows only licenses that are compatible with `GPL-3.0-only`. Confirm that a license is compatible before you add it to the allow list.

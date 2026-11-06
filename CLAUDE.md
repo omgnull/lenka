@@ -24,21 +24,14 @@ cargo test --all-features --locked
 cargo deny check                   # needs cargo-deny installed
 ```
 
-## GitHub Actions
+## Additional rules
 
-Pin every action to a full 40-character commit SHA, for compatibility and security. Never use a tag or branch such as `@v7` or `@main`, in new workflows or when editing existing ones. Add the version as a trailing comment:
+`docs/agents/` holds the shared rules for people and agents. Claude Code loads them through symlinks in `.claude/rules/`, so do not import them with `@`.
 
-```yaml
-- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-```
-
-Get the SHA for a release from GitHub, not from memory:
-
-```sh
-gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
-```
-
-Dependabot updates the pinned SHAs. CI installs Rust with `rustup` from the runner image, not with a third-party action.
+- `docs/agents/README.md`: the index, and the procedure to change or add a rule.
+- `docs/agents/code.md`: general code and commit rules. Loads in each session.
+- `docs/agents/rust.md`: Rust code and Cargo files. Loads when you use a matching file.
+- `docs/agents/tooling.md`: CI, Dependabot, and cargo-deny. Loads when you use a matching file.
 
 ## Licensing
 
