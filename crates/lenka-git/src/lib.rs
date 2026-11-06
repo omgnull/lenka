@@ -327,9 +327,9 @@ pub fn enable(
 ) -> Result<EnableReport> {
     let dir = local_dir(project)?;
     let real_dir =
-        fs::canonicalize(&dir).map_err(|err| LenkaError::io("Read the data directory", &err))?;
+        gitdir::real_path(&dir).map_err(|err| LenkaError::io("Read the data directory", &err))?;
     let linked_common = common_dir
-        .and_then(|common| fs::canonicalize(common).ok())
+        .and_then(|common| gitdir::real_path(common).ok())
         .filter(|common| common.join(GIT_DATA_DIR) == real_dir);
     let layout = if linked_common.is_some() {
         Layout::Worktree

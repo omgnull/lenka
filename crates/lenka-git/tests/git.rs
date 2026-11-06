@@ -514,7 +514,7 @@ fn a_fresh_clone_restores_all_tasks_and_artifact_bytes() -> TestResult {
             let Some(data) = restore(&clone)? else {
                 panic!("the clone has the data branch");
             };
-            assert_eq!(data, data_dir(&fs::canonicalize(&clone)?));
+            assert_eq!(data, data_dir(&lenka_core::gitdir::real_path(&clone)?));
             assert_eq!(git(&clone, &["rev-parse", "HEAD"])?, head);
             assert_eq!(git(&clone, &["status", "--porcelain"])?, "");
 

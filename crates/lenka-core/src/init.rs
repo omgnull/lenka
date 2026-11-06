@@ -64,7 +64,7 @@ pub fn find_clone_file(start: &Path) -> Option<PathBuf> {
         let file = location.common_dir.join(CLONE_FILE);
         return file.is_file().then_some(file);
     }
-    let start = fs::canonicalize(start).ok()?;
+    let start = gitdir::real_path(start).ok()?;
     start
         .ancestors()
         .map(|dir| dir.join(PLAIN_CLONE_FILE))
@@ -75,7 +75,7 @@ pub fn find_clone_file(start: &Path) -> Option<PathBuf> {
 #[must_use]
 pub fn default_name(dir: &Path) -> String {
     let base = gitdir::locate(dir).map_or_else(|| dir.to_path_buf(), |location| location.worktree);
-    let raw = fs::canonicalize(&base)
+    let raw = gitdir::real_path(&base)
         .unwrap_or(base)
         .file_name()
         .map_or_else(
@@ -270,7 +270,7 @@ pub struct CallerSetup {
 /// Returns an error if the clone file is not valid.
 pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
     let worktree = gitdir::locate(cwd).map_or_else(
-        || fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+        || gitdir::real_path(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
         |location| location.worktree,
     );
     let clone = match find_clone_file(cwd) {

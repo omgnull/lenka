@@ -17,10 +17,37 @@ pub struct GitLocation {
     pub common_dir: PathBuf,
 }
 
+/// Returns the absolute form of an existing path, in a form that other programs can read.
+///
+/// On Windows, [`fs::canonicalize`] gives a path with the prefix `\\\\?\\`, and Git cannot use
+/// that form. This function removes the prefix.
+///
+/// # Errors
+///
+/// Returns an error if the path does not exist.
+pub fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    let real = fs::canonicalize(path)?;
+    Ok(match real.to_str().and_then(without_verbatim_prefix) {
+        Some(plain) => PathBuf::from(plain),
+        None => real,
+    })
+}
+
+/// Removes the Windows prefix for an extended path, from a drive path or a network path.
+fn without_verbatim_prefix(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(r"\\?\")?;
+    if let Some(network) = rest.strip_prefix(r"UNC\") {
+        return Some(format!(r"\\{network}"));
+    }
+    let bytes = rest.as_bytes();
+    let is_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    is_drive.then(|| rest.to_owned())
+}
+
 /// Finds the Git location of a directory. A directory outside Git gives `None`.
 #[must_use]
 pub fn locate(start: &Path) -> Option<GitLocation> {
-    let start = fs::canonicalize(start).ok()?;
+    let start = real_path(start).ok()?;
     for dir in start.ancestors() {
         let dot_git = dir.join(".git");
         let Ok(meta) = fs::symlink_metadata(&dot_git) else {
@@ -53,7 +80,7 @@ fn read_git_file(file: &Path, base: &Path) -> Option<PathBuf> {
     } else {
         base.join(path)
     };
-    fs::canonicalize(full).ok()
+    real_path(&full).ok()
 }
 
 fn common_dir_of(git_dir: &Path) -> PathBuf {
@@ -66,12 +93,25 @@ fn common_dir_of(git_dir: &Path) -> PathBuf {
     } else {
         git_dir.join(path)
     };
-    fs::canonicalize(&full).unwrap_or(full)
+    real_path(&full).unwrap_or(full)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_windows_path_prefix_goes_away() {
+        let plain = |text| without_verbatim_prefix(text);
+        assert_eq!(plain(r"\\?\C:\work\repo").as_deref(), Some(r"C:\work\repo"));
+        assert_eq!(
+            plain(r"\\?\UNC\host\share").as_deref(),
+            Some(r"\\host\share")
+        );
+        assert_eq!(plain(r"\\?\Volume{abc}\repo"), None);
+        assert_eq!(plain(r"C:\work"), None);
+        assert_eq!(plain("/work/repo"), None);
+    }
     use std::process::Command;
 
     fn git(dir: &Path, args: &[&str]) {
@@ -100,7 +140,7 @@ mod tests {
         };
         assert_eq!(first.common_dir, second.common_dir);
         assert_ne!(first.worktree, second.worktree);
-        assert_eq!(first.worktree, fs::canonicalize(&main)?);
+        assert_eq!(first.worktree, real_path(&main)?);
         Ok(())
     }
 
@@ -110,10 +150,7 @@ mod tests {
         let plain = temp.path().join("plain");
         fs::create_dir_all(plain.join(".git"))?;
         let found = locate(&plain);
-        assert_ne!(
-            found.map(|item| item.worktree),
-            Some(fs::canonicalize(&plain)?)
-        );
+        assert_ne!(found.map(|item| item.worktree), Some(real_path(&plain)?));
         Ok(())
     }
 }
