@@ -1,0 +1,27 @@
+# Dependency policy checked by `cargo deny check`.
+# Reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
+
+[licenses]
+# Licenses that can be combined with GPL-3.0-only. lenka's own license is
+# listed because cargo-deny also checks the workspace crate.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
