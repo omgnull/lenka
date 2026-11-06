@@ -1,0 +1,11 @@
+[package]
+name = "lenka"
+version = "0.1.0"
+edition = "2024"
+authors = ["Igor Pie <707208+omgnull@users.noreply.github.com>"]
+description = "AI-first project management and collaboration tool"
+license = "GPL-3.0-only"
+repository = "https://github.com/omgnull/lenka"
+readme = "README.md"
+
+[dependencies]
