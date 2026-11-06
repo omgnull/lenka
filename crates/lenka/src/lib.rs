@@ -12,11 +12,15 @@
 //! }
 //! ```
 
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
+#[macro_use]
+mod output;
+
 mod cli;
 #[cfg(feature = "tasks")]
 mod doctor;
 mod hook;
-mod output;
 
 #[cfg(feature = "artifacts")]
 mod artifact_cmd;

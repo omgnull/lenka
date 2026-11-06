@@ -191,6 +191,42 @@ pub fn read_inbox(driver: &dyn StorageDriver, key: &AgentKey) -> Result<Vec<Noti
     Ok(parse_inbox(&bytes[start..]))
 }
 
+/// Adds the open notices of a caller to a tool result. Each author text is in `untrusted_data`.
+pub fn add_to_reply(object: &mut serde_json::Map<String, serde_json::Value>, unread: &[Notice]) {
+    if unread.is_empty() {
+        return;
+    }
+    let reply = for_reply(unread);
+    if reply.omitted > 0 {
+        object.insert(
+            "unread_changes_omitted".to_owned(),
+            serde_json::json!(reply.omitted),
+        );
+    }
+    let rows: Vec<serde_json::Value> = reply
+        .shown
+        .iter()
+        .map(|notice| {
+            let (kind, id) = match &notice.subject {
+                Subject::Task(id) => ("task", id),
+                Subject::Artifact(id) => ("artifact", id),
+            };
+            serde_json::json!({
+                "kind": kind,
+                "id": id,
+                "version": notice.version,
+                "for_claim_on": notice.claimed_task,
+                "untrusted_data": {
+                    "author": notice.author,
+                    "reason": notice.reason,
+                    "changed": notice.changed,
+                },
+            })
+        })
+        .collect();
+    object.insert("unread_changes".to_owned(), serde_json::Value::Array(rows));
+}
+
 /// The notices of one reply, oldest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReplyNotices {

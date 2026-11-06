@@ -362,11 +362,11 @@ fn print_related(value: &Value) {
     for (key, item) in map {
         match item {
             Value::Array(rows) if !rows.is_empty() => {
-                println!("{key}:");
+                say!("{key}:");
                 print_task_rows(rows);
             }
             Value::Object(_) if key == "parent" => {
-                println!("{key}:");
+                say!("{key}:");
                 print_task_rows(std::slice::from_ref(item));
             }
             _ => {}
@@ -376,7 +376,7 @@ fn print_related(value: &Value) {
         .as_array()
         .filter(|links| !links.is_empty())
     {
-        println!("soft_links: {}", Value::Array(links.clone()));
+        say!("soft_links: {}", Value::Array(links.clone()));
     }
 }
 
@@ -384,7 +384,7 @@ fn print_detail(value: &Value) {
     let task = &value["task"];
     let data = &value["untrusted_data"];
     if task.is_object() && data.is_object() {
-        println!(
+        say!(
             "{}  {}  stage {}  version {}  {}",
             text(task, "id"),
             text(task, "status"),
@@ -392,33 +392,31 @@ fn print_detail(value: &Value) {
             task["version"],
             text(task, "type"),
         );
-        println!("{}  ({})", text(data, "title"), text(data, "author"));
+        say!("{}  ({})", text(data, "title"), text(data, "author"));
         if task["loop_stopped"] == true {
-            println!(
-                "The loop limit stopped this task. An agent cannot claim it until a person acts."
-            );
+            say!("The loop limit stopped this task. An agent cannot claim it until a person acts.");
         }
         if task["loop_until_done"] == true {
-            println!("An agent can continue the loop on this task until the task is done.");
+            say!("An agent can continue the loop on this task until the task is done.");
         }
         for key in ["claim", "active_blockers", "warnings", "soft_links"] {
             if !data[key].is_null() {
-                println!("{key}: {}", data[key]);
+                say!("{key}: {}", data[key]);
             }
         }
         for key in ["description", "requirements", "plan"] {
             if let Some(body) = data[key].as_str().filter(|body| !body.is_empty()) {
-                println!("\n{key}:\n{}", body.trim_end());
+                say!("\n{key}:\n{}", body.trim_end());
             }
         }
         if let Some(rows) = data["acceptance"].as_array() {
-            println!("\nacceptance: {}", Value::Array(rows.clone()));
+            say!("\nacceptance: {}", Value::Array(rows.clone()));
         } else if let Some(body) = data["acceptance"].as_str().filter(|body| !body.is_empty()) {
-            println!("\nacceptance:\n{}", body.trim_end());
+            say!("\nacceptance:\n{}", body.trim_end());
         }
         if let Some(rows) = data["entries"].as_array() {
             for row in rows {
-                println!(
+                say!(
                     "\n{} {} ({}):\n{}",
                     text(row, "kind"),
                     text(row, "id"),
@@ -429,7 +427,7 @@ fn print_detail(value: &Value) {
         }
         for key in ["artifacts", "versions"] {
             if !value[key].is_null() {
-                println!("\n{key}: {}", value[key]);
+                say!("\n{key}: {}", value[key]);
             }
         }
     } else {

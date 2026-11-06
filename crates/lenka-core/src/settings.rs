@@ -208,6 +208,15 @@ impl ProjectConfig {
             return Err(LenkaError::invalid_file("lenka.toml has no task types."));
         }
         for (name, def) in &self.types {
+            let names = std::iter::once(name).chain(def.stages.iter().map(|stage| &stage.name));
+            for checked in names {
+                if !crate::input::is_safe_name(checked) {
+                    return Err(LenkaError::invalid_file(format!(
+                        "lenka.toml has a type or a stage with a name that is not valid. A name has at most {} bytes of letters, digits, `-`, and `_`.",
+                        crate::input::MAX_NAME_BYTES
+                    )));
+                }
+            }
             if def.stages.is_empty() {
                 return Err(LenkaError::invalid_file(format!(
                     "The type {name} in lenka.toml has no stages."

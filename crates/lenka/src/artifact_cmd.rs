@@ -85,8 +85,7 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
                     json!({
                         "artifact": record.id.short(),
                         "full_id": record.id.to_string(),
-                        "name": record.name,
-                        "media_type": record.media_type,
+                        "untrusted_data": {"name": record.name, "media_type": record.media_type},
                         "version": record.version,
                         "size": record.current().size,
                     })
@@ -95,15 +94,15 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
             let value = json!({"artifacts": rows});
             context.print(&value, |_| {
                 if rows.is_empty() {
-                    println!("No artifacts.");
+                    say!("No artifacts.");
                 }
                 for row in &rows {
-                    println!(
+                    say!(
                         "{}  version {}  {} bytes  {}",
                         text(row, "artifact"),
                         row["version"],
                         row["size"],
-                        text(row, "name"),
+                        text(&row["untrusted_data"], "name"),
                     );
                 }
             });

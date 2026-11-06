@@ -115,7 +115,7 @@ fn agent_label(agent: Option<&str>, client: Option<&str>) -> String {
     let raw = agent.or(client).unwrap_or("mcp");
     let clean: String = raw
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !lenka_core::input::is_direction_control(*c))
         .take(MAX_NAME_CHARS)
         .collect();
     format!("agent:{}", if clean.is_empty() { "mcp" } else { &clean })
@@ -131,13 +131,25 @@ fn tool_of(def: ToolDef) -> Tool {
         .with_annotations(ToolAnnotations::new().read_only(def.read_only))
 }
 
+/// Forms the JSON of an error. The message of an invalid file can repeat text of this file, so
+/// this text goes in `untrusted_data`.
+fn error_json(error: &LenkaError) -> Value {
+    if error.code() == ErrorCode::InvalidFile {
+        return json!({
+            "code": error.code().as_str(),
+            "message": "A data file is not valid. A person must repair it. Run `lenka doctor`.",
+            "untrusted_data": {"details": error.message()},
+        });
+    }
+    json!({"code": error.code().as_str(), "message": error.message()})
+}
+
 /// Forms a tool result. A tool error is a result, so that the model can correct the call.
 fn result_of(outcome: Result<Value>) -> CallToolResult {
     match outcome {
         Ok(value) => CallToolResult::success(vec![ContentBlock::text(value.to_string())]),
         Err(error) => {
-            let text = json!({"code": error.code().as_str(), "message": error.message()});
-            CallToolResult::error(vec![ContentBlock::text(text.to_string())])
+            CallToolResult::error(vec![ContentBlock::text(error_json(&error).to_string())])
         }
     }
 }
@@ -234,6 +246,12 @@ pub fn serve_stdio(host: Arc<Host>, setup: ServerSetup) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_label_has_no_bidirectional_control() {
+        assert_eq!(agent_label(Some("root\u{202e}x\n"), None), "agent:rootx");
+        assert_eq!(agent_label(None, Some("\u{2066}")), "agent:mcp");
+    }
 
     #[test]
     fn the_label_prefers_the_agent_name() {

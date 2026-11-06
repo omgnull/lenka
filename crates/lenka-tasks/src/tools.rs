@@ -390,31 +390,7 @@ pub fn with_notes(mut result: Value, service: &TaskService, caller: &Caller) -> 
         return result;
     };
     if let Some(object) = result.as_object_mut() {
-        if !notes.unread.is_empty() {
-            let reply = lenka_core::notices::for_reply(&notes.unread);
-            if reply.omitted > 0 {
-                object.insert("unread_changes_omitted".to_owned(), json!(reply.omitted));
-            }
-            let rows: Vec<Value> = reply
-                .shown
-                .iter()
-                .map(|notice| {
-                    let (kind, id) = match &notice.subject {
-                        lenka_core::Subject::Task(id) => ("task", id),
-                        lenka_core::Subject::Artifact(id) => ("artifact", id),
-                    };
-                    json!({
-                        "kind": kind,
-                        "id": id,
-                        "version": notice.version,
-                        "changed": notice.changed,
-                        "for_claim_on": notice.claimed_task,
-                        "untrusted_data": {"author": notice.author, "reason": notice.reason},
-                    })
-                })
-                .collect();
-            object.insert("unread_changes".to_owned(), Value::Array(rows));
-        }
+        lenka_core::notices::add_to_reply(object, &notes.unread);
         if !notes.cross_project.is_empty() {
             let rows = serde_json::to_value(&notes.cross_project).unwrap_or(Value::Null);
             object.insert(

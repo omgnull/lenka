@@ -7,10 +7,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use lenka_core::input;
 use lenka_core::notices::{self, FEED_PATH};
 use lenka_core::{
-    Commit, FeedEvent, FeedKind, Op, Plugin, PluginInfo, Project, Registry, Subject, TextCheck,
-    ToolContext, ToolProvider,
+    Commit, FeedEvent, FeedKind, Op, Plugin, PluginInfo, Project, Registry, TextCheck, ToolContext,
+    ToolProvider,
 };
 use lenka_plugin_api::{
     Actor, Caller, DocPath, ErrorCode, LenkaError, MemoryId, Result, TaskId, Timestamp, ToolDef,
@@ -32,6 +33,9 @@ const MAX_TAG_BYTES: usize = 64;
 
 /// The count of search results when a call names no limit.
 const DEFAULT_LIMIT: usize = 20;
+
+/// The largest size of the memory text in one reply.
+const MAX_REPLY_BYTES: usize = 1024 * 1024;
 
 /// The largest count of search results.
 const MAX_LIMIT: usize = 200;
@@ -152,6 +156,21 @@ fn words(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// Applies the limits of a new record to a record from a file. A person or a merge can write the
+/// file, and one reply must stay small.
+fn check_record_limits(record: &MemoryRecord) -> Result<()> {
+    if record.text.len() > MAX_TEXT_BYTES {
+        return Err(LenkaError::invalid_file(format!(
+            "A memory file is larger than the limit of {MAX_TEXT_BYTES} bytes."
+        )));
+    }
+    input::check_short("The author of a memory record", &record.author)
+        .map_err(|error| LenkaError::invalid_file(error.message().to_owned()))?;
+    clean_tags(record.tags.clone())
+        .map_err(|error| LenkaError::invalid_file(error.message().to_owned()))?;
+    Ok(())
+}
+
 fn clean_tags(tags: Vec<String>) -> Result<Vec<String>> {
     let mut clean: Vec<String> = Vec::new();
     for tag in tags {
@@ -212,7 +231,7 @@ impl MemoryService {
                 "The text is larger than the limit of {MAX_TEXT_BYTES} bytes."
             )));
         }
-        lenka_core::input::check_text("The text", &text)?;
+        input::check_text("The text", &text)?;
         if has_conflict_markers(&text) {
             return Err(LenkaError::invalid_argument(
                 "The text has a line that looks like a Git conflict marker. Change that line.",
@@ -281,17 +300,23 @@ impl MemoryService {
             right
                 .0
                 .cmp(&left.0)
-                .then(right.1.at.cmp(&left.1.at))
+                // IDs are time-ordered. A file can hold any time, so the time does not sort.
                 .then(right.1.id.cmp(&left.1.id))
         });
         let limit = match query.limit {
             0 => DEFAULT_LIMIT,
             value => value.min(MAX_LIMIT),
         };
+        let mut bytes = 0;
         Ok(scored
             .into_iter()
             .take(limit)
             .map(|(_, record)| record)
+            .take_while(|record| {
+                let first = bytes == 0;
+                bytes += record.text.len();
+                first || bytes <= MAX_REPLY_BYTES
+            })
             .collect())
     }
 
@@ -365,6 +390,7 @@ impl MemoryService {
                 "The ID in a memory file does not match its file name.",
             ));
         }
+        check_record_limits(&record)?;
         Ok(Some(record))
     }
 
@@ -489,11 +515,13 @@ fn record_json(record: &MemoryRecord) -> Value {
     json!({
         "id": record.id.short(),
         "full_id": record.id.to_string(),
-        "author": record.author,
         "at": record.at.to_string(),
-        "tags": record.tags,
         "task": record.task.map(|task| task.short()),
-        "untrusted_data": record.text,
+        "untrusted_data": {
+            "text": record.text,
+            "author": record.author,
+            "tags": record.tags,
+        },
     })
 }
 
@@ -502,34 +530,8 @@ fn with_unread(mut result: Value, project: &Project, caller: &Caller) -> Value {
     let Ok(unread) = notices::read_inbox(project.driver(), &caller.agent_key) else {
         return result;
     };
-    if unread.is_empty() {
-        return result;
-    }
-    let reply = notices::for_reply(&unread);
-    let rows: Vec<Value> = reply
-        .shown
-        .iter()
-        .map(|notice| {
-            let (kind, id) = match &notice.subject {
-                Subject::Task(id) => ("task", id),
-                Subject::Artifact(id) => ("artifact", id),
-            };
-            json!({
-                "kind": kind,
-                "id": id,
-                "version": notice.version,
-                "changed": notice.changed,
-                "author": notice.author,
-                "reason_untrusted": notice.reason,
-                "for_claim_on": notice.claimed_task,
-            })
-        })
-        .collect();
     if let Some(object) = result.as_object_mut() {
-        object.insert("unread_changes".to_owned(), Value::Array(rows));
-        if reply.omitted > 0 {
-            object.insert("unread_changes_omitted".to_owned(), json!(reply.omitted));
-        }
+        notices::add_to_reply(object, &unread);
     }
     result
 }

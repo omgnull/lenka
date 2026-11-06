@@ -259,7 +259,7 @@ fn settings_file(cwd: &Path) -> PathBuf {
 }
 
 fn ask_person() -> anyhow::Result<bool> {
-    print!("Add this hook? [y/N] ");
+    say_text!("Add this hook? [y/N] ");
     std::io::stdout().flush().context("Write to the terminal")?;
     let mut line = String::new();
     std::io::stdin()
@@ -291,14 +291,14 @@ pub fn install(cwd: &Path, assume_yes: bool) -> anyhow::Result<()> {
         Err(err) => return Err(err).with_context(|| format!("Read {}", file.display())),
     };
     if !merge_hook(&mut root)? {
-        println!("{} already has the lenka hook. No change.", file.display());
+        say!("{} already has the lenka hook. No change.", file.display());
         return Ok(());
     }
-    println!("This change adds a PostToolUse hook to {}:", file.display());
-    println!("{}", serde_json::to_string_pretty(&hook_rule())?);
-    println!("All other content of the file stays.");
+    say!("This change adds a PostToolUse hook to {}:", file.display());
+    say!("{}", serde_json::to_string_pretty(&hook_rule())?);
+    say!("All other content of the file stays.");
     if !assume_yes && !ask_person()? {
-        println!("No change.");
+        say!("No change.");
         return Ok(());
     }
     if let Some(parent) = file.parent() {
@@ -309,7 +309,7 @@ pub fn install(cwd: &Path, assume_yes: bool) -> anyhow::Result<()> {
     text.push('\n');
     fs::write(&temp, text).with_context(|| format!("Write {}", temp.display()))?;
     fs::rename(&temp, &file).with_context(|| format!("Replace {}", file.display()))?;
-    println!("Added the hook. Claude Code reads it at the next session.");
+    say!("Added the hook. Claude Code reads it at the next session.");
     Ok(())
 }
 

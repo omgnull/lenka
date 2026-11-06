@@ -109,6 +109,15 @@ pub fn load_task(driver: &dyn StorageDriver, id: TaskId) -> Result<LoadedTask> {
     let state: State = toml::from_str(&state_text).map_err(|err| {
         LenkaError::invalid_file(format!("{state_path} is not valid: {}", err.message()))
     })?;
+    // These names appear outside `untrusted_data` in tool results.
+    if !lenka_core::input::is_safe_name(&front.kind)
+        || !lenka_core::input::is_safe_name(&state.stage)
+    {
+        return Err(LenkaError::invalid_file(format!(
+            "The type or the stage in the files of task {} is not a valid name.",
+            id.short()
+        )));
+    }
     Ok(LoadedTask {
         meta: TaskMeta {
             has_plan: plan.is_some(),

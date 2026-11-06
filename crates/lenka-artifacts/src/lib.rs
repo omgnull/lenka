@@ -641,8 +641,7 @@ fn record_json(record: &ArtifactRecord) -> Value {
     json!({
         "artifact": record.id.short(),
         "full_id": record.id.to_string(),
-        "untrusted_data": {"name": record.name},
-        "media_type": record.media_type,
+        "untrusted_data": {"name": record.name, "media_type": record.media_type},
         "version": record.version,
         "size": record.current().size,
         "sha256": record.current().sha256,

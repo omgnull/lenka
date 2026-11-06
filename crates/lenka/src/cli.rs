@@ -219,9 +219,9 @@ fn print_error(json_mode: bool, error: &anyhow::Error) {
             Some(item) => json!({"code": item.code().as_str(), "message": item.message()}),
             None => json!({"code": "error", "message": format!("{error:#}")}),
         };
-        println!("{value}");
+        crate::output::print_json(&value);
     } else {
-        eprintln!("error: {error:#}");
+        say_error!("error: {error:#}");
     }
 }
 
@@ -299,7 +299,7 @@ fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
         None => init::create_project(&paths, cwd, args.name.as_deref(), &location)?,
     };
     if context.json {
-        println!(
+        say!(
             "{}",
             json!({
                 "name": created.name,
@@ -311,20 +311,20 @@ fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     if was_restored {
-        println!(
+        say!(
             "Restored the project {} in {}.",
             created.name,
             created.directory.display()
         );
     } else {
-        println!(
+        say!(
             "Created the project {} in {}.",
             created.name,
             created.directory.display()
         );
-        println!("A delete of this clone also deletes this data, until the Git plugin pushes it.");
+        say!("A delete of this clone also deletes this data, until the Git plugin pushes it.");
     }
-    print!("{GUIDANCE}");
+    say_text!("{GUIDANCE}");
     Ok(())
 }
 
@@ -378,7 +378,7 @@ fn attach(context: &RunContext, name: &str) -> anyhow::Result<()> {
     let file = init::attach(&Paths::from_env()?, &context.cwd, name)?;
     let value = json!({"attached": name, "clone_file": file});
     context.print(&value, |_| {
-        println!("Connected this repository to the project {name}.");
+        say!("Connected this repository to the project {name}.");
     });
     Ok(())
 }
@@ -407,7 +407,7 @@ fn list_projects(context: &RunContext) -> anyhow::Result<()> {
     let value = json!({"projects": rows});
     context.print(&value, |_| {
         if rows.is_empty() {
-            println!("No projects. Run `lenka init`.");
+            say!("No projects. Run `lenka init`.");
         }
         for row in &rows {
             let mark = if row["default"] == true {
@@ -417,7 +417,7 @@ fn list_projects(context: &RunContext) -> anyhow::Result<()> {
             } else {
                 "-"
             };
-            println!(
+            say!(
                 "{}  {mark}  {}",
                 crate::output::text(row, "name"),
                 crate::output::text(row, "directory"),
@@ -433,7 +433,7 @@ fn migrate(context: &RunContext, host: &Host) -> anyhow::Result<()> {
     let format = project.config().format_version;
     let value = json!({"project": project.name(), "format_version": format, "changed": false});
     context.print(&value, |_| {
-        println!(
+        say!(
             "The project {} has the data format {format}, and the current format is {FORMAT_VERSION}. No change.",
             project.name()
         );
@@ -458,14 +458,14 @@ fn show_plugins(context: &RunContext, host: &Host) -> anyhow::Result<()> {
     let value = json!({"plugins": rows});
     context.print(&value, |_| {
         for item in host.plugins() {
-            println!(
+            say!(
                 "{:<14} {:<4} {TRUST_LABEL}. {}",
                 item.info.name,
                 if item.enabled { "on" } else { "off" },
                 item.info.description
             );
         }
-        println!(
+        say!(
             "The file {} selects the plugins that run.",
             host.paths().plugins_file().display()
         );
@@ -511,7 +511,7 @@ fn reindex(context: &RunContext, host: &Host) -> anyhow::Result<()> {
     let count = lenka_tasks::service_of(&project)?.reindex(&caller)?;
     let value = json!({"project": project.name(), "tasks": count});
     context.print(&value, |_| {
-        println!(
+        say!(
             "Rebuilt the index of the project {}: {count} tasks.",
             project.name()
         );
@@ -548,11 +548,11 @@ fn git_enable(
     let report = lenka_git::enable(&project, common.as_deref(), &options)?;
     let value = serde_json::to_value(&report)?;
     context.print(&value, |_| {
-        println!("Git is on for the project {}.", project.name());
+        say!("Git is on for the project {}.", project.name());
         if report.remote_found {
-            println!("`lenka sync` pushes to the remote {}.", report.remote);
+            say!("`lenka sync` pushes to the remote {}.", report.remote);
         } else {
-            println!(
+            say!(
                 "The remote {} does not exist yet, so the data stays local. Add a remote, or use --remote.",
                 report.remote
             );
@@ -572,7 +572,7 @@ fn versions_before_sync(
         tasks.task_versions()
     });
     versions.unwrap_or_else(|error| {
-        eprintln!("Warning: lenka did not read the tasks before the sync: {error}");
+        say_error!("Warning: lenka did not read the tasks before the sync: {error}");
         lenka_tasks::TaskVersions::default()
     })
 }
@@ -597,16 +597,16 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
     let value = serde_json::to_value(&report)?;
     context.print(&value, |_| {
         if report.has_conflict() {
-            println!("The merge has a conflict, so lenka stopped it. Nothing changed. The files:");
+            say!("The merge has a conflict, so lenka stopped it. Nothing changed. The files:");
             for file in &report.conflict {
-                println!("  {file}");
+                say!("  {file}");
             }
-            println!("Merge the branch by hand in the data directory, run `git commit`, run `lenka reindex`, and run `lenka sync` again.");
+            say!("Merge the branch by hand in the data directory, run `git commit`, run `lenka reindex`, and run `lenka sync` again.");
             return;
         }
         match &report.remote {
-            None => println!("Stored the data locally. This project has no remote."),
-            Some(remote) => println!(
+            None => say!("Stored the data locally. This project has no remote."),
+            Some(remote) => say!(
                 "Synced with {remote}: commit {}, merge {}, push {}.",
                 yes_no(report.committed),
                 yes_no(report.merged),
@@ -614,22 +614,22 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
             ),
         }
         if let Some(error) = &report.push_error {
-            println!("The push failed: {error}");
-            println!("The commit and the merge are stored. Run `lenka sync` again.");
+            say!("The push failed: {error}");
+            say!("The commit and the merge are stored. Run `lenka sync` again.");
         }
         if !report.settings_changed.is_empty() {
-            println!(
+            say!(
                 "The merge changed these shared settings in lenka.toml: {}. Check them.",
                 report.settings_changed.join(", ")
             );
         }
         if let Some(warning) = &report.lfs_warning {
-            println!("Some artifact bytes are not downloaded: {warning}");
+            say!("Some artifact bytes are not downloaded: {warning}");
         }
         if !report.skipped.is_empty() {
-            println!("These files are not lenka data, so they stay in this clone:");
+            say!("These files are not lenka data, so they stay in this clone:");
             for file in &report.skipped {
-                println!("  {file}");
+                say!("  {file}");
             }
         }
     });
@@ -664,14 +664,14 @@ fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
     });
     context.print(&value, |_| {
         if clean {
-            println!("The project {} has no problems.", project.name());
+            say!("The project {} has no problems.", project.name());
             return;
         }
         let list = |title: &str, items: &[String]| {
             if !items.is_empty() {
-                println!("{title}:");
+                say!("{title}:");
                 for item in items {
-                    println!("  {item}");
+                    say!("  {item}");
                 }
             }
         };
@@ -683,11 +683,11 @@ fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
         list("Unavailable links", &report.unavailable_links);
         list("Tasks on a missing stage", &report.missing_stages);
         if let Some(reason) = &report.unfinished_write {
-            println!("An unfinished write stops all writes: {reason}");
+            say!("An unfinished write stops all writes: {reason}");
         }
         list("Artifacts that are not downloaded (Git LFS pointer files)", &not_downloaded);
         if let Some(kind) = &network {
-            println!(
+            say!(
                 "Warning: the data directory is on a network file system ({kind}). File locks are unreliable there. A team must use a server."
             );
         }

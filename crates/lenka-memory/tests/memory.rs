@@ -78,7 +78,7 @@ fn search(fixture: &Fixture, args: Value) -> Result<Vec<String>> {
         .map(|rows| {
             rows.iter()
                 .map(|row| {
-                    row["untrusted_data"]
+                    row["untrusted_data"]["text"]
                         .as_str()
                         .unwrap_or_default()
                         .to_owned()
@@ -294,5 +294,19 @@ fn an_unknown_tool_is_not_found() -> Result<()> {
         panic!("an unknown tool must fail");
     };
     assert_eq!(error.code(), ErrorCode::NotFound);
+    Ok(())
+}
+
+#[test]
+fn one_reply_holds_a_limited_size_of_memory_text() -> Result<()> {
+    let fixture = fixture()?;
+    let text = "x".repeat(60 * 1024);
+    for _ in 0..30 {
+        add(&fixture, &text, &[])?;
+    }
+    let found = search(&fixture, json!({"limit": 200}))?;
+    let bytes: usize = found.iter().map(String::len).sum();
+    assert!(!found.is_empty());
+    assert!(bytes <= 1024 * 1024, "{bytes} bytes");
     Ok(())
 }

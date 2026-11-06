@@ -1777,7 +1777,8 @@ impl TaskService {
                 ErrorCode::ClaimLost,
                 format!(
                     "{} holds this task until {}. Select another task.",
-                    existing.holder, existing.expires_at
+                    holder_for(existing, caller),
+                    existing.expires_at
                 ),
             ));
         }
@@ -2812,6 +2813,16 @@ fn cycle_error() -> LenkaError {
     )
 }
 
+/// Names the holder of a claim in an error. A holder name comes from a client, so it is data, and
+/// the text of an error for an agent does not hold it.
+fn holder_for<'a>(claim: &'a Claim, caller: &Caller) -> &'a str {
+    if caller.actor == Actor::Human {
+        &claim.holder
+    } else {
+        "Another holder"
+    }
+}
+
 /// Refuses a change of a closed task. Only [`TaskService::set_status`] opens a closed task.
 fn check_not_closed(meta: &TaskMeta) -> Result<()> {
     if meta.state.status.is_closed() {
@@ -2864,7 +2875,11 @@ fn clean_title(title: &str) -> Result<String> {
     if line.is_empty() {
         return Err(LenkaError::invalid_argument("A task requires a title."));
     }
-    if line.len() > MAX_TITLE_BYTES || line.chars().any(char::is_control) {
+    if line.len() > MAX_TITLE_BYTES
+        || line
+            .chars()
+            .any(|item| item.is_control() || input::is_direction_control(item))
+    {
         return Err(LenkaError::invalid_argument(format!(
             "A title is one line with at most {MAX_TITLE_BYTES} bytes and no control characters."
         )));
@@ -3120,7 +3135,7 @@ fn check_write_claim(
                 ErrorCode::ClaimLost,
                 format!(
                     "{} holds this task until {}. {}",
-                    found.holder,
+                    holder_for(found, caller),
                     found.expires_at,
                     if caller.actor == Actor::Human {
                         "To change it now, use --override."
@@ -3436,6 +3451,12 @@ fn check_artifact_record(id: ArtifactId, record: &ArtifactRecord) -> Result<()> 
     };
     if last.version != record.version {
         return fail("the current version is not the last version.");
+    }
+    // A hash appears outside `untrusted_data` in tool results.
+    let is_hash =
+        |text: &str| text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !record.versions.iter().all(|item| is_hash(&item.sha256)) {
+        return fail("a hash is not valid.");
     }
     if !is_safe_file_name(&record.name)
         || !record

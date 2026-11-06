@@ -37,17 +37,17 @@ pub enum MemoryCommand {
 fn print_found(value: &Value) {
     let rows = value.get("memories").and_then(Value::as_array);
     let Some(rows) = rows.filter(|rows| !rows.is_empty()) else {
-        println!("No memory records.");
+        say!("No memory records.");
         return;
     };
     for row in rows {
-        println!(
+        say!(
             "{}  {}  {}",
             text(row, "id"),
             text(row, "at"),
-            text(row, "author")
+            text(&row["untrusted_data"], "author")
         );
-        println!("{}", text(row, "untrusted_data"));
+        say!("{}", text(&row["untrusted_data"], "text"));
     }
 }
 

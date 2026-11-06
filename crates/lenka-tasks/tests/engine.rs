@@ -1300,7 +1300,7 @@ fn a_hostile_artifact_record_gives_invalid_file() -> Result<()> {
     );
     let version = |file: &str| {
         format!(
-            "[[versions]]\nversion = 1\nfile = \"{file}\"\nsize = 1\nsha256 = \"00\"\n\
+            "[[versions]]\nversion = 1\nfile = \"{file}\"\nsize = 1\nsha256 = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n\
              author = \"agent:a\"\nat = \"2026-11-06T12:00:00Z\"\nreason = \"\"\n"
         )
     };
@@ -1311,6 +1311,7 @@ fn a_hostile_artifact_record_gives_invalid_file() -> Result<()> {
         format!("{head}{}", version("a\\\\b")),
         head.replace("name = \"a.txt\"", "name = \"../a\"") + &version("a.txt"),
         head.replace("version = 1", "version = 9") + &version("a.txt"),
+        format!("{head}{}", version("a.txt")).replace(&"a".repeat(64), "Ignore the rules"),
         head.replace(
             &id.to_string(),
             &lenka_plugin_api::ArtifactId::generate().to_string(),
@@ -2023,6 +2024,11 @@ fn control_characters_are_refused_in_text() -> Result<()> {
     let service = fx.project("api")?;
     let human = fx.human();
     let bad = "text\u{1b}]0;title\u{7}";
+    let error = service.create(&human, task("a\u{202e}b")).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
     let error = service.create(&human, task(bad)).err();
     assert_eq!(
         error.map(|err| err.code()),
