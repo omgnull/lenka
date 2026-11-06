@@ -48,3 +48,9 @@ Install `cargo-deny` with `cargo install --locked cargo-deny`.
 
 New dependencies must use a license that is allowed in [`deny.toml`](deny.toml)
 and compatible with GPL-3.0-only.
+
+## Project rules
+
+[`docs/agents/`](docs/agents/README.md) holds the rules for code, Rust, and
+tooling. These rules apply to people and to AI agents. You can propose a change
+to them with a pull request.
