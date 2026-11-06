@@ -46,6 +46,10 @@ lenka is `GPL-3.0-only`. `CONTRIBUTING.md` has the required SPDX and copyright h
 
 `deny.toml` allows only dependency licenses that are compatible with GPL-3.0-only. Before you add a license to its allow list, confirm that it is compatible.
 
+## Task artifacts
+
+Write all local plans and other task artifacts to a subfolder of `.agents/`, for example `.agents/plans/` or `.agents/specs/`. Do not write them directly in `.agents/` or in other folders of the repository. Git ignores `.agents/`, so do not commit these files.
+
 ## Writing style
 
 Use a relaxed form of ASD-STE100 Simplified Technical English (Issue 9) in new and changed text. Apply it to documentation, code comments, rustdoc, commit messages, pull requests, issues, and user-facing messages. Do not apply it to code, commands, quoted text, or `LICENSE`.
