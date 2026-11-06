@@ -63,6 +63,17 @@ fn isolated(name: &str, config: &str, body: impl FnOnce() -> TestResult) -> Test
     Ok(())
 }
 
+/// Returns a file URL. On Windows, the form is `file:///C:/dir`, because Git LFS refuses a
+/// backslash or a drive letter directly after `file://`.
+fn file_url(path: &Path) -> String {
+    let text = path.display().to_string().replace('\\', "/");
+    if text.starts_with('/') {
+        format!("file://{text}")
+    } else {
+        format!("file:///{text}")
+    }
+}
+
 fn git(dir: &Path, args: &[&str]) -> TestResult<String> {
     let output = Command::new("git").args(args).current_dir(dir).output()?;
     assert!(
@@ -576,7 +587,7 @@ fn git_lfs_sends_the_artifact_bytes_and_a_fresh_clone_gets_them() -> TestResult 
             fs::create_dir_all(&first_root)?;
             fs::create_dir_all(&second_root)?;
             let remote = bare(temp.path())?;
-            let url = format!("file://{}", remote.display());
+            let url = file_url(&remote);
 
             let first = Machine::new(&first_root)?;
             let repo = repo_with_project(&first, "api")?;
