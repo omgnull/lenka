@@ -328,6 +328,7 @@ fn data_from_a_remote_cannot_run_code_or_replay_a_journal() -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_from_a_remote_is_refused() -> TestResult {
     let pair = pair()?;
@@ -336,13 +337,10 @@ fn a_symlink_from_a_remote_is_refused() -> TestResult {
     machine.ok(&repo, &["git", "enable"])?;
     machine.json(&repo, &["sync"])?;
     let evil = push_hostile_files(machine, &pair.remote, &[("tasks/plain.md", "text")])?;
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink("/etc/passwd", evil.join("tasks/link"))?;
-        machine.git(&evil, &["add", "tasks/link"])?;
-        machine.git(&evil, &["commit", "-q", "-m", "link"])?;
-        machine.git(&evil, &["push", "-q", "origin", "lenka-data"])?;
-        assert_eq!(machine.fails(&repo, &["sync"])?, "invalid_file");
-    }
+    std::os::unix::fs::symlink("/etc/passwd", evil.join("tasks/link"))?;
+    machine.git(&evil, &["add", "tasks/link"])?;
+    machine.git(&evil, &["commit", "-q", "-m", "link"])?;
+    machine.git(&evil, &["push", "-q", "origin", "lenka-data"])?;
+    assert_eq!(machine.fails(&repo, &["sync"])?, "invalid_file");
     Ok(())
 }

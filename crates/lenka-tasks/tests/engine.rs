@@ -976,6 +976,7 @@ fn write_file(path: &Path, text: &str) -> Result<()> {
     fs::write(path, text).map_err(|err| LenkaError::io("write", &err))
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlink_in_a_write_path_stops_only_that_write() -> Result<()> {
     let fx = fixture()?;
@@ -990,10 +991,7 @@ fn a_symlink_in_a_write_path_stops_only_that_write() -> Result<()> {
         .join("versions");
     let aside = fx.root.join("aside");
     fs::rename(&versions, &aside).map_err(|err| LenkaError::io("rename", &err))?;
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&aside, &versions).map_err(|err| LenkaError::io("link", &err))?;
-    #[cfg(not(unix))]
-    return Ok(());
     let patch = |version| TaskPatch {
         expected_version: version,
         title: Some("New".to_owned()),
