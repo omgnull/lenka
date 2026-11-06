@@ -34,6 +34,12 @@ const MIN_ZOOM: f32 = 0.02;
 const MAX_ZOOM: f32 = 16.0;
 const HANDLE_SIZE: f32 = 9.0;
 const LIST_ROW_HEIGHT: f32 = 24.0;
+/// The smallest count of points in the outline of one ellipse.
+const MIN_ELLIPSE_POINTS: usize = 8;
+/// The largest count of points in the outline of one ellipse.
+const MAX_ELLIPSE_POINTS: usize = 256;
+/// The count of ellipse points that one frame shares between all visible ellipses.
+const ELLIPSE_POINTS_IN_FRAME: usize = 200_000;
 /// The color of the paper. A drawing has fixed colors, so the paper stays light in a dark theme.
 const PAPER: Color32 = Color32::from_rgb(0xf7, 0xf8, 0xfa);
 const PAPER_DOT: Color32 = Color32::from_rgb(0xd9, 0xdd, 0xe3);
@@ -191,7 +197,6 @@ pub(crate) struct DrawingBoard {
     width: f64,
     gesture: Gesture,
     canvas_rect: Rect,
-    text_before: Option<Snapshot>,
     focus_text: bool,
 }
 
@@ -253,7 +258,6 @@ impl DrawingBoard {
             width: 2.0,
             gesture: Gesture::None,
             canvas_rect: Rect::ZERO,
-            text_before: None,
             focus_text: false,
         }
     }
@@ -269,7 +273,6 @@ impl DrawingBoard {
         self.version = record.version;
         self.remote_version = None;
         self.gesture = Gesture::None;
-        self.text_before = None;
         Ok(())
     }
 
@@ -293,46 +296,47 @@ impl DrawingBoard {
     }
 
     fn commit_text_if_unfocused(&mut self, ui: &Ui) {
-        if self.text_before.is_some()
-            && !ui.ctx().egui_wants_keyboard_input()
-            && let Some(before) = self.text_before.take()
-        {
-            self.editor.commit(before);
+        if !ui.ctx().egui_wants_keyboard_input() {
+            self.editor.finish_typing();
         }
     }
 
     fn shortcuts(&mut self, ui: &Ui, events: &mut Vec<DrawingEvent>) {
         let command = Modifiers::COMMAND;
         let mut fit = false;
+        // A gesture holds positions in the shape list, so the list stays the same until its end.
+        let idle = matches!(self.gesture, Gesture::None);
         ui.input_mut(|input| {
-            if input.consume_key(command | Modifiers::SHIFT, Key::Z)
-                || input.consume_key(command, Key::Y)
-            {
-                self.editor.redo();
-            }
-            if input.consume_key(command, Key::Z) {
-                self.editor.undo();
-            }
-            if input.consume_key(command, Key::S) {
-                events.push(DrawingEvent::Save);
-            }
-            if input.consume_key(command, Key::D) {
-                self.editor.duplicate_selected();
-            }
-            if input.consume_key(command, Key::A) {
-                self.editor.select_all();
+            if idle {
+                if input.consume_key(command | Modifiers::SHIFT, Key::Z)
+                    || input.consume_key(command, Key::Y)
+                {
+                    self.editor.redo();
+                }
+                if input.consume_key(command, Key::Z) {
+                    self.editor.undo();
+                }
+                if input.consume_key(command, Key::S) {
+                    events.push(DrawingEvent::Save);
+                }
+                if input.consume_key(command, Key::D) {
+                    self.editor.duplicate_selected();
+                }
+                if input.consume_key(command, Key::A) {
+                    self.editor.select_all();
+                }
+                if input.consume_key(Modifiers::NONE, Key::Delete)
+                    || input.consume_key(Modifiers::NONE, Key::Backspace)
+                {
+                    self.editor.delete_selected();
+                }
             }
             if input.consume_key(command, Key::Num0) {
                 fit = true;
             }
-            if input.consume_key(Modifiers::NONE, Key::Delete)
-                || input.consume_key(Modifiers::NONE, Key::Backspace)
-            {
-                self.editor.delete_selected();
-            }
             if input.consume_key(Modifiers::NONE, Key::Escape) {
+                self.cancel_gesture();
                 self.editor.clear_selection();
-                self.gesture = Gesture::None;
                 self.tool = Tool::Select;
             }
             for (tool, _, _, key) in Tool::ALL {
@@ -343,6 +347,15 @@ impl DrawingBoard {
         });
         if fit {
             self.needs_fit = true;
+        }
+    }
+
+    /// Ends a gesture, and puts the shapes back.
+    fn cancel_gesture(&mut self) {
+        if let Gesture::Move { before, .. } | Gesture::Resize { before, .. } =
+            std::mem::replace(&mut self.gesture, Gesture::None)
+        {
+            self.editor.restore(&before);
         }
     }
 
@@ -464,7 +477,10 @@ impl DrawingBoard {
                     {
                         events.push(DrawingEvent::ReloadRemote);
                     }
+                    // The next save replaces that version, and the old version stays in the
+                    // history of the artifact.
                     if ui.button("Keep my edits").clicked() {
+                        self.version = version;
                         self.remote_version = None;
                     }
                 });
@@ -558,9 +574,6 @@ impl DrawingBoard {
                 self.focus_text = false;
             }
             if response.changed() {
-                if self.text_before.is_none() {
-                    self.text_before = Some(self.editor.snapshot());
-                }
                 self.editor.set_text_live(index, text);
             }
         }
@@ -918,7 +931,7 @@ impl DrawingBoard {
         match &self.gesture {
             Gesture::Create { kind, points } => {
                 if let Some(shape) = self.shape_of(*kind, points) {
-                    paint_shape(painter, rect, self.camera, &shape);
+                    paint_shape(painter, rect, self.camera, &shape, MAX_ELLIPSE_POINTS);
                 }
             }
             Gesture::Marquee { start, current } => {
@@ -942,10 +955,21 @@ impl DrawingBoard {
         let view_min = self.camera.to_world(rect, rect.min);
         let view_max = self.camera.to_world(rect, rect.max);
         let view = Bounds::of_points(view_min, view_max);
-        for shape in &self.editor.doc().shapes {
-            if shape.bounds().expand(shape.width + 2.0).intersects(view) {
-                paint_shape(painter, rect, self.camera, shape);
-            }
+        let visible: Vec<&Shape> = self
+            .editor
+            .doc()
+            .shapes
+            .iter()
+            .filter(|shape| shape.bounds().expand(shape.width + 2.0).intersects(view))
+            .collect();
+        let ellipses = visible
+            .iter()
+            .filter(|shape| shape.kind == Kind::Ellipse)
+            .count();
+        let ellipse_points = (ELLIPSE_POINTS_IN_FRAME / ellipses.max(1))
+            .clamp(MIN_ELLIPSE_POINTS, MAX_ELLIPSE_POINTS);
+        for shape in visible {
+            paint_shape(painter, rect, self.camera, shape, ellipse_points);
         }
     }
 
@@ -980,8 +1004,35 @@ fn color_of(text: &str) -> Color32 {
     parse_color(text).map_or(Color32::BLACK, |[r, g, b]| Color32::from_rgb(r, g, b))
 }
 
+/// Returns the outline of an ellipse, with at most `limit` points.
+///
+/// The ellipse shape of `egui` adds points with the radius, so one large ellipse can cost millions
+/// of vertices on each frame.
+fn ellipse_outline(center: Pos2, radius: Vec2, limit: usize) -> Vec<Pos2> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the clamp keeps the value small and positive"
+    )]
+    let wanted = radius.max_elem().clamp(0.0, 4096.0) as usize;
+    let count = (MIN_ELLIPSE_POINTS + wanted).min(limit.max(MIN_ELLIPSE_POINTS));
+    (0..count)
+        .map(|index| {
+            #[expect(clippy::cast_precision_loss, reason = "the count of points is small")]
+            let angle = std::f32::consts::TAU * index as f32 / count as f32;
+            center + Vec2::new(radius.x * angle.cos(), radius.y * angle.sin())
+        })
+        .collect()
+}
+
 /// Paints one shape.
-fn paint_shape(painter: &Painter, canvas: Rect, camera: Camera, shape: &Shape) {
+fn paint_shape(
+    painter: &Painter,
+    canvas: Rect,
+    camera: Camera,
+    shape: &Shape,
+    ellipse_points: usize,
+) {
     #[expect(clippy::cast_possible_truncation, reason = "screen sizes fit in f32")]
     let width = (shape.width as f32 * camera.zoom).max(0.5);
     let stroke = Stroke::new(width, color_of(&shape.stroke));
@@ -997,11 +1048,15 @@ fn paint_shape(painter: &Painter, canvas: Rect, camera: Camera, shape: &Shape) {
             painter.rect_stroke(area, 0.0, stroke, StrokeKind::Middle);
         }
         Kind::Ellipse => {
-            let radius = area.size() / 2.0;
+            let outline = ellipse_outline(area.center(), area.size() / 2.0, ellipse_points);
             if let Some(fill) = fill {
-                painter.add(egui::Shape::ellipse_filled(area.center(), radius, fill));
+                painter.add(egui::Shape::convex_polygon(
+                    outline.clone(),
+                    fill,
+                    Stroke::NONE,
+                ));
             }
-            painter.add(egui::Shape::ellipse_stroke(area.center(), radius, stroke));
+            painter.add(egui::Shape::closed_line(outline, stroke));
         }
         Kind::Line | Kind::Arrow | Kind::Freehand => {
             let points: Vec<Pos2> = shape

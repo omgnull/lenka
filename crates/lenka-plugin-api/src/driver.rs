@@ -244,6 +244,21 @@ pub trait ArtifactStore: Send + Sync + fmt::Debug {
     /// Returns an error if the bytes cannot be read.
     fn get(&self, id: ArtifactId, version: u64, name: &str) -> Result<Vec<u8>>;
 
+    /// Reads the bytes of a version, and stops after `max_bytes`. A store must not read a larger
+    /// file into memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::ErrorCode::InvalidFile`] if the version is larger than the limit, or an
+    /// error if the bytes cannot be read.
+    fn get_limited(
+        &self,
+        id: ArtifactId,
+        version: u64,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>>;
+
     /// Returns a local path of a version, for stores that have one.
     fn local_path(&self, id: ArtifactId, version: u64, name: &str) -> Option<PathBuf>;
 

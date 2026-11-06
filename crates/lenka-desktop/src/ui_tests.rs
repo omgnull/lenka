@@ -756,6 +756,272 @@ fn the_drawing_keys_work_and_undo_restores_the_shape() {
     );
 }
 
+/// Writes a new version of the first drawing of a task, as another process does.
+fn write_remote_version(fixture: &Fixture, task: TaskId, expected_version: u64) {
+    let (host, tasks) = fixture.other_process();
+    let artifact = tasks
+        .detail(task, &[])
+        .expect("detail")
+        .meta
+        .front
+        .artifacts[0];
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let text = "{\"format\": 1, \"shapes\": []}";
+    let request = lenka_artifacts::NewVersion {
+        expected_version,
+        source: lenka_artifacts::Source::Bytes {
+            name: "remote.json",
+            media_type: DRAWING_MEDIA_TYPE,
+            bytes: text.as_bytes(),
+        },
+        reason: "An agent changed the drawing",
+        mode: lenka_artifacts::UpdateMode::Keep,
+        claim: ClaimRef::Implicit,
+    };
+    artifacts_of(&project)
+        .expect("artifacts")
+        .update(&fixture.agent(), artifact, &request)
+        .expect("a new version");
+}
+
+fn newest_drawing_version(fixture: &Fixture, task: TaskId) -> u64 {
+    let (host, tasks) = fixture.other_process();
+    let artifact = tasks
+        .detail(task, &[])
+        .expect("detail")
+        .meta
+        .front
+        .artifacts[0];
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    artifacts_of(&project)
+        .expect("artifacts")
+        .record(artifact)
+        .expect("record")
+        .version
+}
+
+#[test]
+fn keep_my_edits_lets_the_next_save_replace_the_other_version() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    click(&mut harness, "Save drawing");
+    draw_rectangle(&mut harness);
+    write_remote_version(&fixture, ids[0], 1);
+    wait_until(&mut harness, "the banner shows", |harness| {
+        harness
+            .query_by_label_contains("Another writer saved version 2")
+            .is_some()
+    });
+    click(&mut harness, "Keep my edits");
+    click(&mut harness, "Save drawing");
+    type_into(&mut harness, "Reason", "Keep the second box");
+    click(&mut harness, "Save version");
+    assert!(
+        harness.state().app().dialog.is_none(),
+        "the save works with the new version"
+    );
+    assert_eq!(newest_drawing_version(&fixture, ids[0]), 3);
+    assert_eq!(shapes_of(&harness).len(), 2);
+}
+
+#[test]
+fn text_that_a_person_types_stays_when_another_writer_saves() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    click(&mut harness, "Text");
+    let canvas = harness.get_by_label("Drawing canvas").rect();
+    harness.hover_at(canvas.center());
+    harness.step();
+    harness.drag_at(canvas.center());
+    harness.step();
+    harness.drop_at(canvas.center());
+    harness.run();
+    click(&mut harness, "Save drawing");
+    assert_eq!(shapes_of(&harness).len(), 1);
+    type_into(&mut harness, "Shape text", " with more");
+    assert!(
+        shapes_of(&harness)[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("with more"))
+    );
+    write_remote_version(&fixture, ids[0], 1);
+    wait_until(&mut harness, "the banner shows", |harness| {
+        harness
+            .query_by_label_contains("Another writer saved version 2")
+            .is_some()
+    });
+    assert!(
+        shapes_of(&harness)[0]
+            .text
+            .as_deref()
+            .is_some_and(|text| text.contains("with more")),
+        "the reload waits for a choice of the person"
+    );
+}
+
+#[test]
+fn a_delete_during_a_drag_changes_no_shape() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    let canvas = harness.get_by_label("Drawing canvas").rect();
+    click(&mut harness, "Rectangle");
+    drag(
+        &mut harness,
+        canvas.center() + Vec2::new(150.0, 150.0),
+        canvas.center() + Vec2::new(250.0, 210.0),
+    );
+    let before = shapes_of(&harness);
+    assert_eq!(before.len(), 2);
+
+    // The top edge of the first rectangle.
+    let from = canvas.center() - Vec2::new(0.0, 60.0);
+    harness.hover_at(from);
+    harness.step();
+    harness.drag_at(from);
+    harness.step();
+    harness.hover_at(from + Vec2::new(30.0, 30.0));
+    harness.step();
+    harness.key_press(egui::Key::Delete);
+    harness.step();
+    harness.hover_at(from + Vec2::new(40.0, 40.0));
+    harness.step();
+    harness.drop_at(from + Vec2::new(40.0, 40.0));
+    harness.run();
+    let after = shapes_of(&harness);
+    assert_eq!(after.len(), 2, "the delete waits for the end of the drag");
+    assert_eq!(after[1], before[1], "the other shape stays the same");
+    assert_ne!(after[0], before[0], "the drag moved the first shape");
+}
+
+#[test]
+fn escape_during_a_move_puts_the_shape_back() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    let before = shapes_of(&harness);
+    let canvas = harness.get_by_label("Drawing canvas").rect();
+    let from = canvas.center() - Vec2::new(0.0, 60.0);
+    harness.hover_at(from);
+    harness.step();
+    harness.drag_at(from);
+    harness.step();
+    harness.hover_at(from + Vec2::new(30.0, 30.0));
+    harness.step();
+    assert_ne!(shapes_of(&harness), before, "the drag moves the shape");
+    harness.key_press(egui::Key::Escape);
+    harness.step();
+    harness.drop_at(from + Vec2::new(30.0, 30.0));
+    harness.run();
+    assert_eq!(shapes_of(&harness), before);
+}
+
+#[test]
+fn a_drawing_name_with_a_path_is_refused_in_the_dialog() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Artifacts");
+    click(&mut harness, "New drawing");
+    type_into(&mut harness, "Drawing name", "plans/first");
+    click(&mut harness, "Create drawing");
+    assert!(harness.state().app().drawing.is_none());
+    assert!(harness.state().app().dialog.is_some());
+    assert!(harness.query_by_label_contains("one file name").is_some());
+}
+
+#[test]
+fn a_drawing_outside_a_limit_does_not_save() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    let board = harness
+        .state_mut()
+        .app_mut()
+        .drawing
+        .as_mut()
+        .expect("a board");
+    let mut shape =
+        crate::drawing::model::Shape::new(crate::drawing::model::Kind::Text, "#000000", None, 1.0);
+    shape.text = Some("x".repeat(70 * 1024));
+    board.editor.add(shape);
+    harness.run();
+    click(&mut harness, "Save drawing");
+    let app = harness.state().app();
+    assert!(
+        app.banners.iter().any(|text| text.contains("larger than")),
+        "{:?}",
+        app.banners
+    );
+    assert!(
+        app.drawing
+            .as_ref()
+            .is_some_and(|board| board.artifact.is_none())
+    );
+    let (_host, tasks) = fixture.other_process();
+    let detail = tasks.detail(ids[0], &[]).expect("detail");
+    assert!(detail.meta.front.artifacts.is_empty());
+}
+
+#[test]
+fn large_ellipses_cost_few_vertices() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let mut document = Document::default();
+    for offset in 0..100_u32 {
+        let mut shape = crate::drawing::model::Shape::new(
+            crate::drawing::model::Kind::Ellipse,
+            "#000000",
+            Some("#ffffff"),
+            1.0,
+        );
+        shape.x = f64::from(offset);
+        shape.y = f64::from(offset);
+        shape.w = 9_000_000.0;
+        shape.h = 9_000_000.0;
+        document.shapes.push(shape);
+    }
+    let (host, _tasks) = fixture.other_process();
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let text = document.to_text();
+    let record = artifacts_of(&project)
+        .expect("artifacts")
+        .create(
+            &fixture.person(),
+            lenka_artifacts::Source::Bytes {
+                name: "large.lenka-drawing.json",
+                media_type: DRAWING_MEDIA_TYPE,
+                bytes: text.as_bytes(),
+            },
+            None,
+            Some(DRAWING_MEDIA_TYPE),
+        )
+        .expect("an artifact");
+    let _ = ids;
+    harness
+        .state_mut()
+        .app_mut()
+        .open_drawing_for_test(record.id);
+    harness.run();
+    assert_eq!(shapes_of(&harness).len(), 100);
+    let output = harness.output().shapes.clone();
+    let meshes = harness.ctx.tessellate(output, 1.0);
+    let vertices: usize = meshes
+        .iter()
+        .map(|mesh| match &mesh.primitive {
+            egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+            egui::epaint::Primitive::Callback(_) => 0,
+        })
+        .sum();
+    assert!(vertices < 1_000_000, "{vertices} vertices");
+}
+
 #[test]
 fn a_gantt_drag_moves_the_dates() {
     let fixture = Arc::new(Fixture::with_project());

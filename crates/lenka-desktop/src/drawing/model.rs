@@ -457,6 +457,22 @@ impl Document {
         text
     }
 
+    /// Formats the drawing for a save. A file that a later open refuses cannot be saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the drawing is outside a limit of a drawing file.
+    pub(crate) fn checked_text(&self) -> Result<String, DrawingError> {
+        self.validate()?;
+        let text = self.to_text();
+        if text.len() > MAX_BYTES {
+            return Err(bad(format!(
+                "The drawing is larger than the limit of {MAX_BYTES} bytes."
+            )));
+        }
+        Ok(text)
+    }
+
     fn validate(&self) -> Result<(), DrawingError> {
         if self.shapes.len() > MAX_SHAPES {
             return Err(bad(format!(
@@ -643,6 +659,9 @@ pub(crate) struct Editor {
     state: u64,
     saved_state: u64,
     next_state: u64,
+    /// The old form of a text shape while a person types in it. Typing records no undo step for
+    /// each key, so the step waits here until the typing ends.
+    typing: Option<Snapshot>,
 }
 
 impl Editor {
@@ -665,11 +684,12 @@ impl Editor {
 
     /// Tells if the drawing has edits that are not saved.
     pub(crate) fn is_dirty(&self) -> bool {
-        self.state != self.saved_state
+        self.state != self.saved_state || self.typing.is_some()
     }
 
     /// Records that the current state is saved.
     pub(crate) fn mark_saved(&mut self) {
+        self.finish_typing();
         self.saved_state = self.state;
     }
 
@@ -693,6 +713,7 @@ impl Editor {
     }
 
     pub(crate) fn undo(&mut self) {
+        self.finish_typing();
         if let Some(patch) = self.undo.pop() {
             let target = patch.state;
             let inverse = apply(&mut self.doc.shapes, patch, self.state);
@@ -703,6 +724,7 @@ impl Editor {
     }
 
     pub(crate) fn redo(&mut self) {
+        self.finish_typing();
         if let Some(patch) = self.redo.pop() {
             let target = patch.state;
             let inverse = apply(&mut self.doc.shapes, patch, self.state);
@@ -755,6 +777,7 @@ impl Editor {
 
     /// Adds a shape on top, and selects it.
     pub(crate) fn add(&mut self, shape: Shape) {
+        self.finish_typing();
         let at = self.doc.shapes.len();
         self.doc.shapes.push(shape);
         self.push_undo(Patch {
@@ -780,6 +803,7 @@ impl Editor {
 
     /// Records an undo step for a change in place.
     pub(crate) fn commit(&mut self, before: Snapshot) {
+        self.finish_typing();
         let changed = before
             .iter()
             .any(|(index, shape)| self.doc.shapes.get(*index) != Some(shape));
@@ -795,6 +819,7 @@ impl Editor {
 
     /// Changes all selected shapes with one undo step.
     pub(crate) fn change_selected(&mut self, mut change: impl FnMut(&mut Shape)) {
+        self.finish_typing();
         let before = self.snapshot();
         for (index, _) in &before {
             if let Some(shape) = self.doc.shapes.get_mut(*index) {
@@ -804,11 +829,30 @@ impl Editor {
         self.commit(before);
     }
 
+    /// Returns the shape at a position of a snapshot. A position can hold another shape if the
+    /// list changed after the snapshot, and a change must not reach that shape.
+    fn shape_of_snapshot(&mut self, index: usize, old: &Shape) -> Option<&mut Shape> {
+        self.doc
+            .shapes
+            .get_mut(index)
+            .filter(|shape| shape.id == old.id)
+    }
+
+    /// Puts the shapes of a snapshot back. This records no undo step, because a gesture records
+    /// its step only at its end.
+    pub(crate) fn restore(&mut self, before: &Snapshot) {
+        for (index, old) in before {
+            if let Some(shape) = self.shape_of_snapshot(*index, old) {
+                shape.clone_from(old);
+            }
+        }
+    }
+
     /// Moves the shapes of a snapshot by an offset from their old positions. This records no undo
     /// step, so a drag can call it for each pointer move.
     pub(crate) fn drag_move(&mut self, before: &Snapshot, dx: f64, dy: f64) {
         for (index, old) in before {
-            if let Some(shape) = self.doc.shapes.get_mut(*index) {
+            if let Some(shape) = self.shape_of_snapshot(*index, old) {
                 shape.clone_from(old);
                 shape.translate(dx, dy);
             }
@@ -818,23 +862,43 @@ impl Editor {
     /// Scales the shapes of a snapshot from one box to another. This records no undo step.
     pub(crate) fn drag_resize(&mut self, before: &Snapshot, from: Bounds, to: Bounds) {
         for (index, old) in before {
-            if let Some(shape) = self.doc.shapes.get_mut(*index) {
+            if let Some(shape) = self.shape_of_snapshot(*index, old) {
                 shape.clone_from(old);
                 shape.transform(from, to);
             }
         }
     }
 
-    /// Sets the text of a text shape. This records no undo step, so typing can call it.
+    /// Sets the text of a text shape. The undo step waits until the typing ends, so typing can
+    /// call this for each key.
     pub(crate) fn set_text_live(&mut self, index: usize, text: String) {
+        let same_shape = self
+            .typing
+            .as_ref()
+            .is_some_and(|before| before.iter().any(|(at, _)| *at == index));
+        if !same_shape {
+            self.finish_typing();
+            if let Some(shape) = self.doc.shapes.get(index) {
+                self.typing = Some(vec![(index, shape.clone())]);
+            }
+        }
         if let Some(shape) = self.doc.shapes.get_mut(index) {
             shape.text = Some(text);
             shape.fit_text();
         }
     }
 
+    /// Ends the typing, and records its undo step. Each other change calls this first, because
+    /// the step holds a position in the list.
+    pub(crate) fn finish_typing(&mut self) {
+        if let Some(before) = self.typing.take() {
+            self.commit(before);
+        }
+    }
+
     /// Deletes the selected shapes.
     pub(crate) fn delete_selected(&mut self) {
+        self.finish_typing();
         if self.selection.is_empty() {
             return;
         }
@@ -851,6 +915,7 @@ impl Editor {
 
     /// Copies the selected shapes to the top, with an offset, and selects the copies.
     pub(crate) fn duplicate_selected(&mut self) {
+        self.finish_typing();
         let copies: Vec<Shape> = self
             .selection
             .iter()
@@ -893,6 +958,7 @@ impl Editor {
     }
 
     fn reorder(&mut self, join: impl FnOnce(Vec<Shape>, Vec<Shape>) -> Vec<Shape>) {
+        self.finish_typing();
         if self.selection.is_empty() {
             return;
         }
@@ -930,6 +996,7 @@ impl Editor {
     /// Replaces the whole document with new content from a reload. This clears the history.
     pub(crate) fn replace(&mut self, doc: Document) {
         self.doc = doc;
+        self.typing = None;
         self.selection.clear();
         self.undo.clear();
         self.redo.clear();
@@ -941,6 +1008,110 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn text_shape(text: &str) -> Shape {
+        let mut shape = Shape::new(Kind::Text, "#1f2937", None, 1.0);
+        shape.text = Some(text.to_owned());
+        shape.fit_text();
+        shape
+    }
+
+    /// The sequence of a person who types, deletes the shape, and undoes both steps.
+    #[test]
+    fn undo_after_typing_and_delete_keeps_ids_unique() {
+        let mut editor = Editor::new(Document::default());
+        editor.add(rect(0.0, 0.0, 10.0, 10.0));
+        editor.add(text_shape("old"));
+        editor.set_text_live(1, "new".to_owned());
+        editor.delete_selected();
+        assert_eq!(editor.doc().shapes.len(), 1);
+        editor.undo();
+        assert_eq!(editor.doc().shapes[1].text.as_deref(), Some("new"));
+        editor.undo();
+        assert_eq!(editor.doc().shapes[1].text.as_deref(), Some("old"));
+        assert_eq!(editor.doc().shapes.len(), 2);
+        // A second finish finds nothing, as the check of the next frame does.
+        editor.finish_typing();
+        assert_eq!(editor.doc().shapes.len(), 2);
+        assert!(Document::from_bytes(editor.doc().to_text().as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn typing_is_an_unsaved_edit_with_one_undo_step() {
+        let mut editor = Editor::new(Document::default());
+        editor.add(text_shape("old"));
+        editor.mark_saved();
+        assert!(!editor.is_dirty());
+        editor.set_text_live(0, "n".to_owned());
+        assert!(editor.is_dirty(), "a reload must not replace typed text");
+        editor.set_text_live(0, "ne".to_owned());
+        editor.finish_typing();
+        editor.undo();
+        assert_eq!(editor.doc().shapes[0].text.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn typing_in_a_second_shape_records_the_first_step() {
+        let mut editor = Editor::new(Document::default());
+        editor.add(text_shape("one"));
+        editor.add(text_shape("two"));
+        editor.set_text_live(0, "one more".to_owned());
+        editor.set_text_live(1, "two more".to_owned());
+        editor.finish_typing();
+        editor.undo();
+        assert_eq!(editor.doc().shapes[1].text.as_deref(), Some("two"));
+        assert_eq!(editor.doc().shapes[0].text.as_deref(), Some("one more"));
+        editor.undo();
+        assert_eq!(editor.doc().shapes[0].text.as_deref(), Some("one"));
+    }
+
+    #[test]
+    fn a_save_ends_the_typing() {
+        let mut editor = Editor::new(Document::default());
+        editor.add(text_shape("old"));
+        editor.set_text_live(0, "new".to_owned());
+        editor.mark_saved();
+        assert!(!editor.is_dirty());
+        editor.finish_typing();
+        assert!(
+            !editor.is_dirty(),
+            "the step of the saved text is not a new edit"
+        );
+    }
+
+    #[test]
+    fn a_drag_cannot_change_another_shape_after_the_list_changes() {
+        let mut editor = Editor::new(Document::default());
+        editor.add(rect(0.0, 0.0, 10.0, 10.0));
+        editor.add(rect(50.0, 50.0, 10.0, 10.0));
+        editor.select_only(0);
+        let before = editor.snapshot();
+        let other = editor.doc().shapes[1].clone();
+        editor.delete_selected();
+        editor.drag_move(&before, 5.0, 5.0);
+        editor.restore(&before);
+        assert_eq!(editor.doc().shapes, vec![other.clone()]);
+        let from = before[0].1.bounds();
+        editor.drag_resize(&before, from, from.expand(5.0));
+        assert_eq!(editor.doc().shapes, vec![other]);
+    }
+
+    #[test]
+    fn a_save_refuses_a_drawing_that_a_later_open_refuses() {
+        let mut document = Document::default();
+        assert!(document.checked_text().is_ok());
+        document
+            .shapes
+            .push(text_shape(&"x".repeat(MAX_TEXT_BYTES + 1)));
+        assert!(document.checked_text().is_err());
+        let mut far = rect(0.0, 0.0, 1.0, 1.0);
+        far.x = MAX_COORDINATE * 2.0;
+        document.shapes = vec![far];
+        assert!(document.checked_text().is_err());
+        let copy = rect(0.0, 0.0, 1.0, 1.0);
+        document.shapes = vec![copy.clone(), copy];
+        assert!(document.checked_text().is_err(), "duplicate IDs");
+    }
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Shape {
         let mut shape = Shape::new(Kind::Rect, "#1f2937", None, 2.0);

@@ -485,6 +485,21 @@ impl ArtifactService {
         self.project.artifacts().get(id, wanted, &item.file)
     }
 
+    /// Reads the bytes of the newest version, and stops at a limit. A larger file does not enter
+    /// the memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidFile`] if the version is larger than the limit, or an error if
+    /// the bytes cannot be read.
+    pub fn read_newest_limited(&self, id: ArtifactId, max_bytes: u64) -> Result<Vec<u8>> {
+        let record = self.record(id)?;
+        let item = record.current();
+        self.project
+            .artifacts()
+            .get_limited(id, record.version, &item.file, max_bytes)
+    }
+
     /// Resolves a full ID or a short ID.
     ///
     /// # Errors

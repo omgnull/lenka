@@ -211,6 +211,29 @@ impl ArtifactStore for FsStore {
         fs::read(&file).map_err(|err| LenkaError::io("Read the artifact", &err))
     }
 
+    fn get_limited(
+        &self,
+        id: ArtifactId,
+        version: u64,
+        name: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        let path = self.file_of(id, version, name)?;
+        self.check_no_symlink(&path)?;
+        let file =
+            fs::File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
+        let mut bytes = Vec::new();
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| LenkaError::io("Read the artifact", &err))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(LenkaError::invalid_file(format!(
+                "The artifact is larger than the limit of {max_bytes} bytes."
+            )));
+        }
+        Ok(bytes)
+    }
+
     fn local_path(&self, id: ArtifactId, version: u64, name: &str) -> Option<PathBuf> {
         self.file_of(id, version, name).ok()
     }
@@ -259,6 +282,21 @@ mod tests {
         assert!(store.get(id, 1, "a.txt").is_err());
         store.delete_all(id)?;
         assert!(store.get(id, 2, "b.bin").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_limited_read_stops_at_the_limit() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let store = FsStore::new(temp.path());
+        let id = ArtifactId::generate();
+        store.put_bytes(id, 1, "a.txt", b"abc")?;
+        assert_eq!(store.get_limited(id, 1, "a.txt", 3)?, b"abc");
+        let error = store.get_limited(id, 1, "a.txt", 2).err();
+        assert_eq!(
+            error.map(|err| err.code()),
+            Some(lenka_plugin_api::ErrorCode::InvalidFile)
+        );
         Ok(())
     }
 

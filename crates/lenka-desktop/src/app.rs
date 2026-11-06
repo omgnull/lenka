@@ -23,6 +23,7 @@ use crate::dialogs::{
     ReasonForm, ReturnForm,
 };
 use crate::drawing::canvas::{DrawingBoard, DrawingEvent, file_name_of};
+use crate::drawing::model::MAX_BYTES;
 use crate::gantt::GanttState;
 use crate::roadmap::RoadmapState;
 use crate::session::Session;
@@ -60,6 +61,9 @@ pub(crate) struct DesktopApp {
     pub banners: Vec<String>,
     actions: Vec<Action>,
 }
+
+/// The largest drawing file that the app reads.
+const MAX_DRAWING_BYTES: u64 = MAX_BYTES as u64;
 
 impl DesktopApp {
     /// Creates the app, and opens the first project.
@@ -669,6 +673,16 @@ impl DesktopApp {
                     self.dialog = Some(Dialog::NewDrawing { task, name, error });
                     return;
                 }
+                // The name becomes a file name, so a save would fail later.
+                if !lenka_tasks::is_safe_file_name(&file_name_of(&name))
+                    || !lenka_tasks::is_safe_file_name(name.trim())
+                {
+                    let error = Some(FormError::text(
+                        "A drawing name is one file name, with no path and no control characters.",
+                    ));
+                    self.dialog = Some(Dialog::NewDrawing { task, name, error });
+                    return;
+                }
                 self.drawing = Some(DrawingBoard::new_unsaved(name.trim(), task));
                 self.view = View::Drawing;
             }
@@ -1275,7 +1289,7 @@ impl DesktopApp {
         let loaded = session.artifacts.record(artifact).and_then(|record| {
             session
                 .artifacts
-                .read_bytes(artifact, None)
+                .read_newest_limited(artifact, MAX_DRAWING_BYTES)
                 .map(|bytes| (record, bytes))
         });
         match loaded {
@@ -1337,7 +1351,11 @@ impl DesktopApp {
         let (Some(session), Some(board)) = (&self.session, &mut self.drawing) else {
             return Ok(());
         };
-        let text = board.editor.doc().to_text();
+        let text = board
+            .editor
+            .doc()
+            .checked_text()
+            .map_err(|error| LenkaError::invalid_argument(error.to_string()))?;
         let file = file_name_of(&board.name);
         let source = Source::Bytes {
             name: &file,
@@ -1366,7 +1384,11 @@ impl DesktopApp {
         let Some(artifact) = board.artifact else {
             return Ok(());
         };
-        let text = board.editor.doc().to_text();
+        let text = board
+            .editor
+            .doc()
+            .checked_text()
+            .map_err(|error| LenkaError::invalid_argument(error.to_string()))?;
         let file = file_name_of(&board.name);
         let source = Source::Bytes {
             name: &file,
@@ -1398,7 +1420,7 @@ impl DesktopApp {
         let loaded = session.artifacts.record(artifact).and_then(|record| {
             session
                 .artifacts
-                .read_bytes(artifact, None)
+                .read_newest_limited(artifact, MAX_DRAWING_BYTES)
                 .map(|bytes| (record, bytes))
         });
         match loaded {
@@ -1476,7 +1498,10 @@ fn sync_drawing(board: &mut DrawingBoard, session: &Session, errors: &mut Vec<Le
         board.remote_version = Some(record.version);
         return;
     }
-    match session.artifacts.read_bytes(artifact, None) {
+    match session
+        .artifacts
+        .read_newest_limited(artifact, MAX_DRAWING_BYTES)
+    {
         Ok(bytes) => {
             if let Err(error) = board.load_version(&record, &bytes) {
                 errors.push(LenkaError::invalid_file(format!(
