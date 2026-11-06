@@ -98,6 +98,28 @@ impl Git {
         }
     }
 
+    /// Returns a hook directory that cannot exist. Git LFS tries to create this directory and to
+    /// add its hooks there. On Windows, `/dev/null` is a relative path for Git LFS, and a path below
+    /// a regular file cannot become a directory.
+    #[cfg(windows)]
+    fn no_hooks_path(&self) -> OsString {
+        let file = [PROJECT_FILE, "config", "HEAD"]
+            .into_iter()
+            .map(|name| self.dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| self.dir.clone());
+        file.join("no-hooks").into_os_string()
+    }
+
+    #[cfg(not(windows))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the Windows form of this function reads the directory"
+    )]
+    fn no_hooks_path(&self) -> OsString {
+        OsString::from("/dev/null")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new("git");
         command
@@ -113,9 +135,9 @@ impl Git {
             command.env("GIT_TERMINAL_PROMPT", "0");
         }
         // The hook path is outside the data, so that no data from a remote can become a hook.
-        command.args([
-            "-c",
-            "core.hooksPath=/dev/null",
+        let mut hooks = OsString::from("core.hooksPath=");
+        hooks.push(self.no_hooks_path());
+        command.arg("-c").arg(hooks).args([
             "-c",
             "core.fsmonitor=false",
             "-c",
