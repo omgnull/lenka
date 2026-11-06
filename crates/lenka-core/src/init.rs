@@ -19,10 +19,11 @@ use crate::settings::{
 pub const GIT_DATA_DIR: &str = "lenka-data";
 
 /// The contents of `.gitignore` in a data directory.
-const GITIGNORE: &str = ".runtime/\n";
+const GITIGNORE: &str = ".runtime/\n.tmp-*\n";
 
-/// The contents of `.gitattributes` in a data directory.
-const GITATTRIBUTES: &str = "artifacts/*/versions/** filter=lfs diff=lfs merge=lfs -text\n";
+/// The contents of `.gitattributes` in a data directory. A branch from another clone must have
+/// this text, because other text can change how Git reads and writes the data.
+pub const GITATTRIBUTES: &str = "artifacts/*/versions/** filter=lfs diff=lfs merge=lfs -text\n";
 
 /// Where a new project stores its data.
 #[derive(Debug, Clone, PartialEq, Eq)]

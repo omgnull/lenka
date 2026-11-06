@@ -410,13 +410,23 @@ impl Host {
                 ))
             })?;
         let store = store_factory(&entry.directory)?;
-        Project::open(
+        let project = Project::open(
             driver,
             store,
             Arc::clone(&self.clock),
             self.registry.hooks.clone(),
             Arc::clone(&self.peers),
-        )
+        )?;
+        if project.id() != entry.id {
+            return Err(LenkaError::new(
+                ErrorCode::ProjectNotAvailable,
+                format!(
+                    "The directory {} holds a project with another ID than the project list. Restore the `id` value in lenka.toml.",
+                    entry.directory.display()
+                ),
+            ));
+        }
+        Ok(project)
     }
 
     /// Finds the list entry of a project ID, with no regard to a caller scope. Only the visible

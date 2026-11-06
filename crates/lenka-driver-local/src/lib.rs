@@ -45,6 +45,9 @@ const JOURNAL_PATH: &str = ".runtime/pending.json";
 /// The largest document that the driver reads.
 pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// The count of names that one write tries for a temporary file.
+const TEMP_ATTEMPTS: usize = 64;
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A storage driver on a local directory.
@@ -259,6 +262,22 @@ fn sync_dir(dir: &Path) {
     }
 }
 
+/// Creates a new temporary file in a directory. The file cannot exist already, so this call never
+/// writes through a symlink that another process put at that name.
+fn create_temp(parent: &Path) -> std::io::Result<(PathBuf, File)> {
+    let mut last = None;
+    for _ in 0..TEMP_ATTEMPTS {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".tmp-{}-{counter}", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => last = Some(err),
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(ErrorKind::AlreadyExists)))
+}
+
 impl WriteTxn for LocalTxn<'_> {
     fn journal_write(&mut self, bytes: &[u8]) -> Result<()> {
         let path = journal_path()?;
@@ -302,15 +321,26 @@ impl WriteTxn for LocalTxn<'_> {
         self.driver.check_no_symlink(path)
     }
 
+    fn check_file_path(&self, path: &DocPath) -> Result<()> {
+        self.driver.check_no_symlink(path)?;
+        match fs::symlink_metadata(self.driver.file_of(path)) {
+            Ok(meta) if !meta.is_file() => Err(LenkaError::invalid_file(format!(
+                "The path {path} is not a regular file, so lenka cannot write it. Remove that path."
+            ))),
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(LenkaError::io("Read file metadata", &err)),
+        }
+    }
+
     fn put(&mut self, path: &DocPath, bytes: &[u8]) -> Result<()> {
         self.driver.check_no_symlink(path)?;
         let file = self.driver.file_of(path);
         self.ensure_parent(&file)?;
         let parent = file.parent().unwrap_or(&self.driver.root);
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temp = parent.join(format!(".tmp-{}-{counter}", std::process::id()));
+        let (temp, mut handle) =
+            create_temp(parent).map_err(|err| LenkaError::io("Create a temporary file", &err))?;
         let result = (|| {
-            let mut handle = File::create(&temp)?;
             handle.write_all(bytes)?;
             if self.strict_flush {
                 handle.sync_data()?;
@@ -442,6 +472,43 @@ mod tests {
         file.set_len(MAX_DOCUMENT_BYTES + 1)
             .map_err(|e| LenkaError::io("len", &e))?;
         assert!(driver.read(&DocPath::new("big")?).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_file_never_follows_a_planted_symlink()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "keep")?;
+        let root = temp.path().join("data");
+        fs::create_dir_all(&root)?;
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        for counter in next..next + 8 {
+            let name = format!(".tmp-{}-{counter}", std::process::id());
+            std::os::unix::fs::symlink(&outside, root.join(name))?;
+        }
+        let (planted, mut file) = create_temp(&root)?;
+        file.write_all(b"new")?;
+        assert_eq!(fs::read_to_string(&outside)?, "keep");
+        assert_eq!(fs::read_to_string(planted)?, "new");
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_at_a_file_path_fails_before_the_journal()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir_all(temp.path().join("tasks/blocked.md/x"))?;
+        let driver = LocalDriver::open(temp.path())?;
+        let txn = driver.begin()?;
+        let error = txn
+            .check_file_path(&DocPath::new("tasks/blocked.md")?)
+            .err()
+            .ok_or("the check passed")?;
+        assert_eq!(error.code(), ErrorCode::InvalidFile);
+        assert!(txn.check_file_path(&DocPath::new("tasks/new.md")?).is_ok());
         Ok(())
     }
 }

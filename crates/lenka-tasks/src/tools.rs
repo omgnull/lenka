@@ -16,7 +16,7 @@ use crate::service::{
     CheckItem, ClaimRef, Finish, ListFilter, NewEntry, NewTask, TaskDetail, TaskPatch, TaskService,
     service_of,
 };
-use crate::service::{RelatedView, TaskRow};
+use crate::service::{RelatedView, StateChange, TaskRow};
 
 /// The plugin of task operations.
 #[derive(Debug, Clone, Copy, Default)]
@@ -437,14 +437,14 @@ fn dispatch(service: &TaskService, caller: &Caller, name: &str, args: Value) -> 
         "task.advance" => {
             let args: AdvanceArgs = parse_args(args)?;
             let id = service.resolve(&args.task)?;
-            let state = service.advance(
+            let change = service.advance(
                 caller,
                 id,
                 &claim_ref(args.claim),
                 &args.evidence,
                 args.back_to.as_deref(),
             )?;
-            Ok(state_json(id, &state))
+            Ok(change_json(id, &change))
         }
         "task.entry.add" => entry(service, caller, parse_args(args)?),
         "task.pause" => {
@@ -471,6 +471,15 @@ fn state_json(id: TaskId, state: &crate::model::State) -> Value {
         "stage": state.stage,
         "version": state.version,
     })
+}
+
+/// Creates the JSON of a state change. The text of a failed plugin can hold words from a remote.
+pub fn change_json(id: TaskId, change: &StateChange) -> Value {
+    let mut value = state_json(id, &change.state);
+    if !change.warnings.is_empty() {
+        value["plugin_warnings"] = json!({ "untrusted_data": change.warnings });
+    }
+    value
 }
 
 fn create(service: &TaskService, caller: &Caller, args: CreateArgs) -> Result<Value> {
@@ -789,6 +798,6 @@ fn finish(service: &TaskService, caller: &Caller, args: FinishArgs) -> Result<Va
             unchecked_reason: args.unchecked_reason,
         },
     };
-    let state = service.finish(caller, id, &claim_ref(args.claim), &finish)?;
-    Ok(state_json(id, &state))
+    let change = service.finish(caller, id, &claim_ref(args.claim), &finish)?;
+    Ok(change_json(id, &change))
 }

@@ -493,8 +493,8 @@ fn stages_move_and_a_human_stage_needs_a_person() -> Result<()> {
         "later stages remain"
     );
     let state = service.advance(&agent, id, &ClaimRef::Handle(c.handle), "built", None)?;
-    assert_eq!(state.stage, "push");
-    assert!(!state.unblocked);
+    assert_eq!(state.state.stage, "push");
+    assert!(!state.state.unblocked);
     assert_eq!(
         code(service.claim(&agent, Some(dependent), None, None)),
         ErrorCode::Blocked
@@ -503,8 +503,8 @@ fn stages_move_and_a_human_stage_needs_a_person() -> Result<()> {
     // The `unblocks` stage releases dependent tasks when it completes.
     let c = service.claim(&agent, Some(id), None, None)?;
     let state = service.advance(&agent, id, &ClaimRef::Handle(c.handle), "pushed", None)?;
-    assert_eq!(state.stage, "approve");
-    assert!(state.unblocked);
+    assert_eq!(state.state.stage, "approve");
+    assert!(state.state.unblocked);
     assert!(ready_ids(&service, &agent)?.contains(&"D".to_owned()));
 
     // An agent cannot do the human stage.
@@ -517,7 +517,7 @@ fn stages_move_and_a_human_stage_needs_a_person() -> Result<()> {
     assert!(ready_ids(&service, &human)?.contains(&"F".to_owned()));
     let c = service.claim(&human, Some(id), None, None)?;
     let state = service.advance(&human, id, &ClaimRef::Handle(c.handle), "approved", None)?;
-    assert_eq!(state.stage, "deploy");
+    assert_eq!(state.state.stage, "deploy");
 
     // A failure returns to an earlier stage with a reason, and the release ends.
     let c = service.claim(&agent, Some(id), None, None)?;
@@ -528,8 +528,8 @@ fn stages_move_and_a_human_stage_needs_a_person() -> Result<()> {
         "deploy failed",
         Some("code"),
     )?;
-    assert_eq!(state.stage, "code");
-    assert!(!state.unblocked);
+    assert_eq!(state.state.stage, "code");
+    assert!(!state.state.unblocked);
     assert!(!ready_ids(&service, &agent)?.contains(&"D".to_owned()));
 
     let entries = service.detail(id, &["entries"])?.entries;
@@ -572,7 +572,7 @@ fn finish_rules() -> Result<()> {
         ErrorCode::InvalidArgument
     );
     let state = service.finish(&agent, id, &handle, &done("ok", Some("out of scope")))?;
-    assert_eq!(state.status, Status::Done);
+    assert_eq!(state.state.status, Status::Done);
     assert!(service.detail(id, &[])?.claim.is_none());
 
     // Release makes the task ready again.
@@ -586,6 +586,7 @@ fn finish_rules() -> Result<()> {
                 &ClaimRef::Handle(c.handle),
                 &Finish::Released
             )?
+            .state
             .status,
         Status::Todo
     );
@@ -1247,7 +1248,7 @@ fn a_person_can_release_with_an_override() -> Result<()> {
     let id = create(&service, &agent, "T")?;
     service.claim(&agent, Some(id), None, None)?;
     let state = service.finish(&human, id, &ClaimRef::Override, &Finish::Released)?;
-    assert_eq!(state.status, Status::Todo);
+    assert_eq!(state.state.status, Status::Todo);
     assert_eq!(
         code(service.finish(&agent, id, &ClaimRef::Override, &Finish::Released)),
         ErrorCode::ActorDenied
@@ -1872,4 +1873,38 @@ proptest! {
         let second = ready_ids(&service, &agent).map_err(|err| TestCaseError::fail(err.to_string()))?;
         prop_assert_eq!(first, second);
     }
+}
+
+#[test]
+fn a_running_process_stops_writes_after_the_format_is_too_new() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let dir = service_directory(&fx, "api")?;
+    let settings_file = dir.join("lenka.toml");
+    let settings =
+        fs::read_to_string(&settings_file).map_err(|err| LenkaError::io("read", &err))?;
+    let newer = settings.replacen("format_version = 1", "format_version = 99", 1);
+    assert_ne!(newer, settings);
+    fs::write(&settings_file, newer).map_err(|err| LenkaError::io("write", &err))?;
+
+    let error = service
+        .create(&human, task("Refused"))
+        .err()
+        .ok_or_else(|| LenkaError::invalid_argument("the write passed"))?;
+    assert_eq!(error.code(), ErrorCode::FormatTooNew);
+
+    // Other errors in the file keep the old settings, and a valid file ends the refusal.
+    fs::write(&settings_file, settings).map_err(|err| LenkaError::io("write", &err))?;
+    service.create(&human, task("Accepted"))?;
+    Ok(())
+}
+
+fn service_directory(fx: &Fixture, name: &str) -> Result<PathBuf> {
+    fx.host
+        .open_by_name(name)?
+        .driver()
+        .local_dir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| LenkaError::invalid_argument("the project has no directory"))
 }

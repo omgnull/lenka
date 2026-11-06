@@ -164,7 +164,9 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - The secret check finds common patterns only. Do not put secrets in tasks.
 - A delete changes only the current files. Committed bytes stay in the Git history, so rotate an exposed secret.
 - The only network use is the Git plugin through system Git, and only when you enable it.
-- Data from a remote is untrusted. `lenka sync` and `lenka init` refuse a data branch that holds anything other than plain data files, such as a `.runtime` directory or a symlink. A manual `git pull` in a data directory does not have this check, so use `lenka sync`.
+- Data from a remote is untrusted. `lenka sync` and `lenka init` accept a data branch only if each file has a known lenka path. They refuse a symlink, a `.runtime` directory, a `.gitignore` below the data root, a changed `.gitattributes`, a change of the project ID, and conflict markers in a task. A manual `git pull` in a data directory does not have these checks, so use `lenka sync`.
+- A commit holds only the known lenka paths. Other files stay in the clone, and `lenka sync` lists them. Git exclude rules cannot hide data from a commit.
+- The Git settings of lenka are in the local Git configuration of each clone, in the keys `lenka.enabled`, `lenka.remote`, and `lenka.pushOnFinish`. A remote cannot change them. A merge can change other shared settings in `lenka.toml`, and `lenka sync` names the sections that changed.
 
 ## Known limits
 

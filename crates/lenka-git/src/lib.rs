@@ -9,6 +9,11 @@
 //!
 //! The data lives on the branch [`BRANCH`]. A project in `<git-common-dir>/lenka-data` is a
 //! worktree of the clone of the user. Any other project has its own repository.
+//!
+//! The Git settings of this plugin are in the local Git configuration, in the keys `lenka.*`. A
+//! merge cannot change that file, so the remote and the use of the network stay a choice of each
+//! clone. A commit holds only the paths in [`lenka_core::layout`], and a branch from another clone
+//! must hold only these paths.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -17,8 +22,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use lenka_core::gitdir;
-use lenka_core::init::GIT_DATA_DIR;
-use lenka_core::{EventHook, Plugin, PluginInfo, Project, ProjectEvent, Registry};
+use lenka_core::init::{GIT_DATA_DIR, GITATTRIBUTES};
+use lenka_core::layout::{self, TEMP_PREFIX};
+use lenka_core::settings::PROJECT_FILE;
+use lenka_core::{EventHook, Plugin, PluginInfo, Project, ProjectConfig, ProjectEvent, Registry};
 use lenka_plugin_api::{ErrorCode, LenkaError, Result};
 use serde::Serialize;
 
@@ -27,8 +34,30 @@ pub const BRANCH: &str = "lenka-data";
 
 const BRANCH_REF: &str = "refs/heads/lenka-data";
 
-/// The file that replaces the Git excludes of the user, relative to a data directory.
-const EXCLUDES_FILE: &str = ".runtime/git-excludes";
+/// The default remote name.
+const DEFAULT_REMOTE: &str = "origin";
+
+/// The keys of the settings in the local Git configuration.
+const KEY_ENABLED: &str = "lenka.enabled";
+const KEY_REMOTE: &str = "lenka.remote";
+const KEY_PUSH_ON_FINISH: &str = "lenka.pushOnFinish";
+/// This key is on from the start of a merge until the caller rebuilds the task index.
+const KEY_NEEDS_REINDEX: &str = "lenka.needsReindex";
+
+/// The largest settings file that lenka reads from a branch.
+const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+
+/// The count of paths in one call of `git update-index`.
+const PATHS_IN_ONE_CALL: usize = 100;
+
+/// The text fields that a person or lenka checks for conflict markers on each write. Other files
+/// can hold such a line in normal text.
+const MARKER_PATHS: [&str; 3] = [
+    ":(glob)tasks/*/task.md",
+    ":(glob)tasks/*/plan.md",
+    ":(glob)memory/*.md",
+];
+const MARKER_PATTERN: &str = "^<<<<<<< ";
 
 /// The identity for commits when the user has no Git identity.
 const FALLBACK_NAME: &str = "lenka";
@@ -74,7 +103,9 @@ impl Git {
         command
             .current_dir(&self.dir)
             .stdin(Stdio::null())
-            .env("LC_ALL", "C");
+            .env("LC_ALL", "C")
+            // A merge must not depend on a download. `download_lfs` gets the bytes after a merge.
+            .env("GIT_LFS_SKIP_SMUDGE", "1");
         for name in CLEARED_ENV {
             command.env_remove(name);
         }
@@ -133,6 +164,27 @@ impl Git {
         Ok(self.output(args)?.status.success())
     }
 
+    /// Reads a value of the local Git configuration.
+    fn local_value(&self, key: &str) -> Result<Option<String>> {
+        let output = self.output(["config", "--local", "--get", key])?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned()))
+    }
+
+    fn set_local_value(&self, key: &str, value: &str) -> Result<()> {
+        self.run("config", ["config", "--local", key, value])
+            .map(|_| ())
+    }
+
+    fn unset_local_value(&self, key: &str) -> Result<()> {
+        if self.local_value(key)?.is_some() {
+            self.run("config", ["config", "--local", "--unset", key])?;
+        }
+        Ok(())
+    }
+
     /// Returns the options for a command that creates a commit.
     fn identity_args(&self) -> Result<Vec<String>> {
         let name = self.passes(["config", "--get", "user.name"])?;
@@ -150,7 +202,13 @@ impl Git {
 }
 
 fn git_error(what: &str, output: &Output) -> LenkaError {
-    let text = String::from_utf8_lossy(&output.stderr);
+    // Git LFS can write its failure to the standard output.
+    let stream = if output.stderr.iter().all(u8::is_ascii_whitespace) {
+        &output.stdout
+    } else {
+        &output.stderr
+    };
+    let text = String::from_utf8_lossy(stream);
     let lines: Vec<&str> = text.lines().rev().take(6).collect();
     let detail: String = lines.into_iter().rev().collect::<Vec<_>>().join(" ");
     LenkaError::new(
@@ -227,37 +285,159 @@ fn open_data_repo(project: &Project, prompt: Prompt) -> Result<Git> {
     Ok(git)
 }
 
-/// Stages all data and commits it. The result tells if a commit exists.
-fn commit_all(git: &Git, message: &str) -> Result<bool> {
-    // The excludes of the user must not hide an artifact, and `.runtime` must stay out even if
-    // a person removed `.gitignore`. This file replaces the excludes of the user for this call.
-    let file = git.dir.join(EXCLUDES_FILE);
-    fs::write(&file, ".runtime/\n")
-        .map_err(|err| LenkaError::io("Write the Git excludes", &err))?;
-    let mut excludes = OsString::from("core.excludesFile=");
-    excludes.push(&file);
+/// The result of a commit of all data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Stored {
+    /// Tells if a commit exists.
+    committed: bool,
+    /// The files that are not data, so no commit holds them.
+    skipped: Vec<String>,
+}
+
+/// Stops if a merge or a similar operation of a person is open. A commit now would complete that
+/// operation, and it would publish conflict markers.
+fn refuse_open_merge(git: &Git) -> Result<()> {
+    for name in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        if git.passes(["rev-parse", "-q", "--verify", name])? {
+            return Err(open_merge_error(&git.dir));
+        }
+    }
+    if !git.run("ls-files", ["ls-files", "-u"])?.is_empty() {
+        return Err(open_merge_error(&git.dir));
+    }
+    Ok(())
+}
+
+fn open_merge_error(dir: &Path) -> LenkaError {
+    LenkaError::invalid_argument(format!(
+        "The data directory {} has an open merge, so lenka did not commit. Finish it with `git commit`, or stop it with `git merge --abort`.",
+        dir.display()
+    ))
+}
+
+/// Refuses a tree or the index if a text file of lenka has a conflict marker.
+fn refuse_markers(git: &Git, revision: Option<&str>, what: &str) -> Result<()> {
+    let mut args = vec!["grep", "-l", "-E"];
+    match revision {
+        Some(revision) => args.extend([MARKER_PATTERN, revision]),
+        None => args.extend(["--cached", MARKER_PATTERN]),
+    }
+    args.push("--");
+    args.extend(MARKER_PATHS);
+    let output = git.output(args)?;
+    match output.status.code() {
+        Some(0) => Err(LenkaError::invalid_file(format!(
+            "{what} has conflict markers in {}. Resolve them first.",
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .escape_default()
+        ))),
+        Some(1) => Ok(()),
+        _ => Err(git_error("grep", &output)),
+    }
+}
+
+/// Converts a path from the raw output of `git`.
+fn os_path(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        OsString::from(<OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+/// Tells if a blob holds exactly this text. The size check comes first, so that a large blob from
+/// a remote stays out of memory.
+fn blob_is(git: &Git, blob: &str, text: &str) -> Result<bool> {
+    let size = git.run("cat-file", ["cat-file", "-s", blob])?;
+    if size != text.len().to_string() {
+        return Ok(false);
+    }
+    let output = git.output(["cat-file", "blob", blob])?;
+    Ok(output.status.success() && output.stdout == text.as_bytes())
+}
+
+/// Removes all that is not data from the index. The files stay on the disk.
+fn unstage_other_files(git: &Git) -> Result<Vec<String>> {
+    let output = git.output(["ls-files", "-s", "-z"])?;
+    if !output.status.success() {
+        return Err(git_error("ls-files", &output));
+    }
+    let mut remove: Vec<OsString> = Vec::new();
+    let mut skipped = Vec::new();
+    for row in output.stdout.split(|byte| *byte == 0) {
+        let Some(tab) = row.iter().position(|byte| *byte == b'\t') else {
+            continue;
+        };
+        let (info, path) = (&row[..tab], &row[tab + 1..]);
+        let text = String::from_utf8_lossy(path);
+        let info = String::from_utf8_lossy(info);
+        let mut fields = info.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let blob = fields.next().unwrap_or_default();
+        if !is_file_mode(mode) || !layout::is_data_path(&text) {
+            remove.push(os_path(path));
+            skipped.push(text.escape_default().to_string());
+        } else if text == ".gitattributes" && !blob_is(git, blob, GITATTRIBUTES)? {
+            // Other clones refuse other text, so the commit keeps the text of the last commit.
+            git.run("reset", ["reset", "-q", "--", ".gitattributes"])?;
+            skipped.push(text.into_owned());
+        }
+    }
+    for paths in remove.chunks(PATHS_IN_ONE_CALL) {
+        let mut args = vec![
+            OsString::from("update-index"),
+            OsString::from("--force-remove"),
+            OsString::from("--"),
+        ];
+        args.extend_from_slice(paths);
+        git.run("update-index", args)?;
+    }
+    Ok(skipped)
+}
+
+/// Stages all data and commits it. Forced staging ignores all exclude rules, so that no local
+/// file and no file from a remote can hide data.
+fn commit_all(git: &Git, message: &str) -> Result<Stored> {
+    refuse_open_merge(git)?;
+    let temp_files = format!(":(exclude,glob)**/{TEMP_PREFIX}*");
     git.run(
         "add",
         [
-            OsStr::new("-c"),
-            &excludes,
-            OsStr::new("add"),
-            OsStr::new("-A"),
-            OsStr::new("."),
+            "add",
+            "-A",
+            "-f",
+            "--",
+            ".",
+            ":(exclude).runtime",
+            temp_files.as_str(),
         ],
     )?;
+    let skipped = unstage_other_files(git)?;
+    refuse_markers(git, None, "The data")?;
     if git.passes(["diff", "--cached", "--quiet"])? {
-        return Ok(false);
+        return Ok(Stored {
+            committed: false,
+            skipped,
+        });
     }
     let mut args = git.identity_args()?;
     args.extend(["commit", "--no-verify", "-q", "-m", message].map(str::to_owned));
     git.run("commit", args)?;
-    Ok(true)
+    Ok(Stored {
+        committed: true,
+        skipped,
+    })
 }
 
 /// Commits all data of a project under the project write lock, so that a commit never holds half
 /// of a write.
-fn commit_locked(project: &Project, git: &Git, message: &str) -> Result<bool> {
+fn commit_locked(project: &Project, git: &Git, message: &str) -> Result<Stored> {
     project.write_locked(|_| commit_all(git, message))
 }
 
@@ -265,15 +445,80 @@ fn has_remote(git: &Git, remote: &str) -> Result<bool> {
     git.passes(["remote", "get-url", "--", remote])
 }
 
+/// Tells if this clone uses Git LFS.
+fn uses_lfs(git: &Git) -> Result<bool> {
+    Ok(git.passes(["config", "--get", "filter.lfs.clean"])? && git.passes(["lfs", "version"])?)
+}
+
 /// Sends the branch to a remote. The hooks stay off, so this function uploads Git LFS objects
-/// itself. Without them, a fresh clone cannot download the artifact bytes.
+/// itself. Without them, a fresh clone cannot download the artifact bytes. A pointer with no local
+/// object does not stop the push, because `doctor` reports that artifact.
 fn push(git: &Git, remote: &str) -> Result<()> {
-    if git.passes(["config", "--get", "filter.lfs.clean"])? && git.passes(["lfs", "version"])? {
-        git.run("lfs push", ["lfs", "push", remote, BRANCH])?;
+    if uses_lfs(git)? {
+        git.run(
+            "lfs push",
+            [
+                "-c",
+                "lfs.allowincompletepush=true",
+                "lfs",
+                "push",
+                remote,
+                BRANCH,
+            ],
+        )?;
     }
     let refspec = format!("{BRANCH_REF}:{BRANCH_REF}");
     git.run("push", ["push", "-q", remote, refspec.as_str()])?;
     Ok(())
+}
+
+/// Downloads the Git LFS bytes of the current tree. A failure is not a failure of the merge,
+/// because `doctor` reports the artifacts that are not downloaded. The result is the failure text.
+fn download_lfs(git: &Git, remote: Option<&str>) -> Result<Option<String>> {
+    if !uses_lfs(git)? {
+        return Ok(None);
+    }
+    let mut command = git.command();
+    command
+        .env_remove("GIT_LFS_SKIP_SMUDGE")
+        .args(["lfs", "pull"]);
+    if let Some(remote) = remote {
+        command.arg(remote);
+    }
+    let output = command
+        .output()
+        .map_err(|err| LenkaError::new(ErrorCode::Io, format!("lenka cannot run git: {err}.")))?;
+    Ok((!output.status.success()).then(|| git_error("lfs pull", &output).to_string()))
+}
+
+/// The settings of one clone, in the local Git configuration. A merge cannot change them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalSettings {
+    enabled: bool,
+    remote: String,
+    push_on_finish: bool,
+}
+
+impl LocalSettings {
+    fn read(git: &Git) -> Result<Self> {
+        let remote = git.local_value(KEY_REMOTE)?;
+        let settings = Self {
+            enabled: git.local_value(KEY_ENABLED)?.as_deref() == Some("true"),
+            remote: remote.unwrap_or_else(|| DEFAULT_REMOTE.to_owned()),
+            push_on_finish: git.local_value(KEY_PUSH_ON_FINISH)?.as_deref() == Some("true"),
+        };
+        validate_remote_name(&settings.remote)?;
+        Ok(settings)
+    }
+
+    fn write(&self, git: &Git) -> Result<()> {
+        git.set_local_value(KEY_ENABLED, if self.enabled { "true" } else { "false" })?;
+        git.set_local_value(KEY_REMOTE, &self.remote)?;
+        if self.push_on_finish {
+            git.set_local_value(KEY_PUSH_ON_FINISH, "true")?;
+        }
+        Ok(())
+    }
 }
 
 /// What `enable` did with the data directory.
@@ -300,7 +545,7 @@ pub struct EnableOptions {
 pub struct EnableReport {
     /// The layout of the data directory.
     pub layout: Layout,
-    /// The remote name in the project settings.
+    /// The remote name in the settings of this clone.
     pub remote: String,
     /// Tells if the repository has that remote now.
     pub remote_found: bool,
@@ -308,8 +553,8 @@ pub struct EnableReport {
     pub committed: bool,
 }
 
-/// Connects a project to Git, sets `[git] enabled = true`, and makes the first commit. A repeat
-/// call is safe. Stop other lenka processes of this project first, because the first call moves
+/// Connects a project to Git, stores the settings in the local Git configuration, and makes the
+/// first commit. A repeat call is safe. Stop other lenka processes of this project first, because the first call moves
 /// the data directory for a short time.
 ///
 /// For a data directory at `<common_dir>/lenka-data`, this function creates the branch with no
@@ -344,22 +589,18 @@ pub fn enable(
     }
     let git = open_data_repo(project, Prompt::Allowed)?;
 
-    let mut config = (*project.config()).clone();
+    let mut settings = LocalSettings::read(&git)?;
     if let Some(value) = &options.remote {
-        config.git.remote = configure_remote(&git, layout, value)?;
+        settings.remote = configure_remote(&git, layout, value)?;
     }
-    config.git.enabled = true;
-    config.git.push_on_finish = config.git.push_on_finish || options.push_on_finish;
-    validate_remote_name(&config.git.remote)?;
-    let remote = config.git.remote.clone();
-    if config != *project.config() {
-        project.save_config(config)?;
-    }
-    let committed = commit_locked(project, &git, "lenka: connect the data to Git")?;
+    settings.enabled = true;
+    settings.push_on_finish = settings.push_on_finish || options.push_on_finish;
+    settings.write(&git)?;
+    let committed = commit_locked(project, &git, "lenka: connect the data to Git")?.committed;
     Ok(EnableReport {
         layout,
-        remote_found: has_remote(&git, &remote)?,
-        remote,
+        remote_found: has_remote(&git, &settings.remote)?,
+        remote: settings.remote,
         committed,
     })
 }
@@ -390,7 +631,7 @@ fn configure_remote(git: &Git, layout: Layout, value: &str) -> Result<String> {
             "A Git remote URL cannot start with '-'.",
         ));
     }
-    const NAME: &str = "origin";
+    const NAME: &str = DEFAULT_REMOTE;
     if has_remote(git, NAME)? {
         git.run("remote set-url", ["remote", "set-url", "--", NAME, value])?;
     } else {
@@ -410,31 +651,72 @@ fn clone_git(common_dir: &Path) -> Git {
     Git::new(common_dir, Prompt::Allowed)
 }
 
-/// Tells if a file from another clone can be data. `.runtime` holds local state, such as the write
-/// journal, and a replay of a journal from a remote can change any file.
-fn is_data_path(path: &str) -> bool {
-    matches!(path, "lenka.toml" | ".gitignore" | ".gitattributes")
-        || ["tasks/", "artifacts/", "memory/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
+fn is_file_mode(mode: &str) -> bool {
+    matches!(mode, "100644" | "100755")
 }
 
-/// Refuses a commit from another clone if its tree holds anything other than plain data files.
-fn check_incoming_tree(git: &Git, revision: &str) -> Result<()> {
-    let listing = git.run("ls-tree", ["ls-tree", "-r", "-z", "--full-tree", revision])?;
-    for row in listing.split('\0').filter(|row| !row.is_empty()) {
+/// Reads the settings of a commit. A missing or a large file is an error.
+fn read_settings(git: &Git, revision: &str) -> Result<ProjectConfig> {
+    let object = format!("{revision}:{PROJECT_FILE}");
+    let size = git.output(["cat-file", "-s", object.as_str()])?;
+    let size: Option<u64> = String::from_utf8_lossy(&size.stdout).trim().parse().ok();
+    let Some(size) = size else {
+        return Err(LenkaError::invalid_file(format!(
+            "The branch {BRANCH} has no {PROJECT_FILE}, so it is not lenka data."
+        )));
+    };
+    if size > MAX_SETTINGS_BYTES {
+        return Err(LenkaError::invalid_file(format!(
+            "The file {PROJECT_FILE} of the branch {BRANCH} is too large."
+        )));
+    }
+    let output = git.output(["cat-file", "blob", object.as_str()])?;
+    ProjectConfig::parse(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Refuses settings from another clone that make this clone another project.
+fn check_same_project(local: &ProjectConfig, incoming: &ProjectConfig) -> Result<()> {
+    if incoming.id != local.id || incoming.storage != local.storage {
+        return Err(LenkaError::invalid_file(format!(
+            "The branch {BRANCH} of another clone changes the project ID or the storage settings. lenka did not merge it. Check that remote."
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a commit from another clone if its tree holds anything other than the files of lenka.
+fn check_incoming_tree(git: &Git, revision: &str, local: Option<&ProjectConfig>) -> Result<()> {
+    let listing = git.output(["ls-tree", "-r", "-z", "--full-tree", revision])?;
+    if !listing.status.success() {
+        return Err(git_error("ls-tree", &listing));
+    }
+    for row in listing.stdout.split(|byte| *byte == 0) {
+        let row = String::from_utf8_lossy(row);
         let Some((info, path)) = row.split_once('\t') else {
             continue;
         };
-        let mode = info.split(' ').next().unwrap_or_default();
-        if !matches!(mode, "100644" | "100755") || !is_data_path(path) {
+        let mut fields = info.split(' ');
+        let mode = fields.next().unwrap_or_default();
+        let blob = fields.nth(1).unwrap_or_default();
+        let is_data = is_file_mode(mode)
+            && layout::is_data_path(path)
+            && (path != ".gitattributes" || blob_is(git, blob, GITATTRIBUTES)?);
+        if !is_data {
             return Err(LenkaError::invalid_file(format!(
                 "The branch {BRANCH} of another clone holds a file that is not lenka data: {}. lenka did not merge it. Check that remote.",
                 path.escape_default()
             )));
         }
     }
-    Ok(())
+    let incoming = read_settings(git, revision)?;
+    if let Some(local) = local {
+        check_same_project(local, &incoming)?;
+    }
+    refuse_markers(
+        git,
+        Some(revision),
+        &format!("The branch {BRANCH} of another clone"),
+    )
 }
 
 /// Creates the branch with no change to the checkout, and makes the data directory a worktree.
@@ -551,33 +833,52 @@ pub fn restore(cwd: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     };
     let dir = location.common_dir.join(GIT_DATA_DIR);
-    if dir.join(lenka_core::settings::PROJECT_FILE).is_file() {
+    if dir.join(PROJECT_FILE).is_file() {
         return Ok(Some(dir));
     }
     if fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_some()) {
         return Ok(None);
     }
     let git = clone_git(&location.common_dir);
+    let tracking = tracking_refs(&git)?;
     if git.passes(["show-ref", "--verify", "--quiet", BRANCH_REF])? {
-        check_incoming_tree(&git, BRANCH_REF)?;
+        check_incoming_tree(&git, BRANCH_REF, None)?;
     } else {
-        let Some(tracking) = tracking_refs(&git)?.into_iter().next() else {
+        let Some(first) = tracking.first() else {
             return Ok(None);
         };
-        check_incoming_tree(&git, &tracking)?;
-        git.run(
-            "branch",
-            ["branch", "--no-track", BRANCH, tracking.as_str()],
-        )?;
+        check_incoming_tree(&git, first, None)?;
+        git.run("branch", ["branch", "--no-track", BRANCH, first.as_str()])?;
     }
     add_worktree(&git, &dir)?;
-    if !dir.join(lenka_core::settings::PROJECT_FILE).is_file() {
+    if !dir.join(PROJECT_FILE).is_file() {
         return Err(LenkaError::invalid_file(format!(
-            "The branch {BRANCH} has no lenka.toml, so it is not lenka data. Remove the worktree {}, or repair the branch.",
+            "The branch {BRANCH} has no {PROJECT_FILE}, so it is not lenka data. Remove the worktree {}, or repair the branch.",
             dir.display()
         )));
     }
+    let data = Git::new(&dir, Prompt::Allowed);
+    let mut settings = LocalSettings::read(&data)?;
+    settings.enabled = true;
+    if let Some(remote) = tracking
+        .first()
+        .and_then(|name| remote_of_tracking_ref(name))
+    {
+        settings.remote = remote.to_owned();
+    }
+    settings.write(&data)?;
+    if let Some(failure) = download_lfs(&data, Some(&settings.remote))? {
+        tracing::warn!(failure = %failure, "lenka did not download the Git LFS bytes");
+    }
     Ok(Some(dir))
+}
+
+/// Returns the remote of a tracking ref of the data branch, if the name is valid.
+fn remote_of_tracking_ref(name: &str) -> Option<&str> {
+    let remote = name
+        .strip_prefix("refs/remotes/")?
+        .strip_suffix(&format!("/{BRANCH}"))?;
+    validate_remote_name(remote).ok().map(|()| remote)
 }
 
 /// The result of [`sync`].
@@ -587,12 +888,21 @@ pub struct SyncReport {
     pub committed: bool,
     /// The remote name, if the repository has that remote.
     pub remote: Option<String>,
-    /// Tells if the merge changed local files. If so, the caller must rebuild the task index.
+    /// Tells if a merge changed local files. If so, the caller must rebuild the task index, and
+    /// then call [`mark_indexed`].
     pub merged: bool,
     /// Tells if the data reached the remote.
     pub pushed: bool,
+    /// The failure of the push. The merge and the commit stay stored.
+    pub push_error: Option<String>,
     /// The files in conflict. If this list is not empty, the merge stopped and nothing changed.
     pub conflict: Vec<String>,
+    /// The files that are not lenka data, so they stay in this clone and go in no commit.
+    pub skipped: Vec<String>,
+    /// The sections of the shared settings that the merge changed.
+    pub settings_changed: Vec<String>,
+    /// The failure of a Git LFS download. `doctor` lists the artifacts that are not downloaded.
+    pub lfs_warning: Option<String>,
 }
 
 impl SyncReport {
@@ -601,32 +911,58 @@ impl SyncReport {
     pub fn has_conflict(&self) -> bool {
         !self.conflict.is_empty()
     }
+
+    /// Tells if the sync did all of its work.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        !self.has_conflict() && self.push_error.is_none()
+    }
+
+    fn note_commit(&mut self, stored: Stored) {
+        self.committed |= stored.committed;
+        for file in stored.skipped {
+            if !self.skipped.contains(&file) {
+                self.skipped.push(file);
+            }
+        }
+    }
 }
 
 /// Commits the data, fetches, merges, and pushes. A conflict stops the merge, and the report lists
-/// the files. lenka has no automatic merge. After a merge, the caller rebuilds the task index.
+/// the files. lenka has no automatic merge. A failed push is in the report, because the merge is
+/// complete at that point. After a merge, the caller rebuilds the task index, and then calls
+/// [`mark_indexed`].
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::InvalidArgument`] if the project is not connected to Git, and
-/// [`ErrorCode::Io`] if `git` fails, for example on unrelated histories.
+/// Returns [`ErrorCode::InvalidArgument`] if the project is not connected to Git, the selected
+/// remote does not exist, or a merge of a person is open. Returns [`ErrorCode::InvalidFile`] or
+/// [`ErrorCode::FormatTooNew`] for a branch that lenka refuses. Returns [`ErrorCode::Io`] if `git`
+/// fails, for example on unrelated histories.
 pub fn sync(project: &Project) -> Result<SyncReport> {
-    let settings = project.config().git.clone();
+    let git = open_data_repo(project, Prompt::Allowed)?;
+    let settings = LocalSettings::read(&git)?;
     if !settings.enabled {
         return Err(LenkaError::invalid_argument(
             "Git is off for this project. Run `lenka git enable` first.",
         ));
     }
-    validate_remote_name(&settings.remote)?;
-    let git = open_data_repo(project, Prompt::Allowed)?;
     let mut report = SyncReport {
-        committed: commit_locked(project, &git, "lenka: sync")?,
+        // A stopped process can leave a merge with no index rebuild.
+        merged: git.local_value(KEY_NEEDS_REINDEX)?.is_some(),
         ..SyncReport::default()
     };
-    if !has_remote(&git, &settings.remote)? {
-        return Ok(report);
-    }
+    report.note_commit(commit_locked(project, &git, "lenka: sync")?);
     let remote = settings.remote.as_str();
+    if !has_remote(&git, remote)? {
+        let others = git.run("remote", ["remote"])?;
+        if others.is_empty() {
+            return Ok(report);
+        }
+        return Err(LenkaError::invalid_argument(format!(
+            "This clone has no remote {remote}. Select another remote with `lenka git enable --remote <name>`, or add the remote."
+        )));
+    }
     report.remote = Some(remote.to_owned());
 
     let tracking = format!("refs/remotes/{remote}/{BRANCH}");
@@ -639,25 +975,57 @@ pub fn sync(project: &Project) -> Result<SyncReport> {
                 ["fetch", "-q", "--no-tags", remote, refspec.as_str()],
             )?;
             project.write_locked(|_| {
-                report.committed |= commit_all(&git, "lenka: sync")?;
+                report.note_commit(commit_all(&git, "lenka: sync")?);
                 merge(&git, &tracking, &mut report)
             })?;
             if report.has_conflict() {
                 return Ok(report);
+            }
+            if report.merged {
+                report.lfs_warning = download_lfs(&git, Some(remote))?;
             }
         }
         // The remote has no data branch yet, so this push creates it.
         Some(2) => {}
         _ => return Err(git_error("ls-remote", &listing)),
     }
-    push(&git, remote)?;
-    report.pushed = true;
+    match push(&git, remote) {
+        Ok(()) => report.pushed = true,
+        Err(error) => report.push_error = Some(error.to_string()),
+    }
     Ok(report)
 }
 
+/// Records that the caller rebuilt the task index after a merge.
+///
+/// # Errors
+///
+/// Returns an error if the project is not connected to Git, or if `git` fails.
+pub fn mark_indexed(project: &Project) -> Result<()> {
+    let git = open_data_repo(project, Prompt::Allowed)?;
+    git.unset_local_value(KEY_NEEDS_REINDEX)
+}
+
 fn merge(git: &Git, tracking: &str, report: &mut SyncReport) -> Result<()> {
-    check_incoming_tree(git, tracking)?;
+    let local = read_settings(git, "HEAD")?;
+    check_incoming_tree(git, tracking, Some(&local))?;
     let before = git.run("rev-parse", ["rev-parse", "HEAD"])?;
+    let was_pending = report.merged;
+    git.set_local_value(KEY_NEEDS_REINDEX, "true")?;
+    let result = run_merge(git, tracking, &before, &local, report);
+    if !was_pending && !report.merged {
+        git.unset_local_value(KEY_NEEDS_REINDEX)?;
+    }
+    result
+}
+
+fn run_merge(
+    git: &Git,
+    tracking: &str,
+    before: &str,
+    local: &ProjectConfig,
+    report: &mut SyncReport,
+) -> Result<()> {
     let mut args = git.identity_args()?;
     args.extend(
         [
@@ -674,8 +1042,27 @@ fn merge(git: &Git, tracking: &str, report: &mut SyncReport) -> Result<()> {
     );
     let output = git.output(args)?;
     if output.status.success() {
-        report.merged = git.run("rev-parse", ["rev-parse", "HEAD"])? != before;
-        return Ok(());
+        if git.run("rev-parse", ["rev-parse", "HEAD"])? == before {
+            return Ok(());
+        }
+        // Two valid files can merge to a file that is not valid.
+        let merged = read_settings(git, "HEAD")
+            .and_then(|merged| check_same_project(local, &merged).map(|()| merged));
+        return match merged {
+            Ok(merged) => {
+                report.merged = true;
+                report.settings_changed = local
+                    .changed_sections(&merged)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                Ok(())
+            }
+            Err(error) => {
+                restore_tree(git, before)?;
+                Err(error)
+            }
+        };
     }
     let unmerged = git.run("diff", ["diff", "--name-only", "--diff-filter=U", "-z"])?;
     let files: Vec<String> = unmerged
@@ -684,10 +1071,26 @@ fn merge(git: &Git, tracking: &str, report: &mut SyncReport) -> Result<()> {
         .map(str::to_owned)
         .collect();
     if files.is_empty() {
+        restore_tree(git, before)?;
         return Err(git_error("merge", &output));
     }
     git.run("merge --abort", ["merge", "--abort"])?;
     report.conflict = files;
+    Ok(())
+}
+
+/// Puts the data back to a commit after a failed merge. The caller holds the lock and committed
+/// all data just before the merge, so each untracked data file came from the failed merge.
+fn restore_tree(git: &Git, commit: &str) -> Result<()> {
+    git.run("reset", ["reset", "-q", "--hard", commit])?;
+    let output = git.output(["ls-files", "-o", "-z"])?;
+    for path in output.stdout.split(|byte| *byte == 0) {
+        let text = String::from_utf8_lossy(path);
+        if layout::is_data_path(&text) && text != PROJECT_FILE {
+            fs::remove_file(git.dir.join(text.as_ref()))
+                .map_err(|err| LenkaError::io("Remove a file of a failed merge", &err))?;
+        }
+    }
     Ok(())
 }
 
@@ -720,8 +1123,17 @@ struct GitHook;
 
 impl GitHook {
     fn commit_and_push(project: &Project, message: &str, finished: bool) -> Result<()> {
-        let settings = project.config().git.clone();
-        validate_remote_name(&settings.remote)?;
+        // With no `.git` here, `git` could find a parent repository of the user.
+        let Some(dir) = project.driver().local_dir() else {
+            return Ok(());
+        };
+        if fs::symlink_metadata(dir.join(".git")).is_err() {
+            return Ok(());
+        }
+        let settings = LocalSettings::read(&Git::new(dir, Prompt::Denied))?;
+        if !settings.enabled {
+            return Ok(());
+        }
         let git = open_data_repo(project, Prompt::Denied)?;
         commit_locked(project, &git, message)?;
         if finished && settings.push_on_finish && has_remote(&git, &settings.remote)? {
@@ -733,9 +1145,6 @@ impl GitHook {
 
 impl EventHook for GitHook {
     fn on_event(&self, project: &Project, event: &ProjectEvent) -> Result<()> {
-        if !project.config().git.enabled {
-            return Ok(());
-        }
         let result = match event {
             ProjectEvent::StageChanged { task } => Self::commit_and_push(
                 project,

@@ -566,14 +566,14 @@ fn run_typed(context: &RunContext, host: &Host, command: TaskCommand) -> anyhow:
             force,
         } => {
             let id = service.resolve(&task)?;
-            let state = service.advance(
+            let change = service.advance(
                 &caller,
                 id,
                 &claim_ref(claim, force),
                 &evidence,
                 back_to.as_deref(),
             )?;
-            state_json(id, &state)
+            lenka_tasks::change_json(id, &change)
         }
         TaskCommand::Entry {
             task,
@@ -616,8 +616,8 @@ fn run_typed(context: &RunContext, host: &Host, command: TaskCommand) -> anyhow:
                     unchecked_reason,
                 }
             };
-            let state = service.finish(&caller, id, &claim_ref(claim, force), &finish)?;
-            state_json(id, &state)
+            let change = service.finish(&caller, id, &claim_ref(claim, force), &finish)?;
+            lenka_tasks::change_json(id, &change)
         }
         TaskCommand::Status {
             task,

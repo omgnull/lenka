@@ -94,28 +94,6 @@ impl LinkPolicy {
     }
 }
 
-/// The Git settings of a project. Git is off by default, because it uses the network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GitSettings {
-    /// Tells if the Git plugin commits data for this project.
-    pub enabled: bool,
-    /// The remote name.
-    pub remote: String,
-    /// Tells if `task.finish` also pushes.
-    pub push_on_finish: bool,
-}
-
-impl Default for GitSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            remote: "origin".to_owned(),
-            push_on_finish: false,
-        }
-    }
-}
-
 /// The plugin choices of a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -153,9 +131,6 @@ pub struct ProjectConfig {
     /// The link policy.
     #[serde(default)]
     pub links: LinkPolicy,
-    /// The Git settings.
-    #[serde(default)]
-    pub git: GitSettings,
     /// The task types.
     pub types: BTreeMap<String, TypeDef>,
 }
@@ -182,9 +157,23 @@ impl ProjectConfig {
             storage: StorageSettings::default(),
             limits: Limits::default(),
             links: LinkPolicy::default(),
-            git: GitSettings::default(),
             types,
         }
+    }
+
+    /// Returns the names of the sections that differ from other settings, for a report to a person.
+    #[must_use]
+    pub fn changed_sections(&self, other: &Self) -> Vec<&'static str> {
+        [
+            ("name", self.name == other.name),
+            ("limits", self.limits == other.limits),
+            ("links", self.links == other.links),
+            ("types", self.types == other.types),
+        ]
+        .into_iter()
+        .filter(|(_, same)| !same)
+        .map(|(name, _)| name)
+        .collect()
     }
 
     /// Parses and validates the file text.

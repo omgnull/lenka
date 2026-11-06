@@ -72,6 +72,7 @@ impl Locked<'_> {
 pub struct Project {
     config: Mutex<Arc<ProjectConfig>>,
     config_stamp: Mutex<Option<DocStat>>,
+    format_refusal: Mutex<Option<LenkaError>>,
     driver: Arc<dyn StorageDriver>,
     artifacts: Arc<dyn ArtifactStore>,
     clock: Arc<dyn Clock>,
@@ -82,7 +83,8 @@ pub struct Project {
 }
 
 impl Project {
-    /// Opens a project with a driver and a store, and repairs an unfinished write.
+    /// Opens a project with a driver and a store, and tries to repair an unfinished write. If the
+    /// repair fails, reads and `doctor` still work, and each write returns the repair error.
     ///
     /// # Errors
     ///
@@ -99,6 +101,7 @@ impl Project {
         let project = Arc::new(Self {
             config: Mutex::new(Arc::new(config)),
             config_stamp: Mutex::new(stamp),
+            format_refusal: Mutex::new(None),
             driver,
             artifacts,
             clock,
@@ -107,7 +110,9 @@ impl Project {
             extensions: Mutex::new(HashMap::new()),
             crash: CrashPoint::default(),
         });
-        project.repair_if_needed()?;
+        if let Err(error) = project.repair_if_needed() {
+            tracing::warn!(error = %error, "an unfinished write is not repaired");
+        }
         Ok(project)
     }
 
@@ -168,7 +173,13 @@ impl Project {
         }
         *known = stamp;
         match read_config(self.driver.as_ref()) {
-            Ok(config) => *lock(&self.config) = Arc::new(config),
+            Ok(config) => {
+                *lock(&self.config) = Arc::new(config);
+                *lock(&self.format_refusal) = None;
+            }
+            Err(error) if error.code() == ErrorCode::FormatTooNew => {
+                *lock(&self.format_refusal) = Some(error);
+            }
             Err(error) => tracing::warn!(error = %error, "kept the old project settings"),
         }
     }
@@ -240,6 +251,10 @@ impl Project {
     /// Returns the error of the closure, or an error from the lock or the repair.
     pub fn write_locked<T>(&self, work: impl FnOnce(&mut Locked<'_>) -> Result<T>) -> Result<T> {
         let mut txn = self.driver.begin()?;
+        self.reload_config_if_changed();
+        if let Some(error) = lock(&self.format_refusal).clone() {
+            return Err(error);
+        }
         txn.set_strict_flush(self.config().limits.strict_flush);
         journal::repair(self.driver.as_ref(), txn.as_mut())?;
         let mut locked = Locked { txn, project: self };

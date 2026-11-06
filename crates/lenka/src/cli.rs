@@ -566,9 +566,10 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
     let caller = context.person()?;
     let project = host.project_for(&caller, None)?;
     let report = lenka_git::sync(&project)?;
-    #[cfg(feature = "tasks")]
     if report.merged {
+        #[cfg(feature = "tasks")]
         lenka_tasks::service_of(&project)?.reindex(&caller)?;
+        lenka_git::mark_indexed(&project)?;
     }
     let value = serde_json::to_value(&report)?;
     context.print(&value, |_| {
@@ -577,7 +578,7 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
             for file in &report.conflict {
                 println!("  {file}");
             }
-            println!("Merge the branch by hand in the data directory, run `lenka reindex`, and run `lenka sync` again.");
+            println!("Merge the branch by hand in the data directory, run `git commit`, run `lenka reindex`, and run `lenka sync` again.");
             return;
         }
         match &report.remote {
@@ -589,11 +590,30 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
                 yes_no(report.pushed),
             ),
         }
+        if let Some(error) = &report.push_error {
+            println!("The push failed: {error}");
+            println!("The commit and the merge are stored. Run `lenka sync` again.");
+        }
+        if !report.settings_changed.is_empty() {
+            println!(
+                "The merge changed these shared settings in lenka.toml: {}. Check them.",
+                report.settings_changed.join(", ")
+            );
+        }
+        if let Some(warning) = &report.lfs_warning {
+            println!("Some artifact bytes are not downloaded: {warning}");
+        }
+        if !report.skipped.is_empty() {
+            println!("These files are not lenka data, so they stay in this clone:");
+            for file in &report.skipped {
+                println!("  {file}");
+            }
+        }
     });
-    Ok(if report.has_conflict() {
-        ExitCode::FAILURE
-    } else {
+    Ok(if report.is_complete() {
         ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     })
 }
 
@@ -639,6 +659,9 @@ fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
         list("Broken links", &report.broken_links);
         list("Unavailable links", &report.unavailable_links);
         list("Tasks on a missing stage", &report.missing_stages);
+        if let Some(reason) = &report.unfinished_write {
+            println!("An unfinished write stops all writes: {reason}");
+        }
         list("Artifacts that are not downloaded (Git LFS pointer files)", &not_downloaded);
         if let Some(kind) = &network {
             println!(

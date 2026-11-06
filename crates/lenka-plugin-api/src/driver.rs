@@ -106,6 +106,14 @@ pub trait WriteTxn: fmt::Debug {
     /// Returns an error if the path holds a symlink.
     fn check_path(&self, path: &DocPath) -> Result<()>;
 
+    /// Checks that a later `put` or `append` to this path can pass, before the journal holds the
+    /// write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path holds a symlink, or if the target is not a regular file.
+    fn check_file_path(&self, path: &DocPath) -> Result<()>;
+
     /// Replaces a document in one atomic step.
     ///
     /// # Errors

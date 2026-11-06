@@ -11,6 +11,7 @@ pub mod gitdir;
 pub mod host;
 pub mod init;
 pub mod journal;
+pub mod layout;
 pub mod notices;
 pub mod project;
 pub mod secret;

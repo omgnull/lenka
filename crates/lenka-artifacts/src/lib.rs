@@ -3,6 +3,7 @@
 
 //! The artifact plugin. One artifact can link to many tasks in its project.
 
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,6 +29,12 @@ pub const DRAWING_MEDIA_TYPE: &str = "application/vnd.lenka.drawing+json";
 
 /// The largest artifact that lenka accepts.
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The first bytes of a Git LFS pointer file, with the longest text first.
+const LFS_POINTER_STARTS: [&str; 2] = [
+    "version https://git-lfs.github.com/spec/",
+    "version https://hawser.github.com/spec/",
+];
 
 /// What happens to the old version in an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -104,7 +111,7 @@ fn safe_file_name(raw: &str) -> String {
         })
         .collect();
     let clean = clean.trim_start_matches('.');
-    if clean.is_empty() || clean.len() > 200 {
+    if !lenka_core::layout::is_artifact_file_name(clean) {
         "artifact".to_owned()
     } else {
         clean.to_owned()
@@ -514,7 +521,45 @@ struct Prepared {
 }
 
 /// Checks all bytes of an artifact for secrets.
+/// Refuses a Git LFS pointer. It is only a reference to bytes, and with Git LFS on, a pointer that
+/// has no object can stop each push of the project.
+fn check_not_lfs_pointer(prepared: &Prepared) -> Result<()> {
+    let mut start = [0_u8; LFS_POINTER_STARTS[0].len()];
+    let count = match &prepared.content {
+        Content::Path(path) => {
+            let mut file = std::fs::File::open(path)
+                .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+            let mut count = 0;
+            while count < start.len() {
+                let read = file
+                    .read(&mut start[count..])
+                    .map_err(|err| LenkaError::io("Read the artifact source", &err))?;
+                if read == 0 {
+                    break;
+                }
+                count += read;
+            }
+            count
+        }
+        Content::Bytes(bytes) => {
+            let count = bytes.len().min(start.len());
+            start[..count].copy_from_slice(&bytes[..count]);
+            count
+        }
+    };
+    if LFS_POINTER_STARTS
+        .iter()
+        .any(|pointer| start[..count].starts_with(pointer.as_bytes()))
+    {
+        return Err(LenkaError::invalid_argument(
+            "This file is a Git LFS pointer, not the real bytes. Run `git lfs pull`, and try again.",
+        ));
+    }
+    Ok(())
+}
+
 fn check_content(prepared: &Prepared) -> Result<()> {
+    check_not_lfs_pointer(prepared)?;
     let location = format!("artifact {}", prepared.file);
     match &prepared.content {
         Content::Path(path) => {

@@ -91,7 +91,11 @@ pub fn run(txn: &mut dyn WriteTxn, ops: &[Op], crash: &CrashPoint) -> Result<()>
     // A failed check here changes nothing. A failure after the journal write would repeat at each
     // replay, and it would stop all later writes.
     for op in ops {
-        txn.check_path(&DocPath::new(op.path())?)?;
+        let path = DocPath::new(op.path())?;
+        match op {
+            Op::Put { .. } | Op::Append { .. } => txn.check_file_path(&path)?,
+            Op::Remove { .. } | Op::RemoveTree { .. } => txn.check_path(&path)?,
+        }
     }
     txn.journal_write(&text)?;
     for op in ops {
@@ -128,7 +132,15 @@ pub fn repair(driver: &dyn StorageDriver, txn: &mut dyn WriteTxn) -> Result<bool
         return Ok(false);
     };
     for op in &ops {
-        apply(txn, op, Some(driver))?;
+        apply(txn, op, Some(driver)).map_err(|err| {
+            LenkaError::new(
+                err.code(),
+                format!(
+                    "lenka cannot finish an unfinished write at {}: {err}. Repair that path, and run the command again.",
+                    op.path()
+                ),
+            )
+        })?;
     }
     txn.journal_clear()?;
     tracing::info!(operations = ops.len(), "repaired an unfinished write");

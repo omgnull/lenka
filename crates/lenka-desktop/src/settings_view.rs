@@ -140,7 +140,9 @@ impl SettingsState {
             .iter()
             .map(|cycle| cycle.join(" > "))
             .collect();
+        let unfinished: Vec<String> = report.unfinished_write.iter().cloned().collect();
         for (title, items) in [
+            ("An unfinished write stops all writes", &unfinished),
             ("Invalid files", &report.invalid_files),
             ("Directories with a bad name", &report.bad_names),
             ("Relation cycles", &cycles),

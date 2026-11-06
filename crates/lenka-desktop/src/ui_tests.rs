@@ -957,6 +957,18 @@ fn a_file_path_becomes_an_artifact_of_the_task() {
 }
 
 #[test]
+fn the_project_check_shows_a_stuck_write() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["A task"]);
+    click(&mut harness, "Settings");
+    harness.state_mut().app_mut().settings.doctor = Some(lenka_tasks::DoctorReport {
+        unfinished_write: Some("The path tasks/a is a directory.".to_owned()),
+        ..lenka_tasks::DoctorReport::default()
+    });
+    harness.run_steps(3);
+    assert!(has_label(&harness, "The path tasks/a is a directory."));
+}
+
+#[test]
 fn settings_save_a_valid_change() {
     let (fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
     click(&mut harness, "Settings");

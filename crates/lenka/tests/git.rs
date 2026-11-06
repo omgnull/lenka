@@ -204,7 +204,11 @@ fn git_commands_need_the_plugin_and_a_person_choice() -> TestResult {
     let enabled = machine.json(&repo, &["git", "enable", "--push-on-finish"])?;
     assert_eq!(enabled["layout"], "worktree");
     let settings = fs::read_to_string(repo.join(".git/lenka-data/lenka.toml"))?;
-    assert!(settings.contains("push_on_finish = true"), "{settings}");
+    assert!(!settings.contains("push_on_finish"), "{settings}");
+    assert_eq!(
+        local_setting(&machine, &repo, "lenka.pushonfinish").as_deref(),
+        Some("true")
+    );
     assert!(
         !machine
             .run(&repo, &["git", "enable", "--remote", "missing"])?
@@ -342,5 +346,597 @@ fn a_symlink_from_a_remote_is_refused() -> TestResult {
     machine.git(&evil, &["commit", "-q", "-m", "link"])?;
     machine.git(&evil, &["push", "-q", "origin", "lenka-data"])?;
     assert_eq!(machine.fails(&repo, &["sync"])?, "invalid_file");
+    Ok(())
+}
+
+/// Returns the Git settings of a clone, as `git config` shows them in the data directory.
+fn local_setting(machine: &Machine, repo: &Path, key: &str) -> Option<String> {
+    let mut command = std::process::Command::new("git");
+    machine.apply_env(&mut command);
+    let output = command
+        .args(["config", "--local", "--get", key])
+        .current_dir(repo.join(".git/lenka-data"))
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn remote_files(machine: &Machine, remote: &Path) -> TestResult<String> {
+    machine.git(remote, &["ls-tree", "-r", "--name-only", "lenka-data"])
+}
+
+/// Runs `lenka sync`, and returns the JSON report with the exit status.
+fn sync_report(machine: &Machine, repo: &Path) -> TestResult<(bool, Value)> {
+    let output = machine.run(repo, &["sync", "--json"])?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok((output.status.success(), serde_json::from_str(&text)?))
+}
+
+/// Two clones of one project, with the first change on the remote.
+fn two_clones(pair: &Pair) -> TestResult<(PathBuf, PathBuf)> {
+    let first = publish(&pair.first, "api", &pair.remote)?;
+    pair.first.ok(&first, &["git", "enable"])?;
+    pair.first.json(&first, &["sync"])?;
+    let second = fresh_clone(&pair.second, "clone", &pair.remote)?;
+    pair.second.ok(&second, &["init"])?;
+    Ok((first, second))
+}
+
+#[test]
+fn a_stray_file_stays_local_and_other_clones_can_sync() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let data = repo.join(".git/lenka-data");
+    let id = text(&task, "full_id");
+    for stray in [
+        ".DS_Store".to_owned(),
+        "notes.txt".to_owned(),
+        "tasks/.DS_Store".to_owned(),
+        format!("tasks/{id}/scratch.txt"),
+    ] {
+        fs::write(data.join(&stray), "stray")?;
+    }
+
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["pushed"], true);
+    let skipped = report["skipped"].to_string();
+    assert!(skipped.contains("notes.txt"), "{report}");
+    assert!(skipped.contains("scratch.txt"), "{report}");
+    let files = remote_files(machine, &pair.remote)?;
+    assert!(!files.contains("DS_Store"), "{files}");
+    assert!(!files.contains("notes.txt"), "{files}");
+    assert!(!files.contains("scratch.txt"), "{files}");
+    assert_eq!(fs::read_to_string(data.join("notes.txt"))?, "stray");
+
+    let second = fresh_clone(&pair.second, "clone", &pair.remote)?;
+    pair.second.ok(&second, &["init"])?;
+    let rows = pair.second.json(&second, &["task", "list"])?;
+    assert_eq!(rows["tasks"][0]["untrusted_data"]["title"], "A task");
+    Ok(())
+}
+
+#[test]
+fn excludes_and_ignore_files_cannot_hide_data() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let data = repo.join(".git/lenka-data");
+    fs::create_dir_all(repo.join(".git/info"))?;
+    fs::write(repo.join(".git/info/exclude"), "*.log\n*.md\n*.toml\n")?;
+    fs::write(data.join(".gitignore"), "*\n")?;
+    fs::create_dir_all(data.join("tasks"))?;
+    fs::write(data.join("tasks/.gitignore"), "*\n!.gitignore\n")?;
+
+    fs::write(repo.join("trace.log"), "trace bytes")?;
+    machine.json(&repo, &["artifact", "create", "trace.log"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(passed, "{report}");
+
+    let files = remote_files(machine, &pair.remote)?;
+    assert!(files.contains("/trace.log"), "{files}");
+    assert!(files.contains(text(&task, "full_id")), "{files}");
+    assert!(!files.contains("tasks/.gitignore"), "{files}");
+    assert!(!files.contains(".runtime"), "{files}");
+    Ok(())
+}
+
+#[test]
+fn a_hostile_ignore_file_cannot_stop_data_from_leaving() -> TestResult {
+    let pair = pair()?;
+    let (_first, second) = two_clones(&pair)?;
+    push_hostile_files(&pair.first, &pair.remote, &[(".gitignore", "*\n")])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["merged"], true, "{report}");
+
+    let task = pair.second.json(&second, &["task", "create", "New"])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["pushed"], true);
+    let files = remote_files(&pair.first, &pair.remote)?;
+    assert!(files.contains(text(&task, "full_id")), "{files}");
+    Ok(())
+}
+
+/// Tells that `lenka sync` refuses a hostile tree, and that the project stays usable.
+fn assert_tree_refused(files: &[(&str, &str)]) -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let task = pair.first.json(&first, &["task", "create", "Keep me"])?;
+    pair.first.json(&first, &["sync"])?;
+    push_hostile_files(&pair.first, &pair.remote, files)?;
+
+    let code = pair.second.fails(&second, &["sync"])?;
+    assert_eq!(code, "invalid_file", "{files:?}");
+    assert_eq!(pair.second.json(&second, &["doctor"])?["clean"], true);
+    let created = pair
+        .second
+        .json(&second, &["task", "create", "Still works"])?;
+    assert_eq!(created["status"], "todo", "{created}");
+    let shown = pair
+        .first
+        .json(&first, &["task", "show", text(&task, "task")])?;
+    assert_eq!(shown["untrusted_data"]["title"], "Keep me");
+    Ok(())
+}
+
+#[test]
+fn a_control_file_below_the_root_is_refused() -> TestResult {
+    assert_tree_refused(&[("tasks/.gitignore", "*\n!.gitignore\n")])?;
+    assert_tree_refused(&[("memory/.gitignore", "*\n")])?;
+    assert_tree_refused(&[("artifacts/.gitattributes", "* text\n")])
+}
+
+#[test]
+fn a_changed_gitattributes_is_refused() -> TestResult {
+    assert_tree_refused(&[(".gitattributes", "memory/** working-tree-encoding=UTF-16\n")])
+}
+
+#[test]
+fn a_gitmodules_file_is_refused() -> TestResult {
+    assert_tree_refused(&[(".gitmodules", "[submodule \"x\"]\n\tpath = x\n\turl = x\n")])
+}
+
+#[test]
+fn a_temporary_file_from_a_remote_is_refused() -> TestResult {
+    assert_tree_refused(&[(".tmp-1-0", "partial")])
+}
+
+#[test]
+fn a_bare_repository_under_tasks_is_refused() -> TestResult {
+    assert_tree_refused(&[
+        ("tasks/plain/HEAD", "ref: refs/heads/main\n"),
+        ("tasks/plain/config", "[core]\n\tfsmonitor = /bin/false\n"),
+        ("tasks/plain/objects/keep", ""),
+        ("tasks/plain/refs/keep", ""),
+    ])
+}
+
+#[test]
+fn a_directory_at_a_version_file_path_is_refused() -> TestResult {
+    let id = "01a1b2e7-da96-7000-8000-000000000001";
+    let path = format!("tasks/{id}/versions/000002/task.md/x");
+    assert_tree_refused(&[(&path, "x")])
+}
+
+#[test]
+fn a_conflict_marker_from_a_remote_is_refused() -> TestResult {
+    let id = "01a1b2e7-da96-7000-8000-000000000001";
+    let path = format!("tasks/{id}/task.md");
+    assert_tree_refused(&[(
+        &path,
+        "+++\n+++\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\n",
+    )])
+}
+
+#[test]
+fn git_settings_stay_in_each_clone() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    let url = pair.remote.to_string_lossy().into_owned();
+    machine.git(&repo, &["remote", "add", "corp", &url])?;
+    machine.ok(
+        &repo,
+        &["git", "enable", "--remote", "corp", "--push-on-finish"],
+    )?;
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["remote"], "corp");
+    assert_eq!(
+        local_setting(machine, &repo, "lenka.pushonfinish").as_deref(),
+        Some("true")
+    );
+
+    let second = fresh_clone(&pair.second, "clone", &pair.remote)?;
+    pair.second.ok(&second, &["init"])?;
+    assert_eq!(
+        local_setting(&pair.second, &second, "lenka.remote").as_deref(),
+        Some("origin")
+    );
+    assert_eq!(
+        local_setting(&pair.second, &second, "lenka.pushonfinish"),
+        None
+    );
+    let task = pair.second.json(&second, &["task", "create", "New"])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["remote"], "origin");
+    assert_eq!(report["pushed"], true);
+    let files = remote_files(machine, &pair.remote)?;
+    assert!(files.contains(text(&task, "full_id")), "{files}");
+    let settings = machine.git(&pair.remote, &["show", "lenka-data:lenka.toml"])?;
+    assert!(!settings.contains("corp"), "{settings}");
+    Ok(())
+}
+
+#[test]
+fn a_missing_selected_remote_is_an_error() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    machine.git(&repo, &["remote", "rename", "origin", "upstream"])?;
+    let code = machine.fails(&repo, &["sync"])?;
+    assert_eq!(code, "invalid_argument");
+    Ok(())
+}
+
+#[test]
+fn a_remote_settings_file_cannot_change_the_git_settings() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let settings = fs::read_to_string(first.join(".git/lenka-data/lenka.toml"))?;
+    let hostile =
+        format!("{settings}\n[git]\nenabled = false\nremote = \"evil\"\npush_on_finish = true\n");
+    push_hostile_files(&pair.first, &pair.remote, &[("lenka.toml", &hostile)])?;
+
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    let task = pair.second.json(&second, &["task", "create", "New"])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["remote"], "origin");
+    assert_eq!(report["pushed"], true);
+    assert_eq!(
+        local_setting(&pair.second, &second, "lenka.pushonfinish"),
+        None
+    );
+    let files = remote_files(&pair.first, &pair.remote)?;
+    assert!(files.contains(text(&task, "full_id")), "{files}");
+    Ok(())
+}
+
+#[test]
+fn a_remote_cannot_change_the_project_id_or_the_format() -> TestResult {
+    let new_id = "id = \"01a1b2e7-da96-7000-8000-000000000001\"";
+    for (start, new_line, code) in [
+        ("format_version = ", "format_version = 99", "format_too_new"),
+        ("id = ", new_id, "invalid_file"),
+    ] {
+        let pair = pair()?;
+        let (first, second) = two_clones(&pair)?;
+        let settings = fs::read_to_string(first.join(".git/lenka-data/lenka.toml"))?;
+        let line = settings
+            .lines()
+            .find(|row| row.starts_with(start))
+            .ok_or("the settings have no such line")?;
+        let hostile = settings.replacen(line, new_line, 1);
+        push_hostile_files(&pair.first, &pair.remote, &[("lenka.toml", &hostile)])?;
+        assert_eq!(pair.second.fails(&second, &["sync"])?, code);
+        assert_eq!(pair.second.json(&second, &["doctor"])?["clean"], true);
+    }
+    Ok(())
+}
+
+#[test]
+fn a_sync_reports_a_change_of_the_shared_settings() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let settings = fs::read_to_string(first.join(".git/lenka-data/lenka.toml"))?;
+    let changed = format!(
+        "{settings}\n[types.review]\nstages = [{{ name = \"look\", actor = \"human\" }}]\n"
+    );
+    push_hostile_files(&pair.first, &pair.remote, &[("lenka.toml", &changed)])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["settings_changed"][0], "types", "{report}");
+    let (_, again) = sync_report(&pair.second, &second)?;
+    assert_eq!(again["settings_changed"].as_array().map(Vec::len), Some(0));
+    Ok(())
+}
+
+#[test]
+fn an_open_merge_is_never_committed() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    let task = pair.first.json(&first, &["task", "create", "Shared"])?;
+    let id = text(&task, "task").to_owned();
+    pair.first.json(&first, &["sync"])?;
+    pair.second.json(&second, &["sync"])?;
+    let other = pair.second.json(&second, &["task", "create", "Other"])?;
+
+    for (machine, repo, words) in [
+        (&pair.first, &first, "first text"),
+        (&pair.second, &second, "second text"),
+    ] {
+        machine.json(
+            repo,
+            &[
+                "task",
+                "update",
+                &id,
+                "--version",
+                "1",
+                "--description",
+                words,
+                "--reason",
+                "Edit.",
+            ],
+        )?;
+    }
+    pair.first.json(&first, &["sync"])?;
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(!passed, "{report}");
+    assert!(
+        report["conflict"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    );
+
+    let published = pair.first.git(&pair.remote, &["rev-parse", "lenka-data"])?;
+
+    // A person starts the hand merge that the CLI text asks for.
+    let data = second.join(".git/lenka-data");
+    let mut merge = std::process::Command::new("git");
+    pair.second.apply_env(&mut merge);
+    let merged = merge
+        .args(["merge", "-q", "origin/lenka-data"])
+        .current_dir(&data)
+        .output()?;
+    assert!(!merged.status.success());
+
+    // A finish in that clone stores the task, and it tells that Git did not store the change.
+    let done = pair.second.json(
+        &second,
+        &[
+            "task",
+            "finish",
+            text(&other, "task"),
+            "--evidence",
+            "It works.",
+            "--override",
+        ],
+    )?;
+    assert_eq!(done["status"], "done");
+    let warning = done["plugin_warnings"]["untrusted_data"].to_string();
+    assert!(warning.contains("open merge"), "{done}");
+
+    assert_eq!(pair.second.fails(&second, &["sync"])?, "invalid_argument");
+    let head = pair.first.git(&pair.remote, &["rev-parse", "lenka-data"])?;
+    assert_eq!(head, published, "the sync changed the remote");
+    let mut grep = std::process::Command::new("git");
+    pair.first.apply_env(&mut grep);
+    let markers = grep
+        .args(["grep", "-l", "<<<<<<<", "lenka-data"])
+        .current_dir(&pair.remote)
+        .output()?;
+    assert!(!markers.status.success(), "the remote has conflict markers");
+    Ok(())
+}
+
+#[test]
+fn a_conflict_marker_in_a_local_file_is_not_committed() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    machine.json(&repo, &["sync"])?;
+    let file = repo
+        .join(".git/lenka-data/tasks")
+        .join(text(&task, "full_id"))
+        .join("task.md");
+    let bad = format!("{}\n<<<<<<< HEAD\nx\n", fs::read_to_string(&file)?);
+    fs::write(&file, bad)?;
+    assert_eq!(machine.fails(&repo, &["sync"])?, "invalid_file");
+    let tree = machine.git(
+        &pair.remote,
+        &[
+            "show",
+            &format!("lenka-data:tasks/{}/task.md", text(&task, "full_id")),
+        ],
+    )?;
+    assert!(!tree.contains("<<<<<<<"), "{tree}");
+    Ok(())
+}
+
+#[test]
+fn a_failed_push_still_reports_the_merge_and_rebuilds_the_index() -> TestResult {
+    let pair = pair()?;
+    let (first, second) = two_clones(&pair)?;
+    pair.first
+        .json(&first, &["task", "create", "From the first clone"])?;
+    pair.first.json(&first, &["sync"])?;
+    let local = pair.second.json(&second, &["task", "create", "Local"])?;
+
+    let hook = pair.remote.join("hooks/pre-receive");
+    fs::create_dir_all(pair.remote.join("hooks"))?;
+    fs::write(&hook, "#!/bin/sh\nexit 1\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))?;
+    }
+
+    let (passed, report) = sync_report(&pair.second, &second)?;
+    assert!(!passed, "{report}");
+    assert_eq!(report["merged"], true, "{report}");
+    assert_eq!(report["pushed"], false, "{report}");
+    assert!(report["push_error"].is_string(), "{report}");
+    let feed = fs::read_to_string(second.join(".git/lenka-data/.runtime/feed.jsonl"))?;
+    assert!(feed.contains("reindex"), "{feed}");
+    let rows = pair.second.json(&second, &["task", "list"])?.to_string();
+    assert!(rows.contains("From the first clone"), "{rows}");
+    assert!(rows.contains(text(&local, "task")), "{rows}");
+    Ok(())
+}
+
+#[test]
+fn a_failed_commit_is_in_the_result_of_a_finish() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    machine.git(
+        &repo.join(".git/lenka-data"),
+        &["checkout", "-q", "--detach"],
+    )?;
+    let done = machine.json(
+        &repo,
+        &[
+            "task",
+            "finish",
+            text(&task, "task"),
+            "--evidence",
+            "It works.",
+            "--override",
+        ],
+    )?;
+    assert_eq!(done["status"], "done");
+    assert!(
+        done["plugin_warnings"]["untrusted_data"].is_array(),
+        "{done}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_changed_id_in_the_settings_stops_the_project() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.project("api")?;
+    let file = repo.join(".git/lenka-data/lenka.toml");
+    let settings = fs::read_to_string(&file)?;
+    let line = settings
+        .lines()
+        .find(|row| row.starts_with("id = "))
+        .unwrap_or("");
+    fs::write(
+        &file,
+        settings.replacen(line, "id = \"01a1b2e7-da96-7000-8000-000000000001\"", 1),
+    )?;
+    assert_eq!(
+        machine.fails(&repo, &["task", "list"])?,
+        "project_not_available"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_stuck_write_leaves_reads_and_doctor_working() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let data = repo.join(".git/lenka-data");
+    // The journal names a file, and that path is a directory, so a replay cannot finish.
+    fs::create_dir_all(data.join("tasks/blocked.md"))?;
+    fs::write(
+        data.join(".runtime/pending.json"),
+        r#"[{"op":"put","path":"tasks/blocked.md","text":"x"}]"#,
+    )?;
+
+    let shown = machine.json(&repo, &["task", "show", text(&task, "task")])?;
+    assert_eq!(shown["untrusted_data"]["title"], "A task");
+    let output = machine.run(&repo, &["doctor", "--json"])?;
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    let stuck = report["report"]["unfinished_write"].to_string();
+    assert!(stuck.contains("tasks/blocked.md"), "{report}");
+    let code = machine.fails(&repo, &["task", "create", "Refused"])?;
+    assert_eq!(code, "io");
+    fs::remove_dir(data.join("tasks/blocked.md"))?;
+    machine.json(&repo, &["task", "create", "Accepted"])?;
+    Ok(())
+}
+
+#[test]
+fn a_conflict_marker_in_an_entry_does_not_stop_a_commit() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    machine.json(
+        &repo,
+        &[
+            "task",
+            "entry",
+            text(&task, "task"),
+            "--kind",
+            "comment",
+            "--text",
+            "<<<<<<< a quote of a merge",
+        ],
+    )?;
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["pushed"], true);
+    Ok(())
+}
+
+#[test]
+fn an_artifact_that_is_a_git_lfs_pointer_is_refused() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.project("api")?;
+    let pointer = format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12\n",
+        "ab".repeat(32)
+    );
+    fs::write(repo.join("x.bin"), pointer)?;
+    assert_eq!(
+        machine.fails(&repo, &["artifact", "create", "x.bin"])?,
+        "invalid_argument"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_temporary_file_from_a_stopped_process_stays_out_of_git() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let data = repo.join(".git/lenka-data");
+    fs::write(data.join(".tmp-1-0"), "partial")?;
+    let inner = format!("tasks/{}/.tmp-1-1", text(&task, "full_id"));
+    fs::write(data.join(&inner), "partial")?;
+
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(passed, "{report}");
+    // Such a file is not a choice of a person, so the report does not list it.
+    assert_eq!(
+        report["skipped"].as_array().map(Vec::len),
+        Some(0),
+        "{report}"
+    );
+    let files = remote_files(machine, &pair.remote)?;
+    assert!(!files.contains(".tmp-"), "{files}");
+
+    let second = fresh_clone(&pair.second, "clone", &pair.remote)?;
+    pair.second.ok(&second, &["init"])?;
     Ok(())
 }

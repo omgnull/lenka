@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use lenka_core::init::{Location, create_project, register_existing};
 use lenka_core::{Builder, Host, Paths, Project};
-use lenka_git::{EnableOptions, Layout, enable, restore, sync};
-use lenka_plugin_api::{Actor, Caller, ProjectScope, TaskId};
+use lenka_git::{EnableOptions, Layout, enable, mark_indexed, restore, sync};
+use lenka_plugin_api::{Actor, ArtifactId, Caller, MemoryId, ProjectScope, TaskId};
 use lenka_tasks::{ClaimRef, Finish, NewTask, TaskPatch, TaskService, service_of};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -27,6 +27,14 @@ const CHILD_FLAG: &str = "LENKA_GIT_TEST_CHILD";
 const WITH_IDENTITY: &str = "[user]\n\tname = Test Person\n\temail = person@example.invalid\n[init]\n\tdefaultBranch = main\n";
 const WITH_LFS: &str = "[user]\n\tname = Test Person\n\temail = person@example.invalid\n[init]\n\tdefaultBranch = main\n[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n";
 const NO_IDENTITY: &str = "[init]\n\tdefaultBranch = main\n";
+
+fn project_dir_of(project: &Project) -> PathBuf {
+    project
+        .driver()
+        .local_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
 
 /// Runs the body in a child process with an isolated Git configuration.
 fn isolated(name: &str, config: &str, body: impl FnOnce() -> TestResult) -> TestResult {
@@ -253,9 +261,15 @@ fn enable_makes_a_worktree_with_no_change_to_the_checkout() -> TestResult {
             assert!(!files.contains(".runtime"), "{files}");
             assert_eq!(git(&data, &["status", "--porcelain"])?, "");
             let project = machine.project("api")?;
-            assert!(project.config().git.enabled);
+            assert_eq!(
+                git(
+                    &project_dir_of(&project),
+                    &["config", "--local", "lenka.enabled"]
+                )?,
+                "true"
+            );
             let text = fs::read_to_string(data.join("lenka.toml"))?;
-            assert!(text.contains("enabled = true"), "{text}");
+            assert!(!text.contains("[git]"), "{text}");
 
             // A repeat call is safe.
             let again = enable_default(&machine, &repo, "api")?;
@@ -416,10 +430,6 @@ fn a_directory_inside_a_clone_never_commits_to_the_code() -> TestResult {
 
             // Without `enable`, a sync refuses. The parent repository stays as it was.
             assert!(sync(&project).is_err());
-            let mut config = (*project.config()).clone();
-            config.git.enabled = true;
-            project.save_config(config)?;
-            assert!(sync(&project).is_err());
             assert_eq!(git(&repo, &["log", "--format=%s"])?, "code");
 
             let report = enable(
@@ -449,10 +459,14 @@ fn a_bad_remote_in_the_settings_is_refused() -> TestResult {
             let repo = repo_with_project(&machine, "api")?;
             enable_default(&machine, &repo, "api")?;
             let project = machine.project("api")?;
-            let mut config = (*project.config()).clone();
-            config.git.remote = "--upload-pack=touch /tmp/x".to_owned();
-            project.save_config(config)?;
+            // The local Git configuration is not a trusted source of a command option.
+            let dir = project_dir_of(&project);
+            git(
+                &dir,
+                &["config", "--local", "lenka.remote", "--upload-pack=touch x"],
+            )?;
             assert!(sync(&project).is_err());
+            git(&dir, &["config", "--local", "lenka.remote", "origin"])?;
 
             let options = EnableOptions {
                 remote: Some("missing".to_owned()),
@@ -760,7 +774,13 @@ fn a_shared_project_uses_its_own_repository_and_a_remote_url() -> TestResult {
             assert_eq!(report.layout, Layout::Repository);
             assert_eq!(report.remote, "origin");
             assert!(report.remote_found);
-            assert!(project.config().git.push_on_finish);
+            assert_eq!(
+                git(
+                    &project_dir_of(&project),
+                    &["config", "--local", "lenka.pushOnFinish"]
+                )?,
+                "true"
+            );
 
             let service = service_of(&project)?;
             let id = add_task(&service, "A task")?;
@@ -798,4 +818,296 @@ fn a_sync_with_no_remote_only_commits() -> TestResult {
         assert_eq!(report.remote, None);
         Ok(())
     })
+}
+
+/// Tells if this machine has Git LFS. The LFS tests stop at once without it.
+fn has_lfs(dir: &Path) -> bool {
+    Command::new("git")
+        .args(["lfs", "version"])
+        .current_dir(dir)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// A valid Git LFS pointer to an object that does not exist.
+fn dangling_pointer() -> String {
+    format!(
+        "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 12\n",
+        "ab".repeat(32)
+    )
+}
+
+/// Two machines with one project, connected through a bare repository.
+struct TwoClones {
+    first: Machine,
+    second: Machine,
+    remote: PathBuf,
+    url: String,
+    first_data: PathBuf,
+    second_data: PathBuf,
+}
+
+fn two_clones(root: &Path, url_of: fn(&Path) -> String) -> TestResult<TwoClones> {
+    let first_root = root.join("first");
+    let second_root = root.join("second");
+    fs::create_dir_all(&first_root)?;
+    fs::create_dir_all(&second_root)?;
+    let remote = bare(root)?;
+    let url = url_of(&remote);
+    let first = Machine::new(&first_root)?;
+    let repo = repo_with_project(&first, "api")?;
+    git(&repo, &["remote", "add", "origin", &url])?;
+    git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/main"])?;
+    enable_default(&first, &repo, "api")?;
+    let project = first.project("api")?;
+    assert!(sync(&project)?.pushed);
+    let first_data = project_dir_of(&project);
+
+    let second = Machine::new(&second_root)?;
+    let clone = second_root.join("clone");
+    git_os(
+        &second_root,
+        [
+            OsStr::new("clone"),
+            OsStr::new("-q"),
+            OsStr::new(&url),
+            clone.as_os_str(),
+        ],
+    )?;
+    let second_data = restore(&clone)?.ok_or("the clone has no data branch")?;
+    register_existing(&second.paths, &clone, None, &second_data)?;
+    Ok(TwoClones {
+        first,
+        second,
+        remote,
+        url,
+        first_data,
+        second_data,
+    })
+}
+
+fn plain_path(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Pushes files to the data branch from a clone with no lenka process.
+fn push_with_git(root: &Path, url: &str, files: &[(String, String)]) -> TestResult {
+    let evil = root.join("evil");
+    git_os(
+        root,
+        [
+            OsStr::new("clone"),
+            OsStr::new("-q"),
+            OsStr::new("-b"),
+            OsStr::new("lenka-data"),
+            OsStr::new(url),
+            evil.as_os_str(),
+        ],
+    )?;
+    for (path, text) in files {
+        let file = evil.join(path);
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(file, text)?;
+    }
+    git(&evil, &["add", "-A"])?;
+    git(&evil, &["commit", "-q", "-m", "other clone"])?;
+    // Git LFS adds a push hook to this clone. A hostile clone does not run that hook.
+    git(
+        &evil,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            "-q",
+            "origin",
+            "lenka-data",
+        ],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn a_dangling_lfs_pointer_does_not_stop_a_sync_or_a_restore() -> TestResult {
+    isolated(
+        "a_dangling_lfs_pointer_does_not_stop_a_sync_or_a_restore",
+        WITH_LFS,
+        || {
+            let temp = tempfile::tempdir()?;
+            if !has_lfs(temp.path()) {
+                return Ok(());
+            }
+            let clones = two_clones(temp.path(), file_url)?;
+            let memory = format!("memory/{}.md", MemoryId::generate());
+            let pointer = format!("artifacts/{}/versions/000001/x.bin", ArtifactId::generate());
+            push_with_git(
+                temp.path(),
+                &clones.url,
+                &[
+                    (pointer.clone(), dangling_pointer()),
+                    (memory.clone(), "memory text\n".to_owned()),
+                ],
+            )?;
+
+            let project = clones.second.project("api")?;
+            let report = sync(&project)?;
+            assert!(report.merged, "{report:?}");
+            assert!(report.is_complete(), "{report:?}");
+            assert!(report.lfs_warning.is_some(), "{report:?}");
+            assert_eq!(git(&clones.second_data, &["status", "--porcelain"])?, "");
+            assert!(clones.second_data.join(&memory).is_file());
+            assert_eq!(
+                fs::read_to_string(clones.second_data.join(&pointer))?,
+                dangling_pointer()
+            );
+
+            // A fresh clone restores the same branch, and the artifact stays a pointer file.
+            let third = temp.path().join("third");
+            git_os(
+                temp.path(),
+                [
+                    OsStr::new("clone"),
+                    OsStr::new("-q"),
+                    OsStr::new(&clones.url),
+                    third.as_os_str(),
+                ],
+            )?;
+            let restored = restore(&third)?.ok_or("the clone has no data branch")?;
+            assert!(restored.join(&memory).is_file());
+            assert_eq!(
+                fs::read_to_string(restored.join(&pointer))?,
+                dangling_pointer()
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn a_local_pointer_with_no_object_does_not_stop_a_push() -> TestResult {
+    isolated(
+        "a_local_pointer_with_no_object_does_not_stop_a_push",
+        WITH_LFS,
+        || {
+            let temp = tempfile::tempdir()?;
+            if !has_lfs(temp.path()) {
+                return Ok(());
+            }
+            let clones = two_clones(temp.path(), file_url)?;
+            let path = format!("artifacts/{}/versions/000001/x.bin", ArtifactId::generate());
+            let file = clones.first_data.join(&path);
+            fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+            fs::write(file, dangling_pointer())?;
+
+            let project = clones.first.project("api")?;
+            let report = sync(&project)?;
+            assert!(report.is_complete(), "{report:?}");
+            assert!(report.pushed, "{report:?}");
+            let listed = git(
+                &clones.remote,
+                &["ls-tree", "-r", "--name-only", "lenka-data"],
+            )?;
+            assert!(listed.contains(&path), "{listed}");
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn a_failed_merge_puts_the_tree_back() -> TestResult {
+    isolated("a_failed_merge_puts_the_tree_back", WITH_IDENTITY, || {
+        let temp = tempfile::tempdir()?;
+        let clones = two_clones(temp.path(), plain_path)?;
+        let memory = format!("memory/{}.md", MemoryId::generate());
+        let other = format!("memory/{}.md", MemoryId::generate());
+        push_with_git(
+            temp.path(),
+            &clones.url,
+            &[
+                (memory.clone(), "memory text\n".to_owned()),
+                (other.clone(), "other text\n".to_owned()),
+            ],
+        )?;
+
+        // This filter of the second clone fails during the checkout of the merge.
+        let data = &clones.second_data;
+        let rules = temp.path().join("attributes");
+        fs::write(&rules, format!("{other} filter=stop\n"))?;
+        git_os(
+            data,
+            [
+                OsStr::new("config"),
+                OsStr::new("--local"),
+                OsStr::new("core.attributesFile"),
+                rules.as_os_str(),
+            ],
+        )?;
+        for (key, value) in [
+            ("filter.stop.smudge", "false"),
+            ("filter.stop.clean", "cat"),
+            ("filter.stop.required", "true"),
+        ] {
+            git(data, &["config", "--local", key, value])?;
+        }
+
+        let project = clones.second.project("api")?;
+        let head = git(data, &["rev-parse", "HEAD"])?;
+        for _ in 0..2 {
+            assert!(sync(&project).is_err());
+            assert_eq!(git(data, &["status", "--porcelain"])?, "");
+            assert_eq!(git(data, &["rev-parse", "HEAD"])?, head);
+            assert!(!data.join(&memory).exists());
+            assert!(!data.join(&other).exists());
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn a_stopped_process_after_a_merge_still_gets_a_reindex() -> TestResult {
+    isolated(
+        "a_stopped_process_after_a_merge_still_gets_a_reindex",
+        WITH_IDENTITY,
+        || {
+            let temp = tempfile::tempdir()?;
+            let clones = two_clones(temp.path(), plain_path)?;
+            let source = clones.first.project("api")?;
+            let service = service_of(&source)?;
+            add_task(&service, "New")?;
+            assert!(sync(&source)?.pushed);
+
+            let project = clones.second.project("api")?;
+            assert!(sync(&project)?.merged);
+            // The process stopped here, so a later sync tells the caller again.
+            assert!(sync(&project)?.merged);
+            mark_indexed(&project)?;
+            assert!(!sync(&project)?.merged);
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn a_merge_with_nothing_new_does_not_ask_for_a_reindex() -> TestResult {
+    isolated(
+        "a_merge_with_nothing_new_does_not_ask_for_a_reindex",
+        WITH_IDENTITY,
+        || {
+            let temp = tempfile::tempdir()?;
+            let clones = two_clones(temp.path(), plain_path)?;
+            let project = clones.second.project("api")?;
+            assert!(!sync(&project)?.merged);
+            assert!(!sync(&project)?.merged);
+            assert_eq!(
+                Command::new("git")
+                    .args(["config", "--local", "lenka.needsReindex"])
+                    .current_dir(&clones.second_data)
+                    .output()?
+                    .stdout,
+                Vec::<u8>::new()
+            );
+            Ok(())
+        },
+    )
 }

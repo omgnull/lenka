@@ -334,6 +334,8 @@ pub struct DoctorReport {
     pub unavailable_links: Vec<String>,
     /// Tasks with a type or a stage that the settings do not have.
     pub missing_stages: Vec<String>,
+    /// The reason that an unfinished write cannot complete. All writes stop until it can.
+    pub unfinished_write: Option<String>,
 }
 
 impl DoctorReport {
@@ -346,7 +348,18 @@ impl DoctorReport {
             && self.broken_links.is_empty()
             && self.unavailable_links.is_empty()
             && self.missing_stages.is_empty()
+            && self.unfinished_write.is_none()
     }
+}
+
+/// The result of a stage change or a finish. The data is stored, also if a plugin failed.
+#[derive(Debug, Clone)]
+pub struct StateChange {
+    /// The new task state.
+    pub state: State,
+    /// The failures of plugins after the write, for example a failed Git commit or push. The text
+    /// can hold words from a remote, so a tool result must label it as untrusted data.
+    pub warnings: Vec<String>,
 }
 
 /// A row for the desktop board: the full index record, with calculated values.
@@ -1638,7 +1651,7 @@ impl TaskService {
         claim: &ClaimRef,
         evidence: &str,
         back_to: Option<&str>,
-    ) -> Result<State> {
+    ) -> Result<StateChange> {
         let state = self.with_write(|locked, index, now| {
             check_not_invalid(index, id)?;
             let meta = index
@@ -1735,10 +1748,10 @@ impl TaskService {
             })?;
             Ok(state)
         })?;
-        let _warnings = self.project.emit(&ProjectEvent::StageChanged {
+        let warnings = self.project.emit(&ProjectEvent::StageChanged {
             task: id.to_string(),
         });
-        Ok(state)
+        Ok(StateChange { state, warnings })
     }
 
     /// Finishes a task with evidence, or releases it.
@@ -1753,7 +1766,7 @@ impl TaskService {
         id: TaskId,
         claim: &ClaimRef,
         finish: &Finish,
-    ) -> Result<State> {
+    ) -> Result<StateChange> {
         let state = self.with_write(|locked, index, now| {
             check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
@@ -1843,12 +1856,14 @@ impl TaskService {
             })?;
             Ok(state)
         })?;
-        if state.status == Status::Done {
-            let _warnings = self.project.emit(&ProjectEvent::TaskFinished {
+        let warnings = if state.status == Status::Done {
+            self.project.emit(&ProjectEvent::TaskFinished {
                 task: id.to_string(),
-            });
-        }
-        Ok(state)
+            })
+        } else {
+            Vec::new()
+        };
+        Ok(StateChange { state, warnings })
     }
 
     /// Ends the claim, and stops automatic pickup.
@@ -2385,6 +2400,11 @@ impl TaskService {
                 .into_iter()
                 .map(|cycle| cycle.iter().map(TaskId::short).collect())
                 .collect(),
+            unfinished_write: self
+                .project
+                .repair_if_needed()
+                .err()
+                .map(|err| err.to_string()),
             ..DoctorReport::default()
         };
         let mut reader = LinkReader::default();
