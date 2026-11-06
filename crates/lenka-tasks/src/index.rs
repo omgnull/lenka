@@ -19,6 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::markdown::{MAX_TEXT_BYTES, check_conflict_markers, split_front};
 use crate::model::{Claim, Link, State, TaskFront, TaskMeta};
 
+/// The length of a feed text with no line end at which lenka stops to wait for the line end.
+const MAX_FEED_LINE_BYTES: usize = 32 * 1024 * 1024;
+
 const SNAPSHOT_PATH: &str = ".runtime/index/snapshot.json";
 const SNAPSHOT_FORMAT: u32 = 1;
 
@@ -330,9 +333,11 @@ impl Index {
             .map_or(0, |i| i + 1);
         let mut claims_changed = false;
         let mut changed: HashSet<TaskId> = HashSet::new();
+        // A bad line can hide the event of a writer, so only a full scan is sure to see the change.
         let mut rescan = false;
         for line in String::from_utf8_lossy(&bytes[..complete]).lines() {
             let Ok(event) = serde_json::from_str::<FeedEvent>(line) else {
+                rescan = true;
                 continue;
             };
             match event.kind {
@@ -350,6 +355,11 @@ impl Index {
             }
         }
         self.feed_offset += complete as u64;
+        // No event is this long. Without this step, the read never reaches the end of the line.
+        if complete == 0 && bytes.len() >= MAX_FEED_LINE_BYTES {
+            self.feed_offset += bytes.len() as u64;
+            rescan = true;
+        }
         if rescan {
             let offset = self.feed_offset;
             self.scan(driver)?;

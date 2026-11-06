@@ -1908,3 +1908,346 @@ fn service_directory(fx: &Fixture, name: &str) -> Result<PathBuf> {
         .map(Path::to_path_buf)
         .ok_or_else(|| LenkaError::invalid_argument("the project has no directory"))
 }
+
+fn too_long_reason() -> String {
+    "r".repeat(4097)
+}
+
+#[test]
+fn a_long_reason_is_refused() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = service.create(&human, task("A task"))?.id();
+    let patch = TaskPatch {
+        expected_version: 1,
+        reason: Some(too_long_reason()),
+        description: Some("New text.".to_owned()),
+        ..TaskPatch::default()
+    };
+    let error = service.update(&human, id, patch).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let finish = Finish::Done {
+        evidence: "It works.".to_owned(),
+        unchecked_reason: Some(too_long_reason()),
+    };
+    let error = service
+        .finish(&human, id, &ClaimRef::Implicit, &finish)
+        .err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    Ok(())
+}
+
+#[test]
+fn large_evidence_is_refused() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = service.create(&human, task("A task"))?.id();
+    let evidence = "e".repeat(1024 * 1024 + 1);
+    let finish = Finish::Done {
+        evidence: evidence.clone(),
+        unchecked_reason: None,
+    };
+    let error = service
+        .finish(&human, id, &ClaimRef::Implicit, &finish)
+        .err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let error = service
+        .advance(&human, id, &ClaimRef::Implicit, &evidence, None)
+        .err()
+        .map(|err| err.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("The evidence is larger"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn a_bad_label_is_refused() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let many: Vec<String> = (0..1001).map(|index| format!("label{index}")).collect();
+    for labels in [
+        vec!["a\nb".to_owned()],
+        vec!["a\u{1b}[2Jb".to_owned()],
+        vec!["l".repeat(257)],
+        many,
+    ] {
+        let new = NewTask {
+            labels,
+            ..task("A task")
+        };
+        let error = service.create(&human, new).err();
+        assert_eq!(
+            error.map(|err| err.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+    }
+    let id = service.create(&human, task("A task"))?.id();
+    let patch = TaskPatch {
+        expected_version: 1,
+        labels_add: vec!["a\nb".to_owned()],
+        ..TaskPatch::default()
+    };
+    let error = service.update(&human, id, patch).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let patch = TaskPatch {
+        expected_version: 1,
+        relates_add: vec![Link::Local(id); 1001],
+        ..TaskPatch::default()
+    };
+    let error = service.update(&human, id, patch).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    Ok(())
+}
+
+#[test]
+fn control_characters_are_refused_in_text() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let bad = "text\u{1b}]0;title\u{7}";
+    let error = service.create(&human, task(bad)).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let new = NewTask {
+        description: bad.to_owned(),
+        ..task("A task")
+    };
+    let error = service.create(&human, new).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let new = NewTask {
+        plan: Some(bad.to_owned()),
+        ..task("A task")
+    };
+    let error = service.create(&human, new).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+
+    // Line breaks and tabs stay valid in a body.
+    let new = NewTask {
+        description: "one\r\ntwo\n\tthree".to_owned(),
+        ..task("A task")
+    };
+    let id = service.create(&human, new)?.id();
+    let entry = NewEntry {
+        kind: EntryKind::Comment,
+        text: bad.to_owned(),
+        replaces: None,
+        secret_policy: lenka_core::SecretPolicy::Enforce,
+    };
+    let error = service.add_entry(&human, id, entry).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    let error = service
+        .advance(&human, id, &ClaimRef::Implicit, bad, None)
+        .err()
+        .map(|err| err.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("The evidence has a control"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn a_marker_line_with_a_carriage_return_is_refused() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let new = NewTask {
+        description: "one\n=======\r".to_owned(),
+        ..task("A task")
+    };
+    let error = service.create(&fx.human(), new).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+    Ok(())
+}
+
+/// Writes an inbox file with notices of a task, directly on the disk.
+fn write_inbox(
+    fx: &Fixture,
+    caller: &Caller,
+    subject: TaskId,
+    count: usize,
+    reason: &str,
+) -> Result<()> {
+    let notice = lenka_core::Notice {
+        id: lenka_plugin_api::NoticeId::generate(),
+        subject: lenka_core::Subject::Task(subject.to_string()),
+        version: 1,
+        changed: vec!["description".to_owned()],
+        author: "other".to_owned(),
+        reason: reason.to_owned(),
+        at: lenka_plugin_api::Timestamp::from_unix_ms(1_793_000_000_000),
+        claim: "handle".to_owned(),
+        claimed_task: subject.to_string(),
+    };
+    let mut text = String::new();
+    for _ in 0..count {
+        let fresh = lenka_core::Notice {
+            id: lenka_plugin_api::NoticeId::generate(),
+            ..notice.clone()
+        };
+        text.push_str(
+            &serde_json::to_string(&fresh)
+                .map_err(|err| LenkaError::invalid_file(err.to_string()))?,
+        );
+        text.push('\n');
+    }
+    let dir = service_directory(fx, "api")?;
+    let path = lenka_core::notices::inbox_path(&caller.agent_key)?;
+    let file = dir.join(path.as_str());
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|err| LenkaError::io("mkdir", &err))?;
+    }
+    fs::write(file, text).map_err(|err| LenkaError::io("write", &err))
+}
+
+#[test]
+fn a_reply_holds_a_limited_count_of_notes() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let agent = fx.agent("victim");
+    let id = service.create(&human, task("A task"))?.id();
+
+    write_inbox(&fx, &agent, id, 60, "A small reason.")?;
+    let reply = lenka_tasks::with_notes(serde_json::json!({}), &service, &agent);
+    assert_eq!(reply["unread_changes"].as_array().map(Vec::len), Some(50));
+    assert_eq!(reply["unread_changes_omitted"], 10);
+
+    // The bytes have a limit too, and one large old notice cannot fill a reply.
+    write_inbox(&fx, &agent, id, 40, &"\"".repeat(1024 * 1024 / 8))?;
+    let reply = lenka_tasks::with_notes(serde_json::json!({}), &service, &agent);
+    let size = reply.to_string().len();
+    assert!(size < 256 * 1024, "{size}");
+    assert!(
+        reply["unread_changes_omitted"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    Ok(())
+}
+
+#[test]
+fn a_large_inbox_does_not_stop_reads_or_a_finish() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let agent = fx.agent("victim");
+    let id = service.create(&human, task("A task"))?.id();
+    write_inbox(&fx, &agent, id, 18, &"x".repeat(1024 * 1024))?;
+    let notes = service.call_notes(&agent)?;
+    assert!(!notes.unread.is_empty());
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let finish = Finish::Done {
+        evidence: "It works.".to_owned(),
+        unchecked_reason: None,
+    };
+    service.finish(&agent, id, &ClaimRef::Handle(claim.handle), &finish)?;
+    Ok(())
+}
+
+#[test]
+fn a_check_list_has_a_limit_and_runs_in_one_pass() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let count = 5000;
+    let acceptance: String = (0..count)
+        .map(|index| format!("- [ ] Item {index}\n"))
+        .collect();
+    let new = NewTask {
+        acceptance,
+        ..task("A task")
+    };
+    let id = service.create(&human, new)?.id();
+
+    let too_many = TaskPatch {
+        expected_version: 1,
+        check: vec![
+            lenka_tasks::CheckItem {
+                index: 0,
+                done: true
+            };
+            10_001
+        ],
+        ..TaskPatch::default()
+    };
+    let error = service.update(&human, id, too_many).err();
+    assert_eq!(
+        error.map(|err| err.code()),
+        Some(ErrorCode::InvalidArgument)
+    );
+
+    let mut check: Vec<lenka_tasks::CheckItem> = (0..count)
+        .map(|index| lenka_tasks::CheckItem { index, done: true })
+        .collect();
+    // The last mark of a position wins.
+    check.push(lenka_tasks::CheckItem {
+        index: 0,
+        done: false,
+    });
+    let patch = TaskPatch {
+        expected_version: 1,
+        check,
+        ..TaskPatch::default()
+    };
+    let started = std::time::Instant::now();
+    service.update(&human, id, patch)?;
+    let seconds = started.elapsed().as_secs();
+    assert!(seconds < 5, "{seconds} s");
+    let body = service.detail(id, &[])?.acceptance;
+    assert!(body.contains("- [ ] Item 0\n"), "the last mark did not win");
+    assert!(body.contains("- [x] Item 1\n"));
+    assert!(body.contains(&format!("- [x] Item {}", count - 1)));
+    Ok(())
+}
+
+#[test]
+fn a_very_long_feed_line_does_not_stop_the_index() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let first = service.create(&human, task("First"))?.id();
+    let dir = service_directory(&fx, "api")?;
+    let feed = dir.join(".runtime/feed.jsonl");
+    let mut text = fs::read(&feed).map_err(|err| LenkaError::io("read", &err))?;
+    text.extend(std::iter::repeat_n(b'x', 65 * 1024 * 1024));
+    fs::write(&feed, text).map_err(|err| LenkaError::io("write", &err))?;
+    // This list moves past the long line. Then a new event must reach the index again.
+    let _rows = service.list(&human, &lenka_tasks::ListFilter::default())?;
+    let other = build_host(&fx.paths, &fx.clock)?;
+    let other = service_of(&other.open_by_name("api")?)?;
+    let second = other.create(&human, task("Second"))?.id();
+    let rows = service.list(&human, &lenka_tasks::ListFilter::default())?;
+    let titles = format!("{rows:?}");
+    assert!(titles.contains("Second"), "{first} {second}: {titles}");
+    Ok(())
+}

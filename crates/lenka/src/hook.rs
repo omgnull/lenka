@@ -5,7 +5,7 @@
 //! starts no other process. A failure gives no output, because a hook must not stop the client.
 
 use std::fs;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -122,7 +122,7 @@ fn project_notices(name: &str, dir: &Path, key: &str) -> Vec<String> {
     if has_symlink(dir, &inbox_dir) {
         return Vec::new();
     }
-    let Some(bytes) = read_limited(&inbox_dir.join(format!("{key}.jsonl"))) else {
+    let Some(bytes) = read_end(&inbox_dir.join(format!("{key}.jsonl"))) else {
         return Vec::new();
     };
     let notices = parse_inbox(&bytes);
@@ -156,6 +156,24 @@ fn has_symlink(base: &Path, path: &Path) -> bool {
         current.push(part);
         fs::symlink_metadata(&current).is_ok_and(|meta| meta.file_type().is_symlink())
     })
+}
+
+/// Reads the end of a file, because new notices are at the end. The result holds only whole lines.
+fn read_end(path: &Path) -> Option<Vec<u8>> {
+    if fs::symlink_metadata(path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(MAX_INBOX_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    if start > 0 {
+        let first = bytes.iter().position(|byte| *byte == b'\n')?;
+        bytes.drain(..=first);
+    }
+    Some(bytes)
 }
 
 fn read_limited(path: &Path) -> Option<Vec<u8>> {

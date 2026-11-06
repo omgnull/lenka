@@ -789,3 +789,60 @@ fn an_artifact_write_never_goes_through_a_symlink() -> TestResult {
     assert_eq!(fs::read_to_string(&victim)?, "original");
     Ok(())
 }
+
+#[test]
+fn an_artifact_has_limits_on_its_type_and_its_reason() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.project("api")?;
+    fs::write(repo.join("a.txt"), "first")?;
+    let bad_type = "text/plain\u{1b}]0;x\u{7}";
+    let code = machine.fails(
+        &repo,
+        &["artifact", "create", "a.txt", "--media-type", bad_type],
+    )?;
+    assert_eq!(code, "invalid_argument");
+    let long_type = "t".repeat(257);
+    let code = machine.fails(
+        &repo,
+        &["artifact", "create", "a.txt", "--media-type", &long_type],
+    )?;
+    assert_eq!(code, "invalid_argument");
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let id = text(&created, "artifact").to_owned();
+    fs::write(repo.join("b.txt"), "second")?;
+    let reason = "r".repeat(4097);
+    let code = machine.fails(
+        &repo,
+        &[
+            "artifact",
+            "update",
+            &id,
+            "b.txt",
+            "--version",
+            "1",
+            "--reason",
+            &reason,
+        ],
+    )?;
+    assert_eq!(code, "invalid_argument");
+    Ok(())
+}
+
+#[test]
+fn an_artifact_with_an_invalid_record_can_be_deleted() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let machine = Machine::new(temp.path())?;
+    let repo = machine.project("api")?;
+    fs::write(repo.join("a.txt"), "first")?;
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let record = repo
+        .join(".git/lenka-data/artifacts")
+        .join(&full)
+        .join("artifact.toml");
+    fs::write(&record, "<<<<<<< HEAD\nnot valid\n")?;
+    machine.json(&repo, &["artifact", "delete", &full])?;
+    assert!(!record.exists());
+    Ok(())
+}

@@ -34,7 +34,10 @@ pub fn print_fields(value: &Value) {
 }
 
 fn is_note_field(key: &str) -> bool {
-    matches!(key, "unread_changes" | "cross_project_changes")
+    matches!(
+        key,
+        "unread_changes" | "unread_changes_omitted" | "cross_project_changes"
+    )
 }
 
 fn print_notes(value: &Value) {
@@ -50,6 +53,9 @@ fn print_notes(value: &Value) {
                 text(&row["untrusted_data"], "author"),
             );
         }
+    }
+    if let Some(count) = value.get("unread_changes_omitted").and_then(Value::as_u64) {
+        println!("  {count} more unread changes. Read these changes to see the others.");
     }
     if let Some(rows) = value.get("cross_project_changes").and_then(Value::as_array) {
         println!("Changes in other projects: {}", rows.len());

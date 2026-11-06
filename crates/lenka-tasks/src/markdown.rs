@@ -4,6 +4,8 @@
 //! The Markdown form of tasks. The three headings are fixed, and lenka keeps unknown headings
 //! without change.
 
+use std::collections::BTreeMap;
+
 use lenka_plugin_api::{LenkaError, Result};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -27,7 +29,9 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Returns [`lenka_plugin_api::ErrorCode::InvalidFile`] if a line is a conflict marker.
 pub fn check_conflict_markers(what: &str, text: &str) -> Result<()> {
     let found = text.lines().any(|line| {
-        line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ") || line == "======="
+        line.starts_with("<<<<<<< ")
+            || line.starts_with(">>>>>>> ")
+            || line.trim_end_matches('\r') == "======="
     });
     if found {
         return Err(LenkaError::invalid_file(format!(
@@ -283,25 +287,31 @@ impl Body {
 
     /// Sets the mark of one criterion. An index out of range changes nothing, and gives `false`.
     pub fn mark_criterion(&mut self, index: usize, done: bool) -> bool {
+        self.mark_criteria(&BTreeMap::from([(index, done)]))
+            .is_none()
+    }
+
+    /// Sets the marks of criteria in one pass over the text. The result is the first position
+    /// that the task does not have.
+    pub fn mark_criteria(&mut self, marks: &BTreeMap<usize, bool>) -> Option<usize> {
+        let first = marks.keys().next().copied();
         let Some(section) = self
             .sections
             .iter_mut()
             .find(|section| section.heading.as_deref() == Some(ACCEPTANCE))
         else {
-            return false;
+            return first;
         };
         let mut count = 0;
-        let mut changed = false;
         let mut result = String::with_capacity(section.text.len());
         for line in section.text.split_inclusive('\n') {
             if parse_criterion(line.trim_end()).is_some() {
-                if count == index {
-                    let mark = if done { "- [x] " } else { "- [ ] " };
+                if let Some(done) = marks.get(&count) {
+                    let mark = if *done { "- [x] " } else { "- [ ] " };
                     let indent = line.len() - line.trim_start().len();
                     result.push_str(&line[..indent]);
                     result.push_str(mark);
                     result.push_str(&line[indent + 6..]);
-                    changed = true;
                     count += 1;
                     continue;
                 }
@@ -310,7 +320,7 @@ impl Body {
             result.push_str(line);
         }
         section.text = result;
-        changed
+        marks.keys().find(|index| **index >= count).copied()
     }
 }
 

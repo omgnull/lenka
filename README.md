@@ -162,6 +162,7 @@ lenka protects against mistakes and untrusted files. It does not protect against
 
 - Task text can be a prompt injection. Tool results put task text in fields that are labeled as untrusted data, with the author beside the text. This reduces the risk, but it does not remove it.
 - The secret check finds common patterns only. Do not put secrets in tasks.
+- lenka refuses control characters in stored text, except line breaks and tabs in a body. A reason has a limit of 4 KiB, and a label or a media type has a limit of 256 bytes. One reply holds at most 50 notices and 64 KiB of notice text, and later replies show the others.
 - A delete changes only the current files. Committed bytes stay in the Git history, so rotate an exposed secret.
 - The only network use is the Git plugin through system Git, and only when you enable it.
 - Data from a remote is untrusted. `lenka sync` and `lenka init` accept a data branch only if each file has a known lenka path. They refuse a symlink, a `.runtime` directory, a `.gitignore` below the data root, a changed `.gitattributes`, a change of the project ID, and conflict markers in a task. A manual `git pull` in a data directory does not have these checks, so use `lenka sync`.
@@ -172,6 +173,7 @@ lenka protects against mistakes and untrusted files. It does not protect against
 
 - No server, no live collaboration between machines, no verified identity, and no enforced roles. These come in a later release.
 - No vault plugin. A task cannot attach a secret yet.
+- An MCP request larger than 16 MiB gets no reply, because `rmcp` drops that line. All task text has lower limits, so a valid request is always smaller.
 - Claims do not sync between machines.
 - Network folders are not supported, because file locks are unreliable on them.
 - The desktop app uses the fonts of your system, and it needs one such as Noto Sans. Characters that the font does not have, such as CJK or emoji, appear as boxes.

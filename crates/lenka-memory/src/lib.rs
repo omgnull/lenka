@@ -135,7 +135,9 @@ fn parse_record(text: &str) -> Result<MemoryRecord> {
 
 fn has_conflict_markers(text: &str) -> bool {
     text.lines().any(|line| {
-        line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> ") || line == "======="
+        line.starts_with("<<<<<<< ")
+            || line.starts_with(">>>>>>> ")
+            || line.trim_end_matches('\r') == "======="
     })
 }
 
@@ -210,6 +212,7 @@ impl MemoryService {
                 "The text is larger than the limit of {MAX_TEXT_BYTES} bytes."
             )));
         }
+        lenka_core::input::check_text("The text", &text)?;
         if has_conflict_markers(&text) {
             return Err(LenkaError::invalid_argument(
                 "The text has a line that looks like a Git conflict marker. Change that line.",
@@ -502,7 +505,9 @@ fn with_unread(mut result: Value, project: &Project, caller: &Caller) -> Value {
     if unread.is_empty() {
         return result;
     }
-    let rows: Vec<Value> = unread
+    let reply = notices::for_reply(&unread);
+    let rows: Vec<Value> = reply
+        .shown
         .iter()
         .map(|notice| {
             let (kind, id) = match &notice.subject {
@@ -522,6 +527,9 @@ fn with_unread(mut result: Value, project: &Project, caller: &Caller) -> Value {
         .collect();
     if let Some(object) = result.as_object_mut() {
         object.insert("unread_changes".to_owned(), Value::Array(rows));
+        if reply.omitted > 0 {
+            object.insert("unread_changes_omitted".to_owned(), json!(reply.omitted));
+        }
     }
     result
 }

@@ -265,3 +265,25 @@ fn hook_install_refuses_invalid_settings() -> TestResult {
     assert_eq!(fs::read_to_string(&file)?, "{ not json");
     Ok(())
 }
+
+#[test]
+fn a_large_old_notice_does_not_hide_a_new_notice() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let id = related_tasks(&machine, &repo)?;
+    change(&machine, &repo, &id, "The first change.")?;
+    let inbox = repo.join(".git/lenka-data/.runtime/inbox");
+    let file = fs::read_dir(&inbox)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .ok_or("the inbox file exists")?;
+    // An older lenka had no limit on a reason, so such a line can exist.
+    let old = fs::read_to_string(&file)?;
+    let large = old.replace("The first change.", &"x".repeat(1024 * 1024 + 1024));
+    fs::write(&file, large)?;
+    change(&machine, &repo, &id, "The second change.")?;
+    let output = run_hook(&machine, &repo, "{}", Some("a"))?;
+    assert!(output.contains("The second change."), "{output}");
+    Ok(())
+}

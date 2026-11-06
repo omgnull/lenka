@@ -242,6 +242,9 @@ fn is_placeholder(value: &str) -> bool {
         .any(|word| lower.contains(word))
 }
 
+/// The count of bytes of an assignment value that the check reads.
+const MAX_ASSIGNMENT_VALUE_BYTES: usize = 256;
+
 fn has_secret_assignment(text: &str) -> bool {
     text.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -265,6 +268,8 @@ fn assignment_value_is_secret(rest: &str) -> bool {
         return false;
     };
     let value = value.trim_start().trim_start_matches(['"', '\'']);
+    // The start of a value is enough, and this limit keeps the check linear for repeated names.
+    let value = crate::input::clip(value, MAX_ASSIGNMENT_VALUE_BYTES);
     let end = value
         .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '`'))
         .unwrap_or(value.len());
@@ -307,6 +312,25 @@ pub fn check(texts: &[TextCheck], policy: SecretPolicy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeated_name_stays_fast() {
+        // The cost was quadratic, and this text took 50 seconds in a release build.
+        for unit in ["secret=", "password=", "password:a"] {
+            let text = unit.repeat(1024 * 1024 / unit.len());
+            let started = std::time::Instant::now();
+            let _ = find_pattern(&text);
+            let seconds = started.elapsed().as_secs();
+            assert!(seconds < 10, "{unit}: {seconds} s");
+        }
+    }
+
+    #[test]
+    fn a_long_value_is_still_found() {
+        let value = "a1".repeat(50_000);
+        let text = ["pass", "word=", &value].concat();
+        assert!(find_pattern(&text).is_some());
+    }
 
     fn token() -> String {
         format!("ghp_{}", "a1b2c3d4".repeat(5))

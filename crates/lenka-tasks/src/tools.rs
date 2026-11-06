@@ -391,8 +391,12 @@ pub fn with_notes(mut result: Value, service: &TaskService, caller: &Caller) -> 
     };
     if let Some(object) = result.as_object_mut() {
         if !notes.unread.is_empty() {
-            let rows: Vec<Value> = notes
-                .unread
+            let reply = lenka_core::notices::for_reply(&notes.unread);
+            if reply.omitted > 0 {
+                object.insert("unread_changes_omitted".to_owned(), json!(reply.omitted));
+            }
+            let rows: Vec<Value> = reply
+                .shown
                 .iter()
                 .map(|notice| {
                     let (kind, id) = match &notice.subject {

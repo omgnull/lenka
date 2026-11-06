@@ -10,6 +10,7 @@ pub mod clock;
 pub mod gitdir;
 pub mod host;
 pub mod init;
+pub mod input;
 pub mod journal;
 pub mod layout;
 pub mod notices;

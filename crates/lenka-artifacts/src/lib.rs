@@ -281,6 +281,7 @@ impl ArtifactService {
         }
         check_content(&prepared)?;
         let final_type = media_type.map_or_else(|| prepared.media_type.clone(), str::to_owned);
+        lenka_core::input::check_short("The media type", &final_type)?;
         let checks = vec![
             TextCheck::new("artifact name", final_name.clone()),
             TextCheck::new("artifact media type", final_type.clone()),
@@ -349,6 +350,7 @@ impl ArtifactService {
                 "A new artifact version is a material change, so it requires a reason.",
             ));
         }
+        lenka_core::input::check_reason("The reason", reason)?;
         let prepared = self.prepare(caller, *source)?;
         check_content(&prepared)?;
         let checks = vec![TextCheck::new("reason", reason)];
@@ -408,7 +410,9 @@ impl ArtifactService {
             ));
         }
         self.tasks.with_artifact_write(|locked, routing, now| {
-            if read_artifact(&self.project, id)?.is_none() {
+            // The record can be invalid. That must not keep the artifact from a delete.
+            let record = DocPath::new(record_path(id))?;
+            if self.project.driver().stat(&record)?.is_none() {
                 return Err(missing(id));
             }
             if routing.is_linked(id) {

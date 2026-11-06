@@ -3,9 +3,10 @@
 
 //! The task operations. The tools, the CLI, and the desktop app all call this service.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use lenka_core::input;
 use lenka_core::notices::{self, FEED_PATH};
 use lenka_core::{
     Commit, FeedEvent, FeedKind, Locked, Notice, Op, Project, ProjectEvent, SecretPolicy, Stage,
@@ -31,6 +32,18 @@ use crate::model::{
 const MS_PER_MINUTE: i64 = 60_000;
 const MS_PER_HOUR: i64 = 60 * MS_PER_MINUTE;
 const MAX_TITLE_BYTES: usize = 500;
+
+/// The largest count of labels in one call.
+const MAX_LABELS_IN_CALL: usize = 100;
+
+/// The largest count of links of one kind in one call.
+const MAX_LINKS_IN_CALL: usize = 1000;
+
+/// The largest count of criterion marks in one call. A longer list only costs time under the lock.
+const MAX_CHECK_ITEMS: usize = 10_000;
+
+/// The largest count of notices that the text of an error names.
+const MAX_NAMES_IN_ERROR: usize = 20;
 const EXTERNAL_AUTHOR: &str = "external";
 
 /// Returns the task service of a project, and creates it on first use.
@@ -432,7 +445,7 @@ impl ArtifactRouting<'_> {
                     version,
                     changed: changed.to_vec(),
                     author: caller.label.clone(),
-                    reason: reason.to_owned(),
+                    reason: input::clip(reason, input::MAX_REASON_BYTES).to_owned(),
                     at: self.now,
                     claim: claim.handle.clone(),
                     claimed_task: task.to_string(),
@@ -473,12 +486,71 @@ fn require_reason(reason: Option<&str>, what: &str) -> Result<String> {
 
 fn check_field(what: &str, text: &str) -> Result<()> {
     check_text_size(what, text)?;
+    input::check_text(what, text)?;
     crate::markdown::check_field_text(what, text)
 }
 
 fn check_plan(text: &str) -> Result<()> {
     check_text_size("The plan", text)?;
+    input::check_text("The plan", text)?;
     crate::markdown::check_line_text("The plan", text)
+}
+
+/// Checks a reason. It goes into a TOML file and into notices.
+fn check_reason(what: &str, text: &str) -> Result<()> {
+    input::check_reason(what, text)?;
+    crate::markdown::check_line_text(what, text)
+}
+
+fn check_evidence(text: &str) -> Result<()> {
+    check_text_size("The evidence", text)?;
+    input::check_text("The evidence", text)
+}
+
+fn check_list_size(what: &str, count: usize, limit: usize) -> Result<()> {
+    if count > limit {
+        return Err(LenkaError::invalid_argument(format!(
+            "{what} has {count} items, and the limit is {limit}."
+        )));
+    }
+    Ok(())
+}
+
+fn check_labels(labels: &[String]) -> Result<()> {
+    check_list_size("The label list", labels.len(), MAX_LABELS_IN_CALL)?;
+    labels
+        .iter()
+        .try_for_each(|label| input::check_short("A label", label.trim()))
+}
+
+/// Checks the sizes in a change before it takes any lock.
+fn check_patch_input(patch: &TaskPatch) -> Result<()> {
+    if let Some(reason) = &patch.reason {
+        check_reason("The reason", reason)?;
+    }
+    check_labels(&patch.labels_add)?;
+    check_list_size("The list of marks", patch.check.len(), MAX_CHECK_ITEMS)?;
+    for (what, count) in [
+        ("The list of labels to remove", patch.labels_remove.len()),
+        ("The list of blockers to add", patch.blocked_by_add.len()),
+        (
+            "The list of blockers to remove",
+            patch.blocked_by_remove.len(),
+        ),
+        ("The list of related tasks to add", patch.relates_add.len()),
+        (
+            "The list of related tasks to remove",
+            patch.relates_remove.len(),
+        ),
+        ("The list of artifacts to link", patch.artifacts_add.len()),
+        (
+            "The list of artifacts to unlink",
+            patch.artifacts_remove.len(),
+        ),
+    ] {
+        check_list_size(what, count, MAX_LINKS_IN_CALL)?;
+    }
+    Ok(())
 }
 
 fn check_text_size(what: &str, text: &str) -> Result<()> {
@@ -676,6 +748,14 @@ impl TaskService {
         };
         let stages = self.stages_of(&kind)?;
         let title = clean_title(&new.title)?;
+        check_labels(&new.labels)?;
+        for (what, count) in [
+            ("The list of blockers", new.blocked_by.len()),
+            ("The list of related tasks", new.relates.len()),
+            ("The list of artifacts", new.artifacts.len()),
+        ] {
+            check_list_size(what, count, MAX_LINKS_IN_CALL)?;
+        }
         for (what, text) in [
             ("The description", &new.description),
             ("The requirements", &new.requirements),
@@ -831,6 +911,7 @@ impl TaskService {
     /// Returns [`ErrorCode::StaleVersion`] for an old version, [`ErrorCode::ClaimLost`] if another
     /// holder has the claim, and other codes for a field that is not valid.
     pub fn update(&self, caller: &Caller, id: TaskId, patch: TaskPatch) -> Result<TaskMeta> {
+        check_patch_input(&patch)?;
         let policy = policy_for(caller, patch.secret_policy)?;
         if caller.actor != Actor::Human && (patch.kind.is_some() || patch.coordinated.is_some()) {
             return Err(LenkaError::new(
@@ -864,13 +945,15 @@ impl TaskService {
                     body.set_section(heading, text);
                 }
             }
-            for item in &patch.check {
-                if !body.mark_criterion(item.index, item.done) {
-                    return Err(LenkaError::invalid_argument(format!(
-                        "The task has no acceptance criterion at position {}. Positions start at 0.",
-                        item.index
-                    )));
-                }
+            let marks: BTreeMap<usize, bool> = patch
+                .check
+                .iter()
+                .map(|item| (item.index, item.done))
+                .collect();
+            if let Some(index) = body.mark_criteria(&marks) {
+                return Err(LenkaError::invalid_argument(format!(
+                    "The task has no acceptance criterion at position {index}. Positions start at 0."
+                )));
             }
             if let Some(text) = &patch.plan {
                 check_plan(text)?;
@@ -1652,6 +1735,7 @@ impl TaskService {
         evidence: &str,
         back_to: Option<&str>,
     ) -> Result<StateChange> {
+        check_evidence(evidence)?;
         let state = self.with_write(|locked, index, now| {
             check_not_invalid(index, id)?;
             let meta = index
@@ -1767,6 +1851,16 @@ impl TaskService {
         claim: &ClaimRef,
         finish: &Finish,
     ) -> Result<StateChange> {
+        if let Finish::Done {
+            evidence,
+            unchecked_reason,
+        } = finish
+        {
+            check_evidence(evidence)?;
+            if let Some(reason) = unchecked_reason {
+                check_reason("The reason", reason)?;
+            }
+        }
         let state = self.with_write(|locked, index, now| {
             check_not_invalid(index, id)?;
             let meta = index.tasks.get(&id).cloned().ok_or_else(|| task_missing(id))?;
@@ -1977,6 +2071,7 @@ impl TaskService {
             return Err(LenkaError::invalid_argument("An entry requires text."));
         }
         check_text_size("The entry", &new.text)?;
+        input::check_text("The entry", &new.text)?;
         self.with_write(|locked, index, now| {
             let meta = index
                 .tasks
@@ -2499,9 +2594,9 @@ fn clean_title(title: &str) -> Result<String> {
     if line.is_empty() {
         return Err(LenkaError::invalid_argument("A task requires a title."));
     }
-    if line.len() > MAX_TITLE_BYTES || line.contains('\n') {
+    if line.len() > MAX_TITLE_BYTES || line.chars().any(char::is_control) {
         return Err(LenkaError::invalid_argument(format!(
-            "A title is one line with at most {MAX_TITLE_BYTES} bytes."
+            "A title is one line with at most {MAX_TITLE_BYTES} bytes and no control characters."
         )));
     }
     Ok(line.to_owned())
@@ -2663,7 +2758,7 @@ fn notice_ops(
                 version: meta.version,
                 changed: meta.changed.clone(),
                 author: meta.author.clone(),
-                reason: meta.reason.clone(),
+                reason: input::clip(&meta.reason, input::MAX_REASON_BYTES).to_owned(),
                 at: now,
                 claim: claim.handle.clone(),
                 claimed_task: task.to_string(),
@@ -2710,6 +2805,7 @@ fn check_unread(
     }
     let names: Vec<String> = unread
         .iter()
+        .take(MAX_NAMES_IN_ERROR)
         .map(|notice| match &notice.subject {
             Subject::Task(id) => format!("task {id} version {}", notice.version),
             Subject::Artifact(id) => format!("artifact {id} version {}", notice.version),
