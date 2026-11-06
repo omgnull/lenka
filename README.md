@@ -13,6 +13,6 @@ cargo test
 
 ## License
 
-Copyright (C) 2026 Igor Pie
+Copyright (C) 2026 Igor Pie and lenka contributors
 
 Licensed under the [GNU General Public License v3.0 only](LICENSE).
