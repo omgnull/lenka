@@ -17,6 +17,7 @@ use lenka_plugin_api::{Day, TaskId};
 use lenka_tasks::{ClaimRef, EntryKind, Link, NewEntry, NewTask, Priority, Status, TaskPatch};
 
 use crate::actions::View;
+use crate::dialogs::{Dialog, NewProjectForm};
 use crate::fonts::load_system;
 use crate::test_support::{Fixture, TestApp, start_with};
 
@@ -431,6 +432,13 @@ fn shoot_theme(fixture: &Arc<Fixture>, sample: &Sample, dir: &Path, theme: Theme
     click(&mut harness, "Board");
     click(&mut harness, "New task");
     save(&mut harness, dir, &format!("dialog-{suffix}"));
+    harness.state_mut().app_mut().dialog = None;
+    harness.run_ok();
+
+    harness.state_mut().app_mut().dialog =
+        Some(Dialog::NewProject(NewProjectForm::new(&fixture.host())));
+    harness.run_ok();
+    save(&mut harness, dir, &format!("new-project-{suffix}"));
     harness.state_mut().app_mut().dialog = None;
     harness.run_ok();
 

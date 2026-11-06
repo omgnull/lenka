@@ -19,8 +19,8 @@ use crate::board::BoardState;
 use crate::data::{TaskFilter, apply_filter};
 use crate::detail::{DetailState, Problem, Reload, Tab, has_section_heading, stage_place};
 use crate::dialogs::{
-    DatesForm, Dialog, EvidenceForm, FormError, NewProjectForm, NewTaskForm, Outcome, ReasonForm,
-    ReturnForm,
+    DatesForm, Dialog, EvidenceForm, FormError, LOCAL_DRIVER, NewProjectForm, NewTaskForm, Outcome,
+    ReasonForm, ReturnForm,
 };
 use crate::drawing::canvas::{DrawingBoard, DrawingEvent, file_name_of};
 use crate::gantt::GanttState;
@@ -393,7 +393,7 @@ impl DesktopApp {
                 }
                 ui.separator();
                 if ui.selectable_label(false, "New project").clicked() {
-                    self.dialog = Some(Dialog::NewProject(NewProjectForm::default()));
+                    self.dialog = Some(Dialog::NewProject(NewProjectForm::new(&self.host)));
                 }
             })
             .response
@@ -441,7 +441,7 @@ impl DesktopApp {
             ui.label(RichText::new("Create a project to store tasks, plans, and artifacts for your agents and for you.").color(palette.text_muted));
             ui.add_space(14.0);
             if primary_button(ui, "Create a project").clicked() {
-                self.dialog = Some(Dialog::NewProject(NewProjectForm::default()));
+                self.dialog = Some(Dialog::NewProject(NewProjectForm::new(&self.host)));
             }
             ui.add_space(8.0);
             ui.label(RichText::new("You can also run `lenka init` in a repository.").small().color(palette.text_muted));
@@ -751,11 +751,22 @@ impl DesktopApp {
         if name.is_empty() {
             return Err(FormError::text("A project needs a name."));
         }
+        if form.driver != LOCAL_DRIVER {
+            return Err(FormError::text(
+                "The desktop app can create a project only with the local driver.",
+            ));
+        }
         let directory = form.directory.trim();
         let location = if directory.is_empty() {
             Location::Shared
         } else {
-            Location::Directory(PathBuf::from(directory))
+            let path = PathBuf::from(directory);
+            if !path.is_absolute() {
+                return Err(FormError::text(
+                    "The data directory must be an absolute path. Use Browse to select a directory.",
+                ));
+            }
+            Location::Directory(path)
         };
         let created = create_project(
             self.host.paths(),

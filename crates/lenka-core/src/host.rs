@@ -265,6 +265,14 @@ impl Host {
         &self.paths
     }
 
+    /// Returns the names of the storage drivers in this build, in a fixed order.
+    #[must_use]
+    pub fn driver_names(&self) -> Vec<&'static str> {
+        let mut names: Vec<_> = self.registry.drivers.keys().copied().collect();
+        names.sort_unstable();
+        names
+    }
+
     /// Returns all compiled plugins with their state.
     #[must_use]
     pub fn plugins(&self) -> &[PluginState] {

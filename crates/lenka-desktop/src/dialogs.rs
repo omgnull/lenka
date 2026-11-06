@@ -3,11 +3,13 @@
 
 //! The modal dialogs. Each dialog holds its form, and the app runs its result.
 
-use egui::{ComboBox, RichText, ScrollArea, Ui};
+use egui::{Button, ComboBox, RichText, ScrollArea, TextEdit, Ui};
+use lenka_core::{Host, Paths};
 use lenka_plugin_api::{Day, ErrorCode, LenkaError, TaskId};
 use lenka_tasks::{Priority, Status, TaskPatch};
 
 use crate::actions::TaskOp;
+use crate::folder_pick::{self, FolderPick, PendingFolder};
 use crate::theme::{Palette, priority_name, status_name};
 use crate::timeline::parse_day_field;
 use crate::widgets::{area_field, caption, combo_info, danger_button, line_field, primary_button};
@@ -63,12 +65,44 @@ pub(crate) struct NewTaskForm {
     pub error: Option<FormError>,
 }
 
+/// The only driver that can create a project from the desktop app.
+pub(crate) const LOCAL_DRIVER: &str = "local";
+
 /// The fields of a new project.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct NewProjectForm {
     pub name: String,
+    /// The drivers of the running build.
+    pub drivers: Vec<&'static str>,
+    pub driver: &'static str,
+    /// The data directory of the local driver. An empty value selects the user data directory.
     pub directory: String,
+    /// The native folder dialog, while it is open.
+    pub pending: Option<PendingFolder>,
+    paths: Paths,
     pub error: Option<FormError>,
+}
+
+impl NewProjectForm {
+    /// Creates an empty form. The local driver is the first selection.
+    pub(crate) fn new(host: &Host) -> Self {
+        let drivers = host.driver_names();
+        let driver = drivers
+            .iter()
+            .copied()
+            .find(|name| *name == LOCAL_DRIVER)
+            .or_else(|| drivers.first().copied())
+            .unwrap_or_default();
+        Self {
+            name: String::new(),
+            drivers,
+            driver,
+            directory: String::new(),
+            pending: None,
+            paths: host.paths().clone(),
+            error: None,
+        }
+    }
 }
 
 /// The evidence for a finish or a stage completion.
@@ -357,19 +391,84 @@ fn show_new_task(ui: &mut Ui, form: &mut NewTaskForm) -> Outcome {
 
 fn show_new_project(ui: &mut Ui, form: &mut NewProjectForm) -> Outcome {
     heading(ui, "New project");
-    line_field(ui, "Project name", &mut form.name, "api");
-    line_field(
-        ui,
-        "Data directory (optional)",
-        &mut form.directory,
-        "The user data directory",
-    );
-    caption(
-        ui,
-        "With no directory, lenka uses the shared directory for your user.",
-    );
+    let name = line_field(ui, "Project name", &mut form.name, "api");
+    if ui.memory(|memory| memory.focused().is_none()) {
+        name.request_focus();
+    }
+    ui.add_space(2.0);
+    caption(ui, "Storage driver");
+    ComboBox::from_id_salt("new_project_driver")
+        .selected_text(form.driver)
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            for driver in &form.drivers {
+                ui.selectable_value(&mut form.driver, *driver, *driver);
+            }
+        })
+        .response
+        .widget_info(|| combo_info("Storage driver"));
+    ui.add_space(2.0);
+    if form.driver == LOCAL_DRIVER {
+        show_local_driver_fields(ui, form);
+    } else {
+        ui.label("The desktop app can create a project only with the local driver.");
+    }
     error_line(ui, form.error.as_ref());
     buttons(ui, "Create project", None)
+}
+
+/// Draws the fields of the local driver: a path, and a button for the native folder dialog.
+fn show_local_driver_fields(ui: &mut Ui, form: &mut NewProjectForm) {
+    apply_folder_pick(form);
+    let label = caption(ui, "Data directory");
+    ui.horizontal(|ui| {
+        ui.add(
+            TextEdit::singleline(&mut form.directory)
+                .hint_text("An absolute path, or empty for the default")
+                .desired_width(ui.available_width() - 80.0),
+        )
+        .labelled_by(label.id);
+        let browse = ui.add_enabled(form.pending.is_none(), Button::new("Browse"));
+        if browse.clicked() {
+            form.pending = Some(folder_pick::start(ui.ctx(), &form.directory));
+        }
+    });
+    if form.pending.is_some() {
+        caption(ui, "Select a directory in the folder dialog.");
+    } else if form.directory.trim().is_empty() {
+        let default = form.paths.shared_project_dir(form.name.trim());
+        caption(
+            ui,
+            &format!("With no path, lenka uses {}", default.display()),
+        );
+    } else {
+        caption(
+            ui,
+            "Select an empty directory or a new one. A directory with a lenka project connects to that project.",
+        );
+    }
+}
+
+/// Moves the result of the native folder dialog into the form.
+fn apply_folder_pick(form: &mut NewProjectForm) {
+    let Some(pending) = &form.pending else {
+        return;
+    };
+    match pending.state() {
+        FolderPick::Waiting => {}
+        FolderPick::Cancelled => form.pending = None,
+        FolderPick::Selected(path) => {
+            form.pending = None;
+            match path.into_os_string().into_string() {
+                Ok(text) => form.directory = text,
+                Err(_) => {
+                    form.error = Some(FormError::text(
+                        "The path of this directory is not valid text. Select another directory.",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn show_evidence(ui: &mut Ui, form: &mut EvidenceForm) -> Outcome {

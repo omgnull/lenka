@@ -144,6 +144,11 @@ pub fn create_project(
             .map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
         ProjectConfig::parse(&text)?
     } else {
+        if matches!(location, Location::Directory(_)) && holds_files(&directory)? {
+            return Err(LenkaError::invalid_argument(
+                "This directory holds other files, but no lenka project. Select an empty directory or a new one.",
+            ));
+        }
         let config = ProjectConfig::new(&name);
         write_new_project(&directory, &config)?;
         config
@@ -163,6 +168,15 @@ pub fn create_project(
         directory,
         clone_file,
     })
+}
+
+/// Tells if a directory has entries. A missing directory has none.
+fn holds_files(directory: &Path) -> Result<bool> {
+    match fs::read_dir(directory) {
+        Ok(mut entries) => Ok(entries.next().is_some()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(LenkaError::io("Read the data directory", &err)),
+    }
 }
 
 fn write_new_project(directory: &Path, config: &ProjectConfig) -> Result<()> {
@@ -355,6 +369,33 @@ mod tests {
         let entry = &ProjectsFile::load(&paths)?.projects["api"];
         assert!(entry.directory.is_absolute());
         assert!(entry.directory.join("lenka.toml").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn a_selected_directory_with_other_files_stays_clean() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        let folder = temp.path().join("documents");
+        fs::create_dir_all(&cwd).map_err(|err| LenkaError::io("mkdir", &err))?;
+        fs::create_dir_all(&folder).map_err(|err| LenkaError::io("mkdir", &err))?;
+        fs::write(folder.join("notes.txt"), "text").map_err(|err| LenkaError::io("write", &err))?;
+
+        let location = Location::Directory(folder.clone());
+        let error = create_project(&paths, &cwd, Some("api"), &location)
+            .err()
+            .ok_or_else(|| LenkaError::invalid_argument("the call must fail"))?;
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(!folder.join("lenka.toml").exists());
+        assert!(!folder.join("tasks").exists());
+        assert!(ProjectsFile::load(&paths)?.projects.is_empty());
+
+        // An empty directory is valid, and a second name for the same project connects to it.
+        fs::remove_file(folder.join("notes.txt")).map_err(|err| LenkaError::io("rm", &err))?;
+        create_project(&paths, &cwd, Some("api"), &location)?;
+        create_project(&paths, &cwd, Some("api-2"), &location)?;
+        assert_eq!(ProjectsFile::load(&paths)?.projects.len(), 2);
         Ok(())
     }
 

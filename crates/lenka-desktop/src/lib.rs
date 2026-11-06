@@ -14,6 +14,7 @@ mod data;
 mod detail;
 mod dialogs;
 mod drawing;
+mod folder_pick;
 mod fonts;
 mod gantt;
 mod markdown_view;

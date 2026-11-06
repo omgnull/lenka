@@ -10,7 +10,7 @@ use egui::{Theme, Vec2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use lenka_artifacts::{DRAWING_MEDIA_TYPE, artifacts_of};
-use lenka_core::{SecretPolicy, Stage, TypeDef};
+use lenka_core::{ProjectsFile, SecretPolicy, Stage, TypeDef};
 use lenka_plugin_api::{Actor, Day, TaskId, Timestamp};
 use lenka_tasks::{
     BoardRow, ClaimRef, EntryKind, NewTask, Priority, State, Status, TaskFront, TaskMeta, TaskPatch,
@@ -19,7 +19,9 @@ use lenka_tasks::{
 use crate::actions::View;
 use crate::board::BoardState;
 use crate::data::BoardModel;
+use crate::dialogs::{Dialog, NewProjectForm};
 use crate::drawing::model::Document;
+use crate::folder_pick::{FolderPick, PendingFolder};
 use crate::fonts::load_system;
 use crate::gantt::GanttState;
 use crate::test_support::{Fixture, TestApp, drag, has_label, start, start_with, wait_until};
@@ -92,6 +94,147 @@ fn with_no_projects_the_start_screen_shows_and_creates_a_project() {
         Some("api")
     );
     assert!(has_label(&harness, "This project has no tasks yet"));
+}
+
+/// Opens the dialog for a new project from the start screen.
+fn start_new_project(fixture: &Arc<Fixture>) -> Harness<'static, TestApp> {
+    let mut harness = start(fixture, SIZE, Theme::Light);
+    click(&mut harness, "Create a project");
+    harness
+}
+
+fn project_form<'a>(harness: &'a mut Harness<'static, TestApp>) -> &'a mut NewProjectForm {
+    match harness.state_mut().app_mut().dialog.as_mut() {
+        Some(Dialog::NewProject(form)) => form,
+        other => panic!("the new project dialog must be open, but found {other:?}"),
+    }
+}
+
+fn pending_pick(harness: &mut Harness<'static, TestApp>) -> PendingFolder {
+    project_form(harness)
+        .pending
+        .clone()
+        .expect("the folder dialog must be open")
+}
+
+#[test]
+fn the_new_project_dialog_asks_for_the_name_then_the_driver_then_its_fields() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    let name = harness.get_by_label("Project name").rect().top();
+    let driver = harness
+        .query_all_by_label("Storage driver")
+        .map(|node| node.rect().top())
+        .fold(f32::MAX, f32::min);
+    let directory = harness.get_by_label("Data directory").rect().top();
+    assert!(
+        name < driver && driver < directory,
+        "{name} {driver} {directory}"
+    );
+    assert!(harness.query_by_label("Browse").is_some());
+    let form = project_form(&mut harness);
+    assert_eq!(form.drivers, ["local"]);
+    assert_eq!(form.driver, "local");
+    let hint = fixture.paths.shared_project_dir("api");
+    type_into(&mut harness, "Project name", "api");
+    assert!(has_label(
+        &harness,
+        &format!("With no path, lenka uses {}", hint.display())
+    ));
+}
+
+#[test]
+fn browse_fills_the_path_and_the_project_uses_it() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    type_into(&mut harness, "Project name", "api");
+    click(&mut harness, "Browse");
+    let pending = pending_pick(&mut harness);
+    assert!(has_label(
+        &harness,
+        "Select a directory in the folder dialog."
+    ));
+
+    let selected = fixture.root.join("chosen");
+    pending.finish(FolderPick::Selected(selected.clone()));
+    harness.run();
+    let form = project_form(&mut harness);
+    assert!(form.pending.is_none());
+    assert_eq!(form.directory, selected.display().to_string());
+
+    click(&mut harness, "Create project");
+    assert!(harness.state().app().dialog.is_none());
+    assert!(selected.join("lenka.toml").is_file());
+    let projects = ProjectsFile::load(&fixture.paths).expect("the list");
+    assert_eq!(projects.projects["api"].directory, selected);
+}
+
+#[test]
+fn a_cancelled_folder_dialog_keeps_the_typed_path() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    type_into(&mut harness, "Data directory", "/typed/path");
+    click(&mut harness, "Browse");
+    pending_pick(&mut harness).finish(FolderPick::Cancelled);
+    harness.run();
+    let form = project_form(&mut harness);
+    assert!(form.pending.is_none());
+    assert_eq!(form.directory, "/typed/path");
+    assert!(form.error.is_none());
+}
+
+#[test]
+fn a_new_project_needs_an_absolute_path_and_a_clean_directory() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    type_into(&mut harness, "Project name", "api");
+    type_into(&mut harness, "Data directory", "relative/data");
+    click(&mut harness, "Create project");
+    let message = project_form(&mut harness)
+        .error
+        .clone()
+        .expect("an error")
+        .message;
+    assert!(message.contains("absolute path"), "{message}");
+    assert!(!fixture.root.join("work/relative").exists());
+
+    let folder = fixture.root.join("documents");
+    std::fs::create_dir_all(&folder).expect("a folder");
+    std::fs::write(folder.join("notes.txt"), "text").expect("a file");
+    project_form(&mut harness).directory = folder.display().to_string();
+    click(&mut harness, "Create project");
+    let message = project_form(&mut harness)
+        .error
+        .clone()
+        .expect("an error")
+        .message;
+    assert!(message.contains("other files"), "{message}");
+    assert!(!folder.join("tasks").exists());
+    assert!(harness.state().app().session.is_none());
+}
+
+#[test]
+fn another_driver_hides_the_local_fields_and_cannot_create_a_project() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    type_into(&mut harness, "Project name", "api");
+    project_form(&mut harness).driver = "remote";
+    harness.run();
+    assert!(harness.query_by_label("Browse").is_none());
+    assert!(harness.query_by_label("Data directory").is_none());
+    click(&mut harness, "Create project");
+    let message = project_form(&mut harness)
+        .error
+        .clone()
+        .expect("an error")
+        .message;
+    assert!(message.contains("only with the local driver"), "{message}");
+    assert!(
+        ProjectsFile::load(&fixture.paths)
+            .expect("the list")
+            .projects
+            .is_empty()
+    );
 }
 
 #[test]
