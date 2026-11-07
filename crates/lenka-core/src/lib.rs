@@ -3,8 +3,8 @@
 
 //! The plugin host of lenka: settings, project lookup, checks, journal, and change notices.
 //!
-//! The secret check and the version check run in [`Locked::commit`], so a plugin cannot skip
-//! them by accident.
+//! The secret check runs in [`Locked::commit`], so a plugin cannot skip it by accident. A write
+//! of a versioned item must also call [`Locked::check_version`], which refuses an old version.
 
 pub mod clock;
 pub mod files;

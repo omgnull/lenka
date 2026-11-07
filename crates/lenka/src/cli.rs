@@ -769,7 +769,7 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-/// The options of `lenka doctor`.
+/// The options of `lenka sync`.
 #[cfg(feature = "git")]
 #[derive(Debug, clap::Args)]
 struct SyncOptions {

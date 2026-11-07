@@ -193,6 +193,7 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - The only network use is the Git plugin through system Git, and only when you enable it.
 - Data from a remote is untrusted. `lenka sync` and `lenka init` accept a data branch only if each file has a known lenka path. They refuse a symlink, a `.runtime` directory, a `.gitignore` below the data root, a changed `.gitattributes`, a change of the project ID, and conflict markers in a task. A manual `git pull` in a data directory does not have these checks, so use `lenka sync`.
 - A commit holds only the known lenka paths. Other files stay in the clone, and `lenka sync` lists them. Git exclude rules cannot hide data from a commit.
+- Before a push, `lenka sync` runs the secret check on each file that the push adds or changes. This includes a hand edit and a merge. If a file matches a pattern, nothing is pushed. Remove the secret, or run `lenka sync --allow-secret` to push the file. The remote and its history then keep the file.
 - `lenka git enable` needs Git 2.30 or later. It does not move the data, so a running lenka process can continue. A stopped call can run again.
 - A push in an agent call stops after 60 seconds, and the tool result reports this. `LENKA_GIT_PUSH_LIMIT_MS` changes the limit. The call also turns off the password questions of SSH, unless you set your own SSH command.
 - A write waits 30 seconds for the lock, and then fails with `busy`. `LENKA_LOCK_WAIT_MS` changes the limit.
@@ -204,6 +205,11 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - No server, no live collaboration between machines, no verified identity, and no enforced roles. These come in a later release.
 - No vault plugin. A task cannot attach a secret yet.
 - An MCP request larger than 16 MiB gets no reply, because `rmcp` drops that line. All task text has lower limits, so a valid request is always smaller.
+- Some MCP errors come from `rmcp` and have the wrong JSON-RPC code. For example, `tools/call` with no `params` gets `-32601`, not `-32602`. A line that is not JSON gets no reply.
+- The change feed `.runtime/feed.jsonl` grows with each write, and lenka does not rotate it yet.
+- If a write stops after lenka stored it in the journal, the next write completes it. A client that retries a failed `task.create` can then get two tasks.
+- The board of a running desktop app shows a hand edit of a task file only after the next change in the feed. Run `lenka reindex` to show the edit at once.
+- lenka checks the path of an artifact source file before and after the open, by name. A process that swaps a parent directory and swaps it back between these two checks can make lenka read a file outside the worktree.
 - Claims do not sync between machines.
 - Network folders are not supported, because file locks are unreliable on them.
 - The desktop app uses the fonts of your system, and it needs one such as Noto Sans. Characters that the font does not have, such as CJK or emoji, appear as boxes.
