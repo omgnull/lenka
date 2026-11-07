@@ -563,3 +563,60 @@ async fn the_text_of_an_invalid_file_stays_in_untrusted_data() -> TestResult {
     client.cancel().await?;
     Ok(())
 }
+
+/// A task read closes a notice of an artifact. With no link to the artifact, no read can close the
+/// notice, so the notice must not stop a finish.
+#[tokio::test]
+async fn a_notice_of_an_unlinked_artifact_does_not_stop_a_finish() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    std::fs::write(repo.join("a.txt"), "First")?;
+    let artifact = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let artifact = text(&artifact, "artifact").to_owned();
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    let link = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        "1",
+        "--artifact-add",
+        &artifact,
+    ];
+    let linked = machine.json(&repo, &link)?;
+    let version = linked["version"].to_string();
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    let claim = call_ok(&client, "task.claim", json!({"task": id})).await?;
+    let handle = text(&claim, "claim").to_owned();
+
+    std::fs::write(repo.join("a.txt"), "Second")?;
+    let update = [
+        "artifact",
+        "update",
+        &artifact,
+        "a.txt",
+        "--version",
+        "1",
+        "--reason",
+        "A reason.",
+    ];
+    machine.json(&repo, &update)?;
+    let unlink = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        &version,
+        "--artifact-remove",
+        &artifact,
+        "--override",
+    ];
+    machine.json(&repo, &unlink)?;
+
+    call_ok(&client, "task.show", json!({"task": id})).await?;
+    let finish = json!({"task": id, "claim": handle, "outcome": "done", "evidence": "It works."});
+    call_ok(&client, "task.finish", finish).await?;
+    client.cancel().await?;
+    Ok(())
+}

@@ -11,8 +11,7 @@ use lenka_core::{PeerLookup, Project};
 use lenka_plugin_api::{DocPath, ProjectId, Result, StorageDriver, TaskId};
 use serde::Serialize;
 
-use crate::markdown::split_front;
-use crate::model::{Link, State, Status, TaskFront};
+use crate::model::{Link, Status};
 
 /// The state of a link to another project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -121,17 +120,27 @@ impl LinkReader {
         if !config.links.accepts_from(source.id) {
             return LinkView::empty(link, LinkState::Broken);
         }
-        match read_visible(driver.as_ref(), task) {
-            Some((front, state)) => LinkView {
+        match crate::index::load_task(driver.as_ref(), task) {
+            Ok(loaded) => LinkView {
                 link: link.to_string(),
                 state: LinkState::Ok,
-                title: Some(front.title),
-                status: Some(state.status),
-                stage: Some(state.stage),
-                version: state.version,
-                unblocked: state.unblocked,
+                title: Some(
+                    lenka_core::input::clip(
+                        &loaded.meta.front.title,
+                        crate::service::MAX_TITLE_BYTES,
+                    )
+                    .to_owned(),
+                ),
+                status: Some(loaded.meta.state.status),
+                stage: Some(loaded.meta.state.stage),
+                version: loaded.meta.state.version,
+                unblocked: loaded.meta.state.unblocked,
             },
-            None => LinkView::empty(link, LinkState::Broken),
+            Err(error) if error.code() == lenka_plugin_api::ErrorCode::NotFound => {
+                LinkView::empty(link, LinkState::Broken)
+            }
+            // The state of the target is not known, so the link must still block.
+            Err(_) => LinkView::empty(link, LinkState::Unavailable),
         }
     }
 }
@@ -145,20 +154,6 @@ fn open_peer(project: &Project, target: ProjectId) -> Option<Peer> {
     let text = String::from_utf8(bytes).ok()?;
     let config = ProjectConfig::parse(&text).ok()?;
     (config.id == target).then_some((driver, config))
-}
-
-fn read_visible(driver: &dyn StorageDriver, task: TaskId) -> Option<(TaskFront, State)> {
-    let root = format!("tasks/{task}");
-    let text = read_text(driver, &format!("{root}/task.md"))?;
-    let (front, _): (TaskFront, String) = split_front("task.md", &text).ok()?;
-    let state_text = read_text(driver, &format!("{root}/state.toml"))?;
-    let state: State = toml::from_str(&state_text).ok()?;
-    (front.id == task).then_some((front, state))
-}
-
-fn read_text(driver: &dyn StorageDriver, path: &str) -> Option<String> {
-    let path = DocPath::new(path).ok()?;
-    String::from_utf8(driver.read(&path).ok()??).ok()
 }
 
 /// Checks a new link against the policy of both sides. A project that this machine does not have
@@ -182,7 +177,9 @@ pub fn check_new_link(project: &Project, target: ProjectId, task: TaskId) -> Res
     let Some((driver, config)) = open_peer(project, target) else {
         return Ok(());
     };
-    if !config.links.accepts_from(source.id) || read_visible(driver.as_ref(), task).is_none() {
+    if !config.links.accepts_from(source.id)
+        || crate::index::load_task(driver.as_ref(), task).is_err()
+    {
         return Err(denied());
     }
     Ok(())

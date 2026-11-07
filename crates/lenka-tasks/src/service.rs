@@ -31,7 +31,7 @@ use crate::model::{
 
 const MS_PER_MINUTE: i64 = 60_000;
 const MS_PER_HOUR: i64 = 60 * MS_PER_MINUTE;
-const MAX_TITLE_BYTES: usize = 500;
+pub(crate) const MAX_TITLE_BYTES: usize = 500;
 
 /// The largest count of labels in one call.
 const MAX_LABELS_IN_CALL: usize = 100;
@@ -819,6 +819,56 @@ impl TaskService {
         Ok(Link::Local(self.resolve(text)?))
     }
 
+    /// Finds the task or the project link that a remove names. The target of such a link can be
+    /// gone, so the search uses the links of the task and needs no target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the text is not a link and no link or task matches it.
+    pub fn resolve_removed_link(&self, task: TaskId, text: &str) -> Result<Link> {
+        if text.contains('/') {
+            return Link::parse(text);
+        }
+        let index = self.read_index()?;
+        let meta = index.tasks.get(&task).ok_or_else(|| task_missing(task))?;
+        let mut found = meta
+            .front
+            .blocked_by
+            .iter()
+            .chain(&meta.front.relates)
+            .filter_map(|link| link.local())
+            .filter(|id| id.to_string() == text || id.matches_short(text));
+        if let Some(id) = found.next() {
+            return Ok(Link::Local(id));
+        }
+        drop(index);
+        self.resolve_link(text)
+    }
+
+    /// Finds an entry of a task by its full ID or by its short ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::NotFound`] if the task has no such entry, and
+    /// [`ErrorCode::AmbiguousId`] if more than one entry matches.
+    pub fn resolve_entry(&self, task: TaskId, text: &str) -> Result<EntryId> {
+        let detail = self.detail(task, &["entries"])?;
+        let mut found = detail
+            .entries
+            .iter()
+            .filter(|entry| entry.id.to_string() == text || entry.id.matches_short(text));
+        match (found.next(), found.next()) {
+            (Some(entry), None) => Ok(entry.id),
+            (Some(_), Some(_)) => Err(LenkaError::new(
+                ErrorCode::AmbiguousId,
+                format!("The short ID {text} matches more than one entry. Use the full ID."),
+            )),
+            _ => Err(LenkaError::not_found(format!(
+                "The task has no entry {text}."
+            ))),
+        }
+    }
+
     // ---- Create and change ----
 
     /// Stores a new task.
@@ -869,6 +919,9 @@ impl TaskService {
             }
             if let Some(parent) = new.parent {
                 check_parent_open(index, parent)?;
+                if index.chain_is_too_deep(parent, None) {
+                    return Err(chain_error());
+                }
             }
             self.check_links(index, id, &new.blocked_by, &new.relates)?;
             // A new task has no children, and only its ancestors wait for it. A blocker that waits
@@ -1096,6 +1149,12 @@ impl TaskService {
             {
                 return Ok(meta);
             }
+            // A change of the parent is not material, but it can remove the coordinator rule.
+            if patch.parent.is_some_and(|parent| parent != meta.front.parent)
+                && let Some(coordinator) = coordinator_of(index, id)
+            {
+                check_coordinator(index, coordinator, caller, &patch.claim, now)?;
+            }
             let material = !changed.is_empty();
             let reason = if material {
                 require_reason(patch.reason.as_deref(), "This change")?
@@ -1216,6 +1275,9 @@ impl TaskService {
                 check_parent_open(index, target)?;
                 if index.parent_makes_cycle(id, target) {
                     return Err(cycle_error());
+                }
+                if index.chain_is_too_deep(target, Some(id)) {
+                    return Err(chain_error());
                 }
             }
             front.parent = parent;
@@ -1489,11 +1551,9 @@ impl TaskService {
         reader: &mut LinkReader,
     ) -> bool {
         let id = meta.id();
-        let status_ok = match meta.state.status {
-            Status::Todo => true,
-            Status::InProgress => index.active_claim(id, now).is_none(),
-            _ => false,
-        };
+        // A hand edit can set `todo` on a task with a claim, and that claim stays valid.
+        let status_ok = matches!(meta.state.status, Status::Todo | Status::InProgress)
+            && index.active_claim(id, now).is_none();
         if !status_ok || index.invalid.contains_key(&id) {
             return false;
         }
@@ -1523,7 +1583,8 @@ impl TaskService {
                 let children = index.children.get(&id);
                 BoardRow {
                     meta: meta.clone(),
-                    blocked: is_blocked(&index, &self.project, id, &mut reader),
+                    blocked: !meta.state.status.is_closed()
+                        && is_blocked(&index, &self.project, id, &mut reader),
                     claimed_by: index
                         .active_claim(id, now)
                         .map(|claim| claim.holder.clone()),
@@ -1584,7 +1645,8 @@ impl TaskService {
                 }
             }
         }
-        if let Some(items) = index.blocks.get(&id) {
+        // A closed task no longer blocks its dependents.
+        if let Some(items) = index.blocks.get(&id).filter(|_| local_blocks(&index, id)) {
             view.blocks = items
                 .iter()
                 .filter_map(|task| index.tasks.get(task))
@@ -2940,6 +3002,13 @@ fn claim_lost() -> LenkaError {
     )
 }
 
+fn chain_error() -> LenkaError {
+    LenkaError::invalid_argument(format!(
+        "A chain of parents has a limit of {} tasks. Use a task nearer to the root.",
+        crate::index::MAX_DEPTH
+    ))
+}
+
 fn cycle_error() -> LenkaError {
     LenkaError::new(
         ErrorCode::Cycle,
@@ -3227,6 +3296,20 @@ fn notice_subject_exists(
     }
 }
 
+/// A task read closes a notice of an artifact only if a task links to the artifact. A notice
+/// with no such task must not stop any work.
+fn notice_can_close(index: &Index, notice: &Notice) -> bool {
+    match &notice.subject {
+        Subject::Task(_) => true,
+        Subject::Artifact(id) => ArtifactId::parse(id).is_ok_and(|id| {
+            index
+                .artifact_users
+                .get(&id)
+                .is_some_and(|users| !users.is_empty())
+        }),
+    }
+}
+
 fn check_unread(
     index: &Index,
     driver: &dyn lenka_plugin_api::StorageDriver,
@@ -3238,7 +3321,9 @@ fn check_unread(
         .iter()
         // A notice stays valid for a new claim on the same task. A claim can end by timeout.
         .filter(|notice| {
-            notice.claimed_task == task && notice_subject_exists(index, driver, notice)
+            notice.claimed_task == task
+                && notice_subject_exists(index, driver, notice)
+                && notice_can_close(index, notice)
         })
         .collect();
     if unread.is_empty() {
@@ -3876,7 +3961,13 @@ fn search_tasks<'a>(
                 .flatten()
                 .is_some_and(|body| body.to_lowercase().contains(text))
         };
-        if has(format!("{root}/task.md")) || (meta.has_plan && has(format!("{root}/plan.md"))) {
+        // The front matter holds values such as `normal` that match all tasks.
+        let body_has = read_text(driver, &format!("{root}/task.md"))
+            .ok()
+            .flatten()
+            .and_then(|file| split_front::<TaskFront>("task.md", &file).ok())
+            .is_some_and(|(_, body)| body.to_lowercase().contains(text));
+        if body_has || (meta.has_plan && has(format!("{root}/plan.md"))) {
             return true;
         }
         read_entries(driver, id).is_ok_and(|entries| {

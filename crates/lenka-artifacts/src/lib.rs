@@ -284,6 +284,7 @@ impl ArtifactService {
         lenka_core::input::check_short("The media type", &final_type)?;
         let checks = vec![
             TextCheck::new("artifact name", final_name.clone()),
+            TextCheck::new("artifact file name", prepared.file.clone()),
             TextCheck::new("artifact media type", final_type.clone()),
         ];
         secret::check(&checks, SecretPolicy::Enforce)?;
@@ -353,7 +354,10 @@ impl ArtifactService {
         lenka_core::input::check_reason("The reason", reason)?;
         let prepared = self.prepare(caller, *source)?;
         check_content(&prepared)?;
-        let checks = vec![TextCheck::new("reason", reason)];
+        let checks = vec![
+            TextCheck::new("reason", reason),
+            TextCheck::new("artifact file name", prepared.file.clone()),
+        ];
         secret::check(&checks, SecretPolicy::Enforce)?;
         self.tasks.check_artifact_coordinator(id, caller, claim)?;
         self.tasks.with_artifact_write(|locked, routing, now| {
@@ -644,6 +648,7 @@ impl Plugin for ArtifactsPlugin {
 struct ArtifactTools;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateArgs {
     path: String,
     name: Option<String>,
@@ -651,6 +656,7 @@ struct CreateArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     artifact: String,
     version: u64,
@@ -662,11 +668,16 @@ struct UpdateArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteArgs {
     artifact: String,
 }
 
-fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
+fn parse_args<T: serde::de::DeserializeOwned>(mut args: Value) -> Result<T> {
+    // All tools take `project`, and the tool call reads it before this call.
+    if let Some(map) = args.as_object_mut() {
+        map.remove("project");
+    }
     serde_json::from_value(args)
         .map_err(|err| LenkaError::invalid_argument(format!("The arguments are not valid: {err}")))
 }
@@ -722,7 +733,7 @@ impl ToolProvider for ArtifactTools {
     }
 
     fn call(&self, ctx: ToolContext<'_>, name: &str, args: Value) -> Result<Value> {
-        let requested = args.get("project").and_then(Value::as_str);
+        let requested = lenka_core::project_argument(&args)?;
         let project = ctx.host.project_for(ctx.caller, requested)?;
         let service = artifacts_of(&project)?;
         let result = match name {

@@ -205,8 +205,8 @@ impl Body {
     pub fn section(&self, heading: &str) -> Option<&str> {
         self.sections
             .iter()
-            .find(|section| section.heading.as_deref() == Some(heading))
-            .map(|section| section.text.trim_matches('\n'))
+            .find(|section| has_heading(section, heading))
+            .map(|section| section.text.trim_matches(['\n', '\r']))
     }
 
     /// Returns the headings and the texts of the sections that are not one of the fixed three.
@@ -216,7 +216,10 @@ impl Body {
             .iter()
             .filter_map(|section| {
                 let heading = section.heading.as_deref()?;
-                if [DESCRIPTION, REQUIREMENTS, ACCEPTANCE].contains(&heading) {
+                if [DESCRIPTION, REQUIREMENTS, ACCEPTANCE]
+                    .iter()
+                    .any(|name| heading.eq_ignore_ascii_case(name))
+                {
                     return None;
                 }
                 Some((
@@ -234,7 +237,7 @@ impl Body {
         let position = self
             .sections
             .iter()
-            .position(|section| section.heading.as_deref() == Some(heading));
+            .position(|section| has_heading(section, heading));
         if trimmed.is_empty() {
             if let Some(position) = position {
                 self.sections.remove(position);
@@ -267,6 +270,20 @@ impl Body {
                     .is_some_and(|value| value > wanted)
             })
             .unwrap_or(self.sections.len());
+        // A file can end with no newline, and a heading must start a line.
+        if let Some(previous) = insert_at
+            .checked_sub(1)
+            .map(|index| &mut self.sections[index])
+        {
+            let end = if previous.text.is_empty() {
+                &mut previous.heading_line
+            } else {
+                &mut previous.text
+            };
+            if !end.is_empty() && !end.ends_with('\n') {
+                end.push('\n');
+            }
+        }
         self.sections.insert(
             insert_at,
             Section {
@@ -280,9 +297,13 @@ impl Body {
     /// Returns the acceptance criteria.
     #[must_use]
     pub fn criteria(&self) -> Vec<Criterion> {
-        self.section(ACCEPTANCE)
-            .map(|text| text.lines().filter_map(parse_criterion).collect())
-            .unwrap_or_default()
+        // A hand edit can repeat the section, and a criterion there must also count.
+        self.sections
+            .iter()
+            .filter(|section| has_heading(section, ACCEPTANCE))
+            .flat_map(|section| section.text.lines())
+            .filter_map(parse_criterion)
+            .collect()
     }
 
     /// Sets the mark of one criterion. An index out of range changes nothing, and gives `false`.
@@ -294,34 +315,36 @@ impl Body {
     /// Sets the marks of criteria in one pass over the text. The result is the first position
     /// that the task does not have.
     pub fn mark_criteria(&mut self, marks: &BTreeMap<usize, bool>) -> Option<usize> {
-        let first = marks.keys().next().copied();
-        let Some(section) = self
-            .sections
-            .iter_mut()
-            .find(|section| section.heading.as_deref() == Some(ACCEPTANCE))
-        else {
-            return first;
-        };
         let mut count = 0;
-        let mut result = String::with_capacity(section.text.len());
-        for line in section.text.split_inclusive('\n') {
-            if parse_criterion(line.trim_end()).is_some() {
-                if let Some(done) = marks.get(&count) {
-                    let mark = if *done { "- [x] " } else { "- [ ] " };
-                    let indent = line.len() - line.trim_start().len();
-                    result.push_str(&line[..indent]);
-                    result.push_str(mark);
-                    result.push_str(&line[indent + 6..]);
-                    count += 1;
-                    continue;
-                }
-                count += 1;
+        for section in &mut self.sections {
+            if !has_heading(section, ACCEPTANCE) {
+                continue;
             }
-            result.push_str(line);
+            let mut result = String::with_capacity(section.text.len());
+            for line in section.text.split_inclusive('\n') {
+                if let Some(position) = mark_position(line.trim_end_matches(['\n', '\r'])) {
+                    if let Some(done) = marks.get(&count) {
+                        result.push_str(&line[..position]);
+                        result.push(if *done { 'x' } else { ' ' });
+                        result.push_str(&line[position + 1..]);
+                        count += 1;
+                        continue;
+                    }
+                    count += 1;
+                }
+                result.push_str(line);
+            }
+            section.text = result;
         }
-        section.text = result;
         marks.keys().find(|index| **index >= count).copied()
     }
+}
+
+fn has_heading(section: &Section, name: &str) -> bool {
+    section
+        .heading
+        .as_deref()
+        .is_some_and(|heading| heading.eq_ignore_ascii_case(name))
 }
 
 /// One acceptance criterion.
@@ -333,30 +356,49 @@ pub struct Criterion {
     pub done: bool,
 }
 
-fn parse_criterion(line: &str) -> Option<Criterion> {
-    let line = line.trim_start();
-    let (done, text) = if let Some(text) = line.strip_prefix("- [ ] ") {
-        (false, text)
+/// Finds the place of the mark in a line of a task list, with any Markdown list marker.
+fn mark_position(line: &str) -> Option<usize> {
+    let rest = line.trim_start();
+    let indent = line.len() - rest.len();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let marker = if digits > 0 {
+        matches!(rest.as_bytes().get(digits), Some(b'.' | b')')).then_some(digits + 1)?
     } else {
-        let text = line
-            .strip_prefix("- [x] ")
-            .or_else(|| line.strip_prefix("- [X] "))?;
-        (true, text)
+        matches!(rest.as_bytes().first(), Some(b'-' | b'*' | b'+')).then_some(1)?
     };
+    let open = &rest.as_bytes()[marker..];
+    let has_mark = open.len() >= 5
+        && open[0] == b' '
+        && open[1] == b'['
+        && matches!(open[2], b' ' | b'x' | b'X')
+        && open[3] == b']'
+        && open[4] == b' ';
+    has_mark.then_some(indent + marker + 2)
+}
+
+fn parse_criterion(line: &str) -> Option<Criterion> {
+    let position = mark_position(line)?;
     Some(Criterion {
-        text: text.trim_end().to_owned(),
-        done,
+        text: line[position + 3..].trim_end().to_owned(),
+        done: line.as_bytes()[position] != b' ',
     })
 }
 
 /// Tells if two acceptance sections differ in more than their check marks.
 #[must_use]
 pub fn criteria_text_differs(old: Option<&str>, new: Option<&str>) -> bool {
-    fn normal(text: Option<&str>) -> String {
+    fn normal(text: Option<&str>) -> Vec<String> {
         text.unwrap_or("")
             .trim()
-            .replace("- [x] ", "- [ ] ")
-            .replace("- [X] ", "- [ ] ")
+            .lines()
+            .map(|line| {
+                let mut line = line.trim_end().to_owned();
+                if let Some(position) = mark_position(&line) {
+                    line.replace_range(position..=position, " ");
+                }
+                line
+            })
+            .collect()
     }
     normal(old) != normal(new)
 }
@@ -374,6 +416,57 @@ pub fn new_body(description: &str, requirements: &str, acceptance: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_section_after_text_with_no_final_newline_starts_a_line() {
+        let mut body = Body::parse("Do the work");
+        body.set_section(ACCEPTANCE, "- [ ] Tests pass");
+        let again = Body::parse(&body.to_text());
+        assert_eq!(again.criteria().len(), 1, "{}", body.to_text());
+    }
+
+    #[test]
+    fn an_empty_criterion_does_not_shift_a_mark() {
+        let mut body = Body::parse("## Acceptance criteria\n- [ ] A\n- [ ] \n- [ ] B\n- [ ] C\n");
+        assert_eq!(body.criteria().len(), 4);
+        assert!(body.mark_criterion(2, true));
+        let marks: Vec<bool> = body.criteria().iter().map(|item| item.done).collect();
+        assert_eq!(marks, [false, false, true, false]);
+    }
+
+    #[test]
+    fn criteria_in_other_forms_of_a_hand_edit_still_count() {
+        for text in [
+            "## acceptance criteria\n- [ ] A\n",
+            "## Acceptance criteria\n* [ ] A\n",
+            "## Acceptance criteria\n+ [ ] A\n",
+            "## Acceptance criteria\n1. [ ] A\n",
+            "## Acceptance criteria\n\n## Notes\nText\n\n## Acceptance criteria\n- [ ] A\n",
+        ] {
+            let mut body = Body::parse(text);
+            let items = body.criteria();
+            assert_eq!(items.len(), 1, "{text}");
+            assert!(!items[0].done, "{text}");
+            assert!(body.mark_criterion(0, true), "{text}");
+            assert!(body.criteria()[0].done, "{text}");
+            assert_eq!(body.criteria()[0].text, "A", "{text}");
+        }
+    }
+
+    #[test]
+    fn a_mark_in_the_middle_of_a_line_is_a_text_change() {
+        assert!(criteria_text_differs(
+            Some("- [ ] Check - [ ] this"),
+            Some("- [ ] Check - [x] this")
+        ));
+        assert!(!criteria_text_differs(Some("- [ ] A"), Some("- [x] A")));
+    }
+
+    #[test]
+    fn a_section_has_no_line_end_characters_at_its_ends() {
+        let body = Body::parse("## Description\r\nLine\r\n\r\n");
+        assert_eq!(body.section(DESCRIPTION), Some("Line"));
+    }
 
     const SAMPLE: &str = "\
 Preamble.

@@ -1193,7 +1193,7 @@ fn doctor_reports_a_missing_task_file_and_a_link_to_a_missing_task() -> TestResu
     assert!(
         value["report"]["invalid_files"]
             .to_string()
-            .contains("no task file"),
+            .contains("task.md is missing"),
         "{value}"
     );
 
@@ -1761,5 +1761,83 @@ fn a_memory_search_finds_a_part_of_a_run_and_nothing_for_punctuation() -> TestRe
     assert_eq!(count("\u{65e5}\u{672c}\u{8a9e}")?, 1);
     assert_eq!(count("***")?, 0);
     assert_eq!(count("port")?, 1);
+    Ok(())
+}
+
+/// A wrong field name must not report success with no change.
+#[test]
+fn a_tool_refuses_an_unknown_field_and_a_project_that_is_not_text() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    let call = |tool: &str, args: String| machine.fails(&repo, &["call", tool, &args]);
+    assert_eq!(
+        call("task.show", format!("{{\"task\":\"{id}\",\"partz\":[]}}"))?,
+        "invalid_argument"
+    );
+    assert_eq!(
+        call(
+            "task.show",
+            format!("{{\"task\":\"{id}\",\"project\":123}}")
+        )?,
+        "invalid_argument"
+    );
+    assert_eq!(
+        call("memory.search", "{\"textt\":\"a\"}".to_owned())?,
+        "invalid_argument"
+    );
+    assert_eq!(
+        call("memory.search", "{\"project\":123}".to_owned())?,
+        "invalid_argument"
+    );
+    assert_eq!(
+        call(
+            "artifact.delete",
+            "{\"artifact\":\"x\",\"extra\":1}".to_owned()
+        )?,
+        "invalid_argument"
+    );
+    machine.ok(
+        &repo,
+        &[
+            "call",
+            "task.show",
+            &format!("{{\"task\":\"{id}\",\"project\":\"api\"}}"),
+        ],
+    )?;
+    Ok(())
+}
+
+/// A short ID under eight characters selects nothing, also in a link to an artifact.
+#[test]
+fn an_artifact_link_needs_a_long_short_id() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    fs::write(repo.join("a.txt"), "Some text")?;
+    machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    let args = format!("{{\"task\":\"{id}\",\"version\":1,\"artifacts_add\":[\"\"]}}");
+    assert!(
+        !machine
+            .run(&repo, &["call", "task.update", &args])?
+            .status
+            .success()
+    );
+    Ok(())
+}
+
+/// A secret in the name of a source file must not stay in a record.
+#[test]
+fn a_secret_in_a_source_file_name_is_refused() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let name = format!("ghp_{}.txt", "a1B2".repeat(10));
+    fs::write(repo.join(&name), "Some text")?;
+    let output = machine.run(&repo, &["artifact", "create", &name, "--name", "clean.txt"])?;
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(message.contains("file name"), "{message}");
     Ok(())
 }

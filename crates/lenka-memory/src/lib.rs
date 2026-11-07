@@ -530,6 +530,7 @@ impl Plugin for MemoryPlugin {
 struct MemoryTools;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AddArgs {
     text: String,
     #[serde(default)]
@@ -538,6 +539,7 @@ struct AddArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchArgs {
     text: Option<String>,
     tag: Option<String>,
@@ -546,11 +548,16 @@ struct SearchArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteArgs {
     id: String,
 }
 
-fn parse_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T> {
+fn parse_args<T: serde::de::DeserializeOwned>(mut args: Value) -> Result<T> {
+    // All tools take `project`, and the tool call reads it before this call.
+    if let Some(map) = args.as_object_mut() {
+        map.remove("project");
+    }
     serde_json::from_value(args)
         .map_err(|err| LenkaError::invalid_argument(format!("The arguments are not valid: {err}")))
 }
@@ -615,7 +622,7 @@ impl ToolProvider for MemoryTools {
     }
 
     fn call(&self, ctx: ToolContext<'_>, name: &str, args: Value) -> Result<Value> {
-        let requested = args.get("project").and_then(Value::as_str);
+        let requested = lenka_core::project_argument(&args)?;
         let project = ctx.host.project_for(ctx.caller, requested)?;
         let service = memory_of(&project)?;
         let result = match name {

@@ -3128,3 +3128,386 @@ fn an_invalid_blocker_with_no_record_stops_a_claim() -> Result<()> {
     );
     Ok(())
 }
+
+fn allow(service: &TaskService, to: Vec<String>, from: Vec<String>) -> Result<()> {
+    let mut config = (*service.project().config()).clone();
+    config.links.link_to = to;
+    config.links.accept_from = from;
+    service.project().save_config(config)
+}
+
+/// A chain with no limit stops a walk with no error, so the leaf ignores a blocker of the root.
+#[test]
+fn a_chain_of_parents_has_a_limit() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let mut parent = create(&service, &human, "Root")?;
+    let root = parent;
+    for number in 1..256 {
+        let new = NewTask {
+            parent: Some(parent),
+            ..task(&format!("Level {number}"))
+        };
+        parent = service.create(&human, new)?.id();
+    }
+    let too_deep = NewTask {
+        parent: Some(parent),
+        ..task("One level more")
+    };
+    assert_eq!(
+        code(service.create(&human, too_deep)),
+        ErrorCode::InvalidArgument
+    );
+
+    // A move of a task with a child counts the two levels.
+    let top = create(&service, &human, "Top")?;
+    let child = NewTask {
+        parent: Some(top),
+        ..task("Child")
+    };
+    service.create(&human, child)?;
+    let middle = service
+        .detail(parent, &[])?
+        .meta
+        .front
+        .parent
+        .ok_or_else(|| LenkaError::not_found("no parent"))?;
+    let moved = TaskPatch {
+        expected_version: 1,
+        parent: Some(Some(parent)),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&human, top, moved)),
+        ErrorCode::InvalidArgument
+    );
+    let one_level_too_many = TaskPatch {
+        expected_version: 1,
+        parent: Some(Some(middle)),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&human, top, one_level_too_many)),
+        ErrorCode::InvalidArgument
+    );
+    let fits = TaskPatch {
+        expected_version: 1,
+        parent: Some(Some(root)),
+        ..TaskPatch::default()
+    };
+    assert!(service.update(&human, top, fits).is_ok(), "{middle}");
+    Ok(())
+}
+
+/// The blockers of the old parent do not count after a move.
+#[test]
+fn a_move_away_from_a_blocked_parent_is_not_a_cycle() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let target = create(&service, &human, "Target")?;
+    let old = NewTask {
+        blocked_by: vec![Link::Local(target)],
+        ..task("Old parent")
+    };
+    let old = service.create(&human, old)?.id();
+    let child = NewTask {
+        parent: Some(old),
+        ..task("Child")
+    };
+    let child = service.create(&human, child)?.id();
+    let moved = TaskPatch {
+        expected_version: 1,
+        parent: Some(Some(target)),
+        ..TaskPatch::default()
+    };
+    assert!(service.update(&human, child, moved).is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_move_that_makes_a_task_wait_for_itself_is_a_cycle() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let parent = create(&service, &human, "Parent")?;
+    let child = NewTask {
+        parent: Some(parent),
+        ..task("Child")
+    };
+    let child = service.create(&human, child)?.id();
+    let moved = |target, version| TaskPatch {
+        expected_version: version,
+        parent: Some(Some(target)),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&human, parent, moved(child, 1))),
+        ErrorCode::Cycle
+    );
+    // A new parent with a blocker that waits for the moved task.
+    let moved_task = create(&service, &human, "Moved")?;
+    let waits = NewTask {
+        blocked_by: vec![Link::Local(moved_task)],
+        ..task("Waits")
+    };
+    let waits = service.create(&human, waits)?.id();
+    let new_parent = NewTask {
+        blocked_by: vec![Link::Local(waits)],
+        ..task("New parent")
+    };
+    let new_parent = service.create(&human, new_parent)?.id();
+    assert_eq!(
+        code(service.update(&human, moved_task, moved(new_parent, 1))),
+        ErrorCode::Cycle
+    );
+    Ok(())
+}
+
+/// A worker could clear the parent, change the plan, and put the parent back.
+#[test]
+fn a_change_of_the_parent_follows_the_coordinator_rule() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (human, worker) = (fx.human(), fx.agent("worker"));
+    let root = create(&service, &human, "Coordinated")?;
+    service.update(
+        &human,
+        root,
+        TaskPatch {
+            expected_version: 1,
+            coordinated: Some(true),
+            ..TaskPatch::default()
+        },
+    )?;
+    let child = NewTask {
+        parent: Some(root),
+        ..task("Child")
+    };
+    let child = service.create(&human, child)?.id();
+    let cleared = TaskPatch {
+        expected_version: 1,
+        parent: Some(None),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&worker, child, cleared)),
+        ErrorCode::ActorDenied
+    );
+    Ok(())
+}
+
+/// A hand edit can set `todo` on a task, and the claim of the holder stays valid.
+#[test]
+fn a_task_with_a_claim_is_not_ready_in_any_status() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (one, two) = (fx.agent("one"), fx.agent("two"));
+    let id = create(&service, &one, "T")?;
+    service.claim(&one, Some(id), None, None)?;
+    let file = task_file(&fx, id, "state.toml");
+    let text = fs::read_to_string(&file).map_err(|err| LenkaError::io("read", &err))?;
+    fs::write(&file, text.replace("in_progress", "todo"))
+        .map_err(|err| LenkaError::io("write", &err))?;
+    service.reindex(&fx.human())?;
+    assert_eq!(
+        code(service.claim(&two, None, None, None)),
+        ErrorCode::NotFound
+    );
+    Ok(())
+}
+
+/// A removed main file with other files left is damage, and not a delete.
+#[test]
+fn a_task_with_a_lost_main_file_is_invalid_and_still_blocks() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let blocker = create(&service, &human, "Blocker")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Local(blocker)],
+        ..task("Blocked")
+    };
+    let blocked = service.create(&human, new)?.id();
+    fs::remove_file(task_file(&fx, blocker, "task.md"))
+        .map_err(|err| LenkaError::io("remove", &err))?;
+    let host = build_host(&fx.paths, &fx.clock)?;
+    let fresh = service_of(&host.open_by_name("api")?)?;
+    let report = fresh.doctor()?;
+    assert!(
+        report
+            .invalid_files
+            .iter()
+            .any(|line| line.contains("task.md")),
+        "{:?}",
+        report.invalid_files
+    );
+    assert_eq!(fresh.detail(blocked, &[])?.blockers.len(), 1);
+    Ok(())
+}
+
+/// A target with damaged files has an unknown state, so the link must still block.
+#[test]
+fn a_remote_target_with_invalid_files_still_blocks() -> Result<()> {
+    let fx = fixture()?;
+    let (api, billing) = (fx.project("api")?, fx.project("billing")?);
+    let human = fx.human();
+    allow(&api, vec![billing.project().id().to_string()], vec![])?;
+    allow(&billing, vec![], vec!["*".to_owned()])?;
+    let target = create(&billing, &human, "Target")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Remote(billing.project().id(), target)],
+        ..task("Local")
+    };
+    let local = api.create(&human, new)?.id();
+    assert_eq!(
+        api.detail(local, &[])?.soft_links[0].state,
+        lenka_tasks::LinkState::Ok
+    );
+
+    let state = fx
+        .data_dir("billing")
+        .join("tasks")
+        .join(target.to_string())
+        .join("state.toml");
+    fs::write(&state, "<<<<<<< ours\n").map_err(|err| LenkaError::io("write", &err))?;
+    let detail = api.detail(local, &[])?;
+    assert_eq!(
+        detail.soft_links[0].state,
+        lenka_tasks::LinkState::Unavailable
+    );
+    assert_eq!(detail.blockers.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_long_remote_title_is_clipped() -> Result<()> {
+    let fx = fixture()?;
+    let (api, billing) = (fx.project("api")?, fx.project("billing")?);
+    let human = fx.human();
+    allow(&api, vec![billing.project().id().to_string()], vec![])?;
+    allow(&billing, vec![], vec!["*".to_owned()])?;
+    let target = create(&billing, &human, "Target")?;
+    let new = NewTask {
+        relates: vec![Link::Remote(billing.project().id(), target)],
+        ..task("Local")
+    };
+    let local = api.create(&human, new)?.id();
+    let file = fx
+        .data_dir("billing")
+        .join("tasks")
+        .join(target.to_string())
+        .join("task.md");
+    let text = fs::read_to_string(&file).map_err(|err| LenkaError::io("read", &err))?;
+    fs::write(&file, text.replace("Target", &"x".repeat(100_000)))
+        .map_err(|err| LenkaError::io("write", &err))?;
+    let title = api.detail(local, &[])?.soft_links[0]
+        .title
+        .clone()
+        .unwrap_or_default();
+    assert!(title.len() <= 500, "{}", title.len());
+    Ok(())
+}
+
+#[test]
+fn a_search_does_not_read_the_front_matter() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    create(&service, &fx.human(), "A title")?;
+    let filter = lenka_tasks::ListFilter {
+        text: Some("priority".to_owned()),
+        ..lenka_tasks::ListFilter::default()
+    };
+    assert!(service.list(&fx.human(), &filter)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_closed_task_shows_no_dependents_and_is_not_blocked() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let blocker = create(&service, &human, "Blocker")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Local(blocker)],
+        ..task("Blocked")
+    };
+    let blocked = service.create(&human, new)?.id();
+    service.set_status(&human, blocker, Status::Cancelled, &ClaimRef::Implicit)?;
+    assert!(service.related(blocker)?.blocks.is_empty());
+    let blocker_of_closed = create(&service, &human, "Other")?;
+    let closed = NewTask {
+        blocked_by: vec![Link::Local(blocker_of_closed)],
+        ..task("Closed")
+    };
+    let closed = service.create(&human, closed)?.id();
+    service.set_status(&human, closed, Status::Cancelled, &ClaimRef::Implicit)?;
+    let rows = service.board_rows()?;
+    let row = rows
+        .iter()
+        .find(|row| row.meta.id() == closed)
+        .ok_or_else(|| LenkaError::not_found("row"))?;
+    assert!(!row.blocked);
+    let _ = blocked;
+    Ok(())
+}
+
+#[test]
+fn an_entry_id_must_name_an_entry_of_the_task() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = create(&service, &human, "T")?;
+    let entry = service.add_entry(
+        &human,
+        id,
+        NewEntry {
+            kind: EntryKind::Comment,
+            text: "A note".to_owned(),
+            replaces: None,
+            secret_policy: lenka_core::SecretPolicy::Enforce,
+        },
+    )?;
+    let full = entry.id.to_string();
+    assert_eq!(service.resolve_entry(id, &full)?, entry.id);
+    assert_eq!(service.resolve_entry(id, &entry.id.short())?, entry.id);
+    for bad in ["", "a", &lenka_plugin_api::EntryId::generate().to_string()] {
+        assert_eq!(
+            code(service.resolve_entry(id, bad)),
+            ErrorCode::NotFound,
+            "{bad}"
+        );
+    }
+    Ok(())
+}
+
+/// The target of a link can be gone, and the link must still go away.
+#[test]
+fn a_link_to_a_removed_task_can_be_removed_with_its_short_id() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let target = create(&service, &human, "Target")?;
+    let new = NewTask {
+        relates: vec![Link::Local(target)],
+        ..task("Local")
+    };
+    let local = service.create(&human, new)?.id();
+    // A merge can remove a task with no check of the links in this clone.
+    let directory = task_file(&fx, target, "task.md");
+    let directory = directory
+        .parent()
+        .ok_or_else(|| LenkaError::not_found("no directory"))?;
+    fs::remove_dir_all(directory).map_err(|err| LenkaError::io("remove", &err))?;
+    service.reindex(&human)?;
+    assert_eq!(
+        service.resolve_removed_link(local, &target.short())?,
+        Link::Local(target)
+    );
+    assert_eq!(
+        code(service.resolve_removed_link(local, "abc")),
+        ErrorCode::InvalidArgument
+    );
+    Ok(())
+}

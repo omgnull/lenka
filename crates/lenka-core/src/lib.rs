@@ -21,7 +21,7 @@ pub mod settings;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use host::{
     Builder, EventHook, Host, PeerLookup, Peers, Plugin, PluginInfo, PluginState, Registry,
-    ToolContext, ToolProvider,
+    ToolContext, ToolProvider, project_argument,
 };
 pub use journal::Op;
 pub use lenka_plugin_api as api;

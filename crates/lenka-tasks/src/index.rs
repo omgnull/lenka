@@ -90,8 +90,18 @@ pub fn load_task(driver: &dyn StorageDriver, id: TaskId) -> Result<LoadedTask> {
         driver.stat(&plan_path)?,
         driver.stat(&state_path)?,
     ];
-    let text = read_utf8(driver, &task_path)?
-        .ok_or_else(|| LenkaError::not_found(format!("The task {} does not exist.", id.short())))?;
+    let Some(text) = read_utf8(driver, &task_path)? else {
+        // A delete removes all files. A task with other files lost its main file by a mistake.
+        if stamps[2].is_some() {
+            return Err(LenkaError::invalid_file(format!(
+                "{task_path} is missing, and other files of the task exist."
+            )));
+        }
+        return Err(LenkaError::not_found(format!(
+            "The task {} does not exist.",
+            id.short()
+        )));
+    };
     check_conflict_markers(task_path.as_str(), &text)?;
     let (front, body): (TaskFront, String) = split_front(task_path.as_str(), &text)?;
     if front.id != id {
@@ -556,9 +566,20 @@ impl Index {
     /// ancestors, which it inherits, and its children.
     #[must_use]
     pub fn wait_edges(&self, id: TaskId) -> Vec<TaskId> {
+        self.wait_edges_with(id, None)
+    }
+
+    /// Returns the wait edges as they are after a task gets a new parent.
+    fn wait_edges_with(&self, id: TaskId, moved: Option<(TaskId, TaskId)>) -> Vec<TaskId> {
         let mut edges: Vec<TaskId> = Vec::new();
-        for task in std::iter::once(id).chain(self.ancestors(id)) {
-            if let Some(meta) = self.tasks.get(&task) {
+        let mut seen = HashSet::new();
+        let mut current = Some(id);
+        while let Some(task) = current {
+            if seen.len() >= MAX_DEPTH || !seen.insert(task) {
+                break;
+            }
+            let meta = self.tasks.get(&task);
+            if let Some(meta) = meta {
                 edges.extend(
                     meta.front
                         .blocked_by
@@ -567,9 +588,24 @@ impl Index {
                         .filter(|target| self.tasks.contains_key(target)),
                 );
             }
+            current = match moved {
+                Some((changed, parent)) if changed == task => Some(parent),
+                _ => meta.and_then(|meta| meta.front.parent),
+            };
         }
         if let Some(children) = self.children.get(&id) {
-            edges.extend(children.iter().copied());
+            let kept = moved.map(|(changed, _)| changed);
+            edges.extend(
+                children
+                    .iter()
+                    .copied()
+                    .filter(|child| Some(*child) != kept),
+            );
+        }
+        if let Some((changed, parent)) = moved
+            && parent == id
+        {
+            edges.push(changed);
         }
         edges
     }
@@ -588,6 +624,17 @@ impl Index {
             }
         }
         false
+    }
+
+    fn reached_from(&self, from: TaskId) -> HashSet<TaskId> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(current) = stack.pop() {
+            if seen.insert(current) {
+                stack.extend(self.wait_edges(current));
+            }
+        }
+        seen
     }
 
     /// Returns a task and all its descendants.
@@ -611,27 +658,64 @@ impl Index {
     /// descendants of `id` inherit the blocker.
     #[must_use]
     pub fn blocker_makes_cycle(&self, id: TaskId, target: TaskId) -> bool {
+        // One walk is enough, and a walk for each descendant has a quadratic cost.
+        let reached = self.reached_from(target);
         self.with_descendants(id)
             .into_iter()
-            .any(|task| self.waits_for(target, task))
+            .any(|task| reached.contains(&task))
     }
 
-    /// Tells if a new parent `parent` on `id` makes a group of tasks wait for itself. The parent
-    /// then waits for `id`, and `id` and its descendants inherit the blockers of the parent.
+    /// Tells if a new parent `parent` on `id` makes a group of tasks wait for itself. The check
+    /// uses the links after the move, so that the blockers of the old parent do not count.
     #[must_use]
     pub fn parent_makes_cycle(&self, id: TaskId, parent: TaskId) -> bool {
-        if self.waits_for(id, parent) {
-            return true;
+        let moved = Some((id, parent));
+        let mut finished = HashSet::new();
+        let mut active = HashSet::new();
+        let mut stack = vec![(id, self.wait_edges_with(id, moved))];
+        active.insert(id);
+        while let Some((task, edges)) = stack.last_mut() {
+            let Some(next) = edges.pop() else {
+                active.remove(task);
+                finished.insert(*task);
+                stack.pop();
+                continue;
+            };
+            if active.contains(&next) {
+                return true;
+            }
+            if !finished.contains(&next) {
+                active.insert(next);
+                stack.push((next, self.wait_edges_with(next, moved)));
+            }
         }
-        let inherited: Vec<TaskId> = std::iter::once(parent)
-            .chain(self.ancestors(parent))
-            .filter_map(|task| self.tasks.get(&task))
-            .flat_map(|meta| meta.front.blocked_by.iter().filter_map(|link| link.local()))
-            .collect();
-        let tasks = self.with_descendants(id);
-        inherited
-            .iter()
-            .any(|blocker| tasks.iter().any(|task| self.waits_for(*blocker, *task)))
+        false
+    }
+
+    /// Tells if a parent has no space for a task, or for a task with its descendants.
+    #[must_use]
+    pub fn chain_is_too_deep(&self, parent: TaskId, task: Option<TaskId>) -> bool {
+        let above = self.ancestors(parent).len() + 1;
+        let below = task.map_or(1, |id| self.height(id));
+        above + below > MAX_DEPTH
+    }
+
+    /// Returns the count of levels from a task down to its deepest descendant.
+    fn height(&self, id: TaskId) -> usize {
+        let mut seen = HashSet::from([id]);
+        let mut level = vec![id];
+        let mut height = 0;
+        while !level.is_empty() {
+            height += 1;
+            let mut next = Vec::new();
+            for task in level {
+                if let Some(children) = self.children.get(&task) {
+                    next.extend(children.iter().copied().filter(|child| seen.insert(*child)));
+                }
+            }
+            level = next;
+        }
+        height
     }
 
     /// Returns the ancestors of a task, nearest first. A loop ends the walk.

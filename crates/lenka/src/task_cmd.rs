@@ -7,9 +7,7 @@
 use anyhow::Context;
 use clap::{ArgAction, Subcommand};
 use lenka_core::{Host, SecretPolicy};
-use lenka_plugin_api::{
-    ArtifactId, Day, DocPath, EntryId, ErrorCode, LenkaError, Result as LenkaResult,
-};
+use lenka_plugin_api::{ArtifactId, Day, DocPath, ErrorCode, LenkaError, Result as LenkaResult};
 use lenka_tasks::{
     CheckItem, ClaimRef, EntryKind, Finish, Link, NewEntry, NewTask, Priority, Status, TaskPatch,
     TaskService, service_of, with_notes,
@@ -285,6 +283,17 @@ fn links(service: &TaskService, items: &[String]) -> LenkaResult<Vec<Link>> {
         .collect()
 }
 
+fn removed_links(
+    service: &TaskService,
+    id: lenka_plugin_api::TaskId,
+    items: &[String],
+) -> LenkaResult<Vec<Link>> {
+    items
+        .iter()
+        .map(|item| service.resolve_removed_link(id, item))
+        .collect()
+}
+
 fn optional_day(raw: Option<&str>) -> LenkaResult<Option<Option<Day>>> {
     match raw {
         None => Ok(None),
@@ -297,6 +306,7 @@ fn resolve_artifact(service: &TaskService, raw: &str) -> LenkaResult<ArtifactId>
     if let Ok(id) = ArtifactId::parse(raw) {
         return Ok(id);
     }
+    lenka_plugin_api::check_short_id(raw)?;
     let names = service
         .project()
         .driver()
@@ -312,23 +322,6 @@ fn resolve_artifact(service: &TaskService, raw: &str) -> LenkaResult<ArtifactId>
             "No artifact matches the ID {raw}."
         ))),
     }
-}
-
-fn resolve_entry(
-    service: &TaskService,
-    task: lenka_plugin_api::TaskId,
-    raw: &str,
-) -> LenkaResult<EntryId> {
-    if let Ok(id) = EntryId::parse(raw) {
-        return Ok(id);
-    }
-    let detail = service.detail(task, &["entries"])?;
-    detail
-        .entries
-        .iter()
-        .find(|entry| entry.id.matches_short(raw))
-        .map(|entry| entry.id)
-        .ok_or_else(|| LenkaError::not_found(format!("The task has no entry {raw}.")))
 }
 
 /// Runs a command that maps to a tool with simple arguments.
@@ -595,7 +588,7 @@ fn run_typed(context: &RunContext, host: &Host, command: TaskCommand) -> anyhow:
             let id = service.resolve(&task)?;
             let replaces = replaces
                 .as_deref()
-                .map(|raw| resolve_entry(&service, id, raw))
+                .map(|raw| service.resolve_entry(id, raw))
                 .transpose()?;
             let entry = service.add_entry(
                 &caller,
@@ -695,9 +688,9 @@ fn update(
             Some(raw) => Some(Some(service.resolve(raw).context("Find the parent task")?)),
         },
         blocked_by_add: links(service, &args.blocked_by_add)?,
-        blocked_by_remove: links(service, &args.blocked_by_remove)?,
+        blocked_by_remove: removed_links(service, id, &args.blocked_by_remove)?,
         relates_add: links(service, &args.relates_add)?,
-        relates_remove: links(service, &args.relates_remove)?,
+        relates_remove: removed_links(service, id, &args.relates_remove)?,
         artifacts_add: artifacts(&args.artifacts_add)?,
         artifacts_remove: artifacts(&args.artifacts_remove)?,
         check,

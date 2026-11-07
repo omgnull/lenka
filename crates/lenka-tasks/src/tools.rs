@@ -45,13 +45,17 @@ pub fn plugin() -> TasksPlugin {
 #[derive(Debug)]
 struct TaskTools;
 
-fn parse_args<T: DeserializeOwned>(args: Value) -> Result<T> {
+/// Parses the arguments of a tool. All tools take `project`, and `project_of` reads it.
+fn parse_args<T: DeserializeOwned>(mut args: Value) -> Result<T> {
+    if let Some(map) = args.as_object_mut() {
+        map.remove("project");
+    }
     serde_json::from_value(args)
         .map_err(|err| LenkaError::invalid_argument(format!("The arguments are not valid: {err}")))
 }
 
 fn project_of(ctx: ToolContext<'_>, args: &Value) -> Result<Arc<Project>> {
-    let requested = args.get("project").and_then(Value::as_str);
+    let requested = lenka_core::project_argument(args)?;
     ctx.host.project_for(ctx.caller, requested)
 }
 
@@ -63,6 +67,13 @@ fn links(service: &TaskService, items: &[String]) -> Result<Vec<Link>> {
     items
         .iter()
         .map(|item| service.resolve_link(item))
+        .collect()
+}
+
+fn removed_links(service: &TaskService, id: TaskId, items: &[String]) -> Result<Vec<Link>> {
+    items
+        .iter()
+        .map(|item| service.resolve_removed_link(id, item))
         .collect()
 }
 
@@ -81,6 +92,7 @@ pub fn task_ref(id: TaskId) -> String {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateArgs {
     title: String,
     #[serde(default, rename = "type")]
@@ -107,6 +119,7 @@ struct CreateArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     task: String,
     version: u64,
@@ -144,6 +157,7 @@ struct UpdateArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ShowArgs {
     task: String,
     #[serde(default)]
@@ -152,6 +166,7 @@ struct ShowArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListArgs {
     #[serde(default)]
     status: Vec<Status>,
@@ -169,6 +184,7 @@ struct ListArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimArgs {
     task: Option<String>,
     claim: Option<String>,
@@ -176,6 +192,7 @@ struct ClaimArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdvanceArgs {
     task: String,
     claim: Option<String>,
@@ -184,6 +201,7 @@ struct AdvanceArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EntryArgs {
     task: String,
     kind: EntryKind,
@@ -192,6 +210,7 @@ struct EntryArgs {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PauseArgs {
     task: String,
     claim: Option<String>,
@@ -205,6 +224,7 @@ enum Outcome {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FinishArgs {
     task: String,
     outcome: Outcome,
@@ -529,9 +549,9 @@ fn update(service: &TaskService, caller: &Caller, args: UpdateArgs) -> Result<Va
             Some(text) => Some(Some(service.resolve(text)?)),
         },
         blocked_by_add: links(service, &args.blocked_by_add)?,
-        blocked_by_remove: links(service, &args.blocked_by_remove)?,
+        blocked_by_remove: removed_links(service, id, &args.blocked_by_remove)?,
         relates_add: links(service, &args.relates_add)?,
-        relates_remove: links(service, &args.relates_remove)?,
+        relates_remove: removed_links(service, id, &args.relates_remove)?,
         artifacts_add: parse_artifacts(&args.artifacts_add)?,
         artifacts_remove: parse_artifacts(&args.artifacts_remove)?,
         check,
@@ -553,6 +573,7 @@ fn resolve_artifact(service: &TaskService, text: &str) -> Result<lenka_plugin_ap
     if let Ok(id) = lenka_plugin_api::ArtifactId::parse(text) {
         return Ok(id);
     }
+    lenka_plugin_api::check_short_id(text)?;
     let dir = lenka_plugin_api::DocPath::new("artifacts")?;
     let names = service.project().driver().list(&dir)?;
     let mut found = names.iter().filter(|name| name.ends_with(text));
@@ -747,7 +768,7 @@ fn entry(service: &TaskService, caller: &Caller, args: EntryArgs) -> Result<Valu
     let replaces = args
         .replaces
         .as_deref()
-        .map(|text| find_entry(service, id, text))
+        .map(|text| service.resolve_entry(id, text))
         .transpose()?;
     let entry = service.add_entry(
         caller,
@@ -760,19 +781,6 @@ fn entry(service: &TaskService, caller: &Caller, args: EntryArgs) -> Result<Valu
         },
     )?;
     Ok(json!({"task": id.short(), "entry": entry.id.short()}))
-}
-
-fn find_entry(service: &TaskService, id: TaskId, text: &str) -> Result<lenka_plugin_api::EntryId> {
-    if let Ok(entry) = lenka_plugin_api::EntryId::parse(text) {
-        return Ok(entry);
-    }
-    let detail = service.detail(id, &["entries"])?;
-    detail
-        .entries
-        .iter()
-        .find(|entry| entry.id.matches_short(text))
-        .map(|entry| entry.id)
-        .ok_or_else(|| LenkaError::not_found(format!("The task has no entry {text}.")))
 }
 
 fn finish(service: &TaskService, caller: &Caller, args: FinishArgs) -> Result<Value> {

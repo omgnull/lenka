@@ -455,3 +455,19 @@ fn store_name_of(driver: &dyn StorageDriver) -> Result<String> {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
+
+/// Reads the optional `project` argument of a tool.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::InvalidArgument`] if the value is not a string. A wrong type must not
+/// select the default project.
+pub fn project_argument(args: &serde_json::Value) -> Result<Option<&str>> {
+    match args.get("project") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(name)) => Ok(Some(name)),
+        Some(_) => Err(LenkaError::invalid_argument(
+            "The argument `project` must be a string.",
+        )),
+    }
+}
