@@ -869,4 +869,63 @@ mod tests {
         let work = |_: &[u8]| -> u8 { panic!("a bug in a worker") };
         let _ = parallel_chunks(&items, &work);
     }
+
+    fn meta(parent: Option<TaskId>, blocked_by: Vec<Link>) -> TaskMeta {
+        TaskMeta {
+            front: TaskFront {
+                id: TaskId::generate(),
+                kind: "task".to_owned(),
+                title: "T".to_owned(),
+                parent,
+                blocked_by,
+                relates: Vec::new(),
+                artifacts: Vec::new(),
+                priority: crate::model::Priority::default(),
+                labels: Vec::new(),
+                created_by: "test".to_owned(),
+                created_at: Timestamp::from_unix_ms(0),
+                start: None,
+                due: None,
+                coordinated: false,
+            },
+            state: State {
+                version: 1,
+                status: crate::model::Status::Todo,
+                stage: "work".to_owned(),
+                unblocked: false,
+                loop_stopped: false,
+                loop_until_done: false,
+            },
+            has_plan: false,
+            stamps: [None, None, None],
+        }
+    }
+
+    /// A blocker between two epics of 4,000 children took 1.57 s under the locks, when the check
+    /// had a walk for each descendant. One walk takes some milliseconds.
+    #[test]
+    fn a_blocker_between_two_large_epics_needs_one_walk() {
+        let mut index = Index::default();
+        let (first, second) = (meta(None, Vec::new()), meta(None, Vec::new()));
+        let (one, two) = (first.id(), second.id());
+        index.insert(first);
+        index.insert(second);
+        for _ in 0..4000 {
+            index.insert(meta(Some(one), Vec::new()));
+            index.insert(meta(Some(two), Vec::new()));
+        }
+        let started = std::time::Instant::now();
+        assert!(!index.blocker_makes_cycle(one, two));
+        let elapsed = started.elapsed();
+        // A child of the second epic waits for a child of the first, so the blocker makes a cycle.
+        let child = index.children[&two].first().copied();
+        let target = index.children[&one].first().copied();
+        if let (Some(child), Some(target)) = (child, target) {
+            let mut edited = index.tasks[&child].clone();
+            edited.front.blocked_by = vec![Link::Local(target)];
+            index.insert(edited);
+        }
+        assert!(index.blocker_makes_cycle(one, two));
+        assert!(elapsed < std::time::Duration::from_secs(1), "{elapsed:?}");
+    }
 }
