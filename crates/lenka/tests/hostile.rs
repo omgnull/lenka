@@ -8,6 +8,10 @@
 //! - A marker text in each field reaches an agent only in `untrusted_data`.
 //! - An escape sequence in each field does not reach the terminal of a person.
 //! - Each file can be damaged, a named pipe, or a symlink, and no call hangs or fails the server.
+//! - A symlink to a valid file with a marker does not show the marker, so lenka did not follow it.
+//!
+//! The suite also changes the files in `.runtime/`, such as the index. lenka can rebuild them,
+//! but it reads them and shows their text.
 
 #![expect(
     clippy::disallowed_methods,
@@ -32,12 +36,26 @@ const MARKER: &str = "HOSTILE MARKER";
 const ESCAPE: &str = "\\u001b[31mHOSTILE";
 const CALL_LIMIT: Duration = Duration::from_secs(20);
 
-/// Files that hold no field that lenka shows.
+/// Files that hold no field that lenka shows. The field tests skip them, but the damage test does
+/// not.
 const NO_FIELDS: [&str; 4] = [".gitignore", ".gitattributes", "lock", "pending.json"];
+
+/// The lowest count of field cases that must show the marker to an agent. A lower count means
+/// that a read path stopped to show data, or that the suite lost its cases.
+const MIN_SHOWN_CASES: usize = 90;
+
+/// The files that a test changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSet {
+    /// Only the files with fields that lenka shows.
+    WithFields,
+    /// All files.
+    All,
+}
 
 /// A project with each kind of file, and a copy of its data to restore after each case.
 struct Sample {
-    _temp: tempfile::TempDir,
+    temp: tempfile::TempDir,
     machine: Machine,
     repo: PathBuf,
     data: PathBuf,
@@ -84,17 +102,20 @@ fn sample() -> TestResult<Sample> {
     assert!(output.status.success(), "{output:?}");
     let change = json!({
         "task": second, "version": 1, "description": "New text.", "reason": "Another reason.",
+        "requirements": "A requirement.", "acceptance": "- [ ] A check.",
     })
     .to_string();
     let update = agent_args(&["call", "task.update", &change]);
     let output = machine.with_input(&repo, &update, "", &[("LENKA_AGENT", "b")])?;
     assert!(output.status.success(), "{output:?}");
+    // A read stores a current index snapshot, so a case can change the snapshot alone.
+    machine.json(&repo, &["task", "list"])?;
 
     let data = repo.join(".git/lenka-data");
     let template = temp.path().join("template");
     copy_tree(&data, &template)?;
     Ok(Sample {
-        _temp: temp,
+        temp,
         machine,
         repo,
         data,
@@ -105,6 +126,8 @@ fn sample() -> TestResult<Sample> {
     })
 }
 
+/// Copies a directory. Each copy keeps the time of change, because the index snapshot compares it
+/// with the time in its stamps.
 fn copy_tree(from: &Path, to: &Path) -> TestResult {
     fs::create_dir_all(to)?;
     for item in fs::read_dir(from)? {
@@ -113,7 +136,12 @@ fn copy_tree(from: &Path, to: &Path) -> TestResult {
         if item.file_type()?.is_dir() {
             copy_tree(&item.path(), &target)?;
         } else {
-            fs::copy(item.path(), target)?;
+            fs::copy(item.path(), &target)?;
+            let modified = item.metadata()?.modified()?;
+            fs::File::options()
+                .write(true)
+                .open(&target)?
+                .set_modified(modified)?;
         }
     }
     Ok(())
@@ -125,8 +153,8 @@ impl Sample {
         copy_tree(&self.template, &self.data)
     }
 
-    /// The paths of all files with fields, relative to the data directory.
-    fn files(&self) -> TestResult<Vec<PathBuf>> {
+    /// The paths of the files of a set, relative to the data directory.
+    fn files(&self, set: FileSet) -> TestResult<Vec<PathBuf>> {
         let mut found = Vec::new();
         let mut open = vec![self.template.clone()];
         while let Some(dir) = open.pop() {
@@ -137,16 +165,21 @@ impl Sample {
                     .map(|name| name.to_string_lossy().into_owned());
                 let name = name.unwrap_or_default();
                 if path.is_dir() {
-                    if name != "index" {
-                        open.push(path);
-                    }
-                } else if !NO_FIELDS.contains(&name.as_str()) {
+                    open.push(path);
+                } else if set == FileSet::All || !NO_FIELDS.contains(&name.as_str()) {
                     found.push(path.strip_prefix(&self.template)?.to_path_buf());
                 }
             }
         }
         found.sort();
+        let index = Path::new(".runtime/index/snapshot.json");
+        assert!(found.iter().any(|path| path == index), "{found:?}");
         Ok(found)
+    }
+
+    /// A path outside the data directory.
+    fn outside(&self) -> PathBuf {
+        self.temp.path().join("outside")
     }
 
     /// Calls each tool that shows data to an agent, and gives back each answer.
@@ -262,13 +295,22 @@ fn outside_untrusted(value: &Value, path: &str, marker: &str, found: &mut Vec<St
 }
 
 /// A text with one field of a file changed, for each field of the file.
+///
+/// The value is the text of a TOML or JSON string, with its escapes. A Markdown body gets the
+/// text that the escapes give.
 fn with_each_field(file: &Path, value: &str) -> TestResult<Vec<(String, String)>> {
     let source = fs::read_to_string(file)?;
     if file.extension().is_some_and(|ext| ext == "jsonl") {
         return jsonl_cases(&source, value);
     }
+    if file.extension().is_some_and(|ext| ext == "json") {
+        return json_cases(&source, value);
+    }
     let mut cases = Vec::new();
     let is_markdown = file.extension().is_some_and(|ext| ext == "md");
+    if is_markdown {
+        cases.extend(body_cases(&source, &plain_text(value)?));
+    }
     let mut in_front = !is_markdown;
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     for (index, line) in lines.iter().enumerate() {
@@ -294,15 +336,55 @@ fn with_each_field(file: &Path, value: &str) -> TestResult<Vec<(String, String)>
     Ok(cases)
 }
 
-fn jsonl_cases(source: &str, value: &str) -> TestResult<Vec<(String, String)>> {
-    let mut cases = Vec::new();
-    // A TOML escape and a JSON escape have one form here, so the raw text works in both.
-    let plain: Value = serde_json::from_str(&format!("\"{value}\""))?;
-    for (index, line) in source.lines().enumerate() {
-        let parsed: Value = serde_json::from_str(line)?;
-        let mut paths = Vec::new();
-        string_paths(&parsed, &mut Vec::new(), &mut paths);
-        for path in paths {
+/// The text that the escapes of a value give. A TOML escape and a JSON escape have one form here,
+/// so the raw text works in both.
+fn plain_text(value: &str) -> TestResult<String> {
+    Ok(serde_json::from_str(&format!("\"{value}\""))?)
+}
+
+/// The Markdown body cases: the whole body, and the text below each `##` heading. The body holds
+/// the most important text of a task, an entry, a memory, or a plan.
+fn body_cases(source: &str, text: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let start = if lines.first().is_some_and(|line| line.trim_end() == "+++") {
+        let end = lines
+            .iter()
+            .skip(1)
+            .position(|line| line.trim_end() == "+++");
+        end.map_or(lines.len(), |end| end + 2)
+    } else {
+        0
+    };
+    let mut cases = vec![(
+        "body".to_owned(),
+        format!("{}{text}\n", lines[..start].concat()),
+    )];
+    let is_heading = |line: &&str| line.starts_with("## ");
+    for index in start..lines.len() {
+        if !is_heading(&lines[index]) {
+            continue;
+        }
+        let next = lines[index + 1..]
+            .iter()
+            .position(is_heading)
+            .map_or(lines.len(), |next| index + 1 + next);
+        let changed = format!(
+            "{}{text}\n{}",
+            lines[..=index].concat(),
+            lines[next..].concat()
+        );
+        cases.push((format!("body {}", lines[index].trim_end()), changed));
+    }
+    cases
+}
+
+/// Gives a copy of a JSON value with the value at each string path changed.
+fn json_variants(parsed: &Value, plain: &str) -> Vec<(JsonPath, Value)> {
+    let mut paths = Vec::new();
+    string_paths(parsed, &mut Vec::new(), &mut paths);
+    paths
+        .into_iter()
+        .map(|path| {
             let mut changed = parsed.clone();
             let mut target = &mut changed;
             for part in &path {
@@ -311,7 +393,18 @@ fn jsonl_cases(source: &str, value: &str) -> TestResult<Vec<(String, String)>> {
                     Err(position) => &mut target[*position],
                 };
             }
-            *target = plain.clone();
+            *target = Value::String(plain.to_owned());
+            (path, changed)
+        })
+        .collect()
+}
+
+fn jsonl_cases(source: &str, value: &str) -> TestResult<Vec<(String, String)>> {
+    let mut cases = Vec::new();
+    let plain = plain_text(value)?;
+    for (index, line) in source.lines().enumerate() {
+        let parsed: Value = serde_json::from_str(line)?;
+        for (path, changed) in json_variants(&parsed, &plain) {
             let mut rows: Vec<String> = source.lines().map(str::to_owned).collect();
             rows[index] = changed.to_string();
             let name = format!("line {index} {path:?}");
@@ -319,6 +412,15 @@ fn jsonl_cases(source: &str, value: &str) -> TestResult<Vec<(String, String)>> {
         }
     }
     Ok(cases)
+}
+
+fn json_cases(source: &str, value: &str) -> TestResult<Vec<(String, String)>> {
+    let parsed: Value = serde_json::from_str(source)?;
+    let variants = json_variants(&parsed, &plain_text(value)?);
+    Ok(variants
+        .into_iter()
+        .map(|(path, changed)| (format!("{path:?}"), changed.to_string()))
+        .collect())
 }
 
 type JsonPath = Vec<Result<String, usize>>;
@@ -344,32 +446,69 @@ fn string_paths(value: &Value, path: &mut JsonPath, found: &mut Vec<JsonPath>) {
     }
 }
 
+/// Tells if any answer holds a text, also in `untrusted_data`.
+fn shows(answers: &[(String, Value)], marker: &str) -> bool {
+    answers
+        .iter()
+        .any(|(_, answer)| answer.to_string().contains(marker))
+}
+
 /// A marker in any field of any file reaches an agent only in `untrusted_data`.
+///
+/// For each case that shows the marker, the file then becomes a symlink to the same text outside
+/// the data. lenka refuses a symlink, so the marker must not show.
 #[tokio::test]
 async fn a_marker_in_any_field_stays_in_untrusted_data() -> TestResult {
     let sample = sample()?;
     let mut leaks = Vec::new();
     let mut count = 0;
-    for file in sample.files()? {
+    let mut shown = 0;
+    for file in sample.files(FileSet::WithFields)? {
         for (field, changed) in with_each_field(&sample.template.join(&file), MARKER)? {
             count += 1;
-            fs::write(sample.data.join(&file), changed)?;
-            match sample.agent_answers().await {
-                Ok(answers) => {
-                    for (call, answer) in answers {
-                        let mut found = Vec::new();
-                        outside_untrusted(&answer, "", MARKER, &mut found);
-                        for place in found {
-                            leaks.push(format!("{}: {field}: {call}: {place}", file.display()));
+            let target = sample.data.join(&file);
+            fs::write(&target, &changed)?;
+            let place = format!("{}: {field}", file.display());
+            let answers = match sample.agent_answers().await {
+                Ok(answers) => answers,
+                Err(error) => {
+                    leaks.push(format!("{place}: {error}"));
+                    Vec::new()
+                }
+            };
+            for (call, answer) in &answers {
+                let mut found = Vec::new();
+                outside_untrusted(answer, "", MARKER, &mut found);
+                for spot in found {
+                    leaks.push(format!("{place}: {call}: {spot}"));
+                }
+            }
+            if shows(&answers, MARKER) {
+                shown += 1;
+                #[cfg(unix)]
+                {
+                    // The calls can change the data, so the symlink case starts from the copy.
+                    sample.restore()?;
+                    fs::write(sample.outside(), &changed)?;
+                    fs::remove_file(&target)?;
+                    std::os::unix::fs::symlink(sample.outside(), &target)?;
+                    match sample.agent_answers().await {
+                        Ok(answers) if shows(&answers, MARKER) => {
+                            leaks.push(format!("{place}: lenka followed a symlink"));
                         }
+                        Ok(_) => {}
+                        Err(error) => leaks.push(format!("{place} as a symlink: {error}")),
                     }
                 }
-                Err(error) => leaks.push(format!("{}: {field}: {error}", file.display())),
             }
             sample.restore()?;
         }
     }
     assert!(count > 40, "the suite found only {count} fields");
+    assert!(
+        shown >= MIN_SHOWN_CASES,
+        "only {shown} of {count} cases showed the marker to an agent"
+    );
     assert!(
         leaks.is_empty(),
         "{} leaks:\n{}",
@@ -429,7 +568,7 @@ async fn a_marker_in_all_copies_of_a_task_stays_in_untrusted_data() -> TestResul
 async fn an_escape_sequence_in_any_field_does_not_reach_a_terminal() -> TestResult {
     let sample = sample()?;
     let mut leaks = Vec::new();
-    for file in sample.files()? {
+    for file in sample.files(FileSet::WithFields)? {
         for (field, changed) in with_each_field(&sample.template.join(&file), ESCAPE)? {
             fs::write(sample.data.join(&file), changed)?;
             for (call, output) in sample.person_outputs()? {
@@ -449,34 +588,37 @@ async fn an_escape_sequence_in_any_field_does_not_reach_a_terminal() -> TestResu
     Ok(())
 }
 
-/// The name of a kind of damage, and the function that makes it.
-type Damage = (&'static str, fn(&Path) -> TestResult);
+/// The name of a kind of damage, and the function that makes it. The function gets the file and a
+/// free path outside the data.
+type Damage = (&'static str, fn(&Path, &Path) -> TestResult);
 
 fn damages() -> Vec<Damage> {
     #[cfg_attr(not(unix), expect(unused_mut, reason = "Only Unix adds more kinds."))]
     let mut list: Vec<Damage> = vec![
-        ("removed", |path| Ok(fs::remove_file(path)?)),
-        ("empty", |path| Ok(fs::write(path, "")?)),
-        ("not UTF-8", |path| Ok(fs::write(path, [0xff, 0xfe, 0x00])?)),
-        ("not the format", |path| {
+        ("removed", |path, _| Ok(fs::remove_file(path)?)),
+        ("empty", |path, _| Ok(fs::write(path, "")?)),
+        ("not UTF-8", |path, _| {
+            Ok(fs::write(path, [0xff, 0xfe, 0x00])?)
+        }),
+        ("not the format", |path, _| {
             Ok(fs::write(path, "[[[ {{{ +++\n")?)
         }),
-        ("a directory", |path| {
+        ("a directory", |path, _| {
             fs::remove_file(path)?;
             Ok(fs::create_dir(path)?)
         }),
     ];
     #[cfg(unix)]
     {
-        list.push(("a named pipe", |path| {
+        list.push(("a named pipe", |path, _| {
             fs::remove_file(path)?;
             let made = std::process::Command::new("mkfifo").arg(path).status()?;
             assert!(made.success());
             Ok(())
         }));
-        list.push(("a symlink out of the data", |path| {
-            let outside = path.with_extension("outside");
-            fs::write(&outside, MARKER)?;
+        // The marker test shows that lenka does not follow a symlink to a valid file.
+        list.push(("a symlink to a copy out of the data", |path, outside| {
+            fs::copy(path, outside)?;
             fs::remove_file(path)?;
             Ok(std::os::unix::fs::symlink(outside, path)?)
         }));
@@ -484,14 +626,15 @@ fn damages() -> Vec<Damage> {
     list
 }
 
-/// No damage to a file makes a call hang, or stops the server of another agent.
+/// No damage to a file makes a call hang, or stops the server of another agent. Each call must
+/// give a result or a tool error. A closed connection is a problem.
 #[tokio::test]
 async fn a_damaged_file_does_not_stop_the_tools() -> TestResult {
     let sample = sample()?;
     let mut problems = Vec::new();
-    for file in sample.files()? {
+    for file in sample.files(FileSet::All)? {
         for (name, damage) in damages() {
-            damage(&sample.data.join(&file))?;
+            damage(&sample.data.join(&file), &sample.outside())?;
             let place = format!("{} is {name}", file.display());
             match sample.agent_answers().await {
                 Ok(answers) => {
@@ -503,13 +646,7 @@ async fn a_damaged_file_does_not_stop_the_tools() -> TestResult {
                         }
                     }
                 }
-                Err(error) => {
-                    // A project with a damaged `lenka.toml` cannot open, but it must not hang.
-                    let text = error.to_string();
-                    if text.contains("hangs") {
-                        problems.push(format!("{place}: {text}"));
-                    }
-                }
+                Err(error) => problems.push(format!("{place}: {error}")),
             }
             if let Err(error) = sample.person_outputs() {
                 problems.push(format!("{place}: {error}"));

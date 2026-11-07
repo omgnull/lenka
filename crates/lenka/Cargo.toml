@@ -69,3 +69,7 @@ required-features = ["tasks", "artifacts", "memory", "mcp"]
 [[test]]
 name = "contract"
 required-features = ["tasks", "artifacts", "mcp"]
+
+[[test]]
+name = "hostile"
+required-features = ["tasks", "artifacts", "memory", "mcp"]

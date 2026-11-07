@@ -510,6 +510,16 @@ impl Index {
         if snapshot.format != SNAPSHOT_FORMAT {
             return;
         }
+        // The type and the stage appear outside `untrusted_data` in tool results. `load_task`
+        // checks them in the task files, so a snapshot must not bring other text.
+        let is_safe = |meta: &TaskMeta| {
+            lenka_core::input::is_safe_name(&meta.front.kind)
+                && lenka_core::input::is_safe_name(&meta.state.stage)
+        };
+        if !snapshot.tasks.iter().all(is_safe) {
+            tracing::warn!("ignored an index snapshot with a type or a stage that is not valid");
+            return;
+        }
         for meta in snapshot.tasks {
             self.insert(meta);
         }
