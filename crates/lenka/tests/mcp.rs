@@ -692,3 +692,29 @@ fn a_debug_log_holds_no_task_text() -> TestResult {
     assert!(!log.contains("A private title"), "{log}");
     Ok(())
 }
+
+/// `rmcp` stops the server at a notification before the first real request.
+#[test]
+fn a_notification_before_the_session_does_not_stop_the_server() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let note = |method: &str| json!({"jsonrpc": "2.0", "method": method});
+    let answers = raw_session(
+        &machine,
+        &repo,
+        &[
+            note("notifications/cancelled"),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            note("notifications/roots/list_changed"),
+            note("notifications/unknown"),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"}}}),
+            note("notifications/initialized"),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"}),
+        ],
+    )?;
+    assert_eq!(answers.len(), 3, "{answers:?}");
+    assert!(answers[2]["result"]["tools"].is_array(), "{answers:?}");
+    Ok(())
+}

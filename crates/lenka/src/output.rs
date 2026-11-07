@@ -132,9 +132,6 @@ fn print_notes(value: &Value) {
     if let Some(count) = value.get("unread_changes_omitted").and_then(Value::as_u64) {
         say!("  {count} more unread changes. Read these changes to see the others.");
     }
-    if let Some(rows) = value.get("cross_project_changes").and_then(Value::as_array) {
-        say!("Changes in other projects: {}", rows.len());
-    }
 }
 
 /// Returns a text field, or an empty text.

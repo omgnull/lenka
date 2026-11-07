@@ -707,6 +707,12 @@ impl TaskService {
         self.project.clock().now()
     }
 
+    /// Gives the stages of a type that a call names, so a wrong name is a wrong argument.
+    fn stages_of_argument(&self, kind: &str) -> Result<Vec<Stage>> {
+        self.stages_of(kind)
+            .map_err(|error| LenkaError::invalid_argument(error.message().to_owned()))
+    }
+
     fn stages_of(&self, kind: &str) -> Result<Vec<Stage>> {
         let config = self.project.config();
         config
@@ -883,7 +889,7 @@ impl TaskService {
         } else {
             new.kind.clone()
         };
-        let stages = self.stages_of(&kind)?;
+        let stages = self.stages_of_argument(&kind)?;
         let title = clean_title(&new.title)?;
         check_labels(&new.labels)?;
         for (what, count) in [
@@ -1115,7 +1121,7 @@ impl TaskService {
 
             let mut new_state = meta.state.clone();
             if let Some(kind) = &patch.kind {
-                let stages = self.stages_of(kind)?;
+                let stages = self.stages_of_argument(kind)?;
                 let found = stages.iter().position(|stage| stage.name == new_state.stage);
                 let position = found.unwrap_or(0);
                 new_state.stage = stages[position].name.clone();

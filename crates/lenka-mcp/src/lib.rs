@@ -226,7 +226,7 @@ pub fn serve_stdio(host: Arc<Host>, setup: ServerSetup) -> Result<()> {
     let server = McpServer::new(host, setup);
     let outcome = runtime.block_on(async move {
         let running = server
-            .serve(rmcp::transport::stdio())
+            .serve((session_input(), tokio::io::stdout()))
             .await
             .map_err(|error| {
                 LenkaError::new(
@@ -244,9 +244,114 @@ pub fn serve_stdio(host: Arc<Host>, setup: ServerSetup) -> Result<()> {
     outcome
 }
 
+/// Gives the standard input to `rmcp`, with no notification before the session starts.
+///
+/// Until the first request other than `ping` or `server/discover`, `rmcp` stops the server at any
+/// notification. A client can send one in this time, and no such notification has a meaning there.
+fn session_input() -> tokio::io::DuplexStream {
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let mut input = tokio::io::BufReader::new(tokio::io::stdin());
+        copy_session_input(&mut input, &mut writer).await;
+    });
+    reader
+}
+
+async fn copy_session_input<R, W>(input: &mut R, writer: &mut W)
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match input.read_until(b'\n', &mut line).await {
+            Ok(count) if count > 0 => {}
+            _ => return,
+        }
+        let kind = early_line_kind(&line);
+        if kind != EarlyLine::Notification && writer.write_all(&line).await.is_err() {
+            return;
+        }
+        if kind == EarlyLine::SessionStart {
+            break;
+        }
+    }
+    let _ = tokio::io::copy_buf(input, writer).await;
+}
+
+/// What a line of the client means before the session starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EarlyLine {
+    Notification,
+    SessionStart,
+    /// `ping`, `server/discover`, or text that `rmcp` must read and answer.
+    Other,
+}
+
+fn early_line_kind(line: &[u8]) -> EarlyLine {
+    let Ok(Value::Object(message)) = serde_json::from_slice::<Value>(line) else {
+        return EarlyLine::Other;
+    };
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return EarlyLine::Other;
+    };
+    if !message.contains_key("id") {
+        EarlyLine::Notification
+    } else if matches!(method, "ping" | "server/discover") {
+        EarlyLine::Other
+    } else {
+        EarlyLine::SessionStart
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifications_pass_after_the_session_starts() -> Result<()> {
+        let text = concat!(
+            "{\"method\":\"notifications/a\"}\n",
+            "{\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"method\":\"notifications/b\"}\n",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|err| LenkaError::io("Start the runtime", &err))?;
+        let mut output = Vec::new();
+        runtime.block_on(copy_session_input(&mut text.as_bytes(), &mut output));
+        let output = String::from_utf8_lossy(&output);
+        assert!(!output.contains("notifications/a"), "{output}");
+        assert!(output.contains("initialize"), "{output}");
+        assert!(output.contains("notifications/b"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_real_request_starts_the_session() {
+        let kind = |text: &str| early_line_kind(text.as_bytes());
+        assert_eq!(
+            kind(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#),
+            EarlyLine::Notification
+        );
+        assert_eq!(kind(r#"{"id":1,"method":"ping"}"#), EarlyLine::Other);
+        assert_eq!(
+            kind(r#"{"id":1,"method":"server/discover"}"#),
+            EarlyLine::Other
+        );
+        assert_eq!(
+            kind(r#"{"id":1,"method":"initialize"}"#),
+            EarlyLine::SessionStart
+        );
+        assert_eq!(
+            kind(r#"{"id":1,"method":"tools/list"}"#),
+            EarlyLine::SessionStart
+        );
+        assert_eq!(kind("not json"), EarlyLine::Other);
+        assert_eq!(kind(r#"{"id":1,"result":{}}"#), EarlyLine::Other);
+    }
 
     #[test]
     fn a_label_has_no_bidirectional_control() {

@@ -1935,3 +1935,22 @@ fn a_closed_output_pipe_causes_no_panic() -> TestResult {
     assert_ne!(output.status.code(), Some(101));
     Ok(())
 }
+
+#[test]
+fn a_second_init_restores_nothing() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let value = machine.json(&repo, &["init"])?;
+    assert_eq!(value["restored"], false, "{value}");
+    assert!(machine.ok(&repo, &["init"])?.contains("already set up"));
+    Ok(())
+}
+
+#[test]
+fn an_unknown_type_is_a_wrong_argument() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let args = ["task", "create", "One", "--type", "nosuch"];
+    assert!(machine.fails(&repo, &args)?.contains("invalid_argument"));
+    Ok(())
+}

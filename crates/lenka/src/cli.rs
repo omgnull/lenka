@@ -54,7 +54,7 @@ enum Command {
     /// Rebuild the index from the files.
     #[cfg(feature = "tasks")]
     Reindex,
-    /// Upgrade the data format.
+    /// Show the data format. This version has only one format, so it changes nothing.
     Migrate,
     /// Commit, fetch, merge, and push through the Git plugin.
     #[cfg(feature = "git")]
@@ -340,12 +340,22 @@ fn init_command(
         (false, Some(dir)) => Location::Directory(cwd.join(dir)),
         (false, None) => Location::Default,
     };
+    let data_in_place = data_in_place(cwd);
     let restored = if location == Location::Default {
         restore(cwd, plugins)?
     } else {
         None
     };
-    let was_restored = restored.is_some();
+    // A second `lenka init` finds the same data, and this call restores nothing.
+    let already_known = restored.as_ref().is_some_and(|directory| {
+        data_in_place.as_ref() == Some(directory)
+            && ProjectsFile::load(&paths).is_ok_and(|list| {
+                list.projects
+                    .values()
+                    .any(|entry| entry.directory == *directory)
+            })
+    });
+    let was_restored = restored.is_some() && !already_known;
     let created = match restored {
         Some(directory) => {
             check_free_name(&paths, args.name.as_deref(), &directory)?;
@@ -363,7 +373,13 @@ fn init_command(
         }));
         return Ok(());
     }
-    if was_restored {
+    if already_known {
+        say!(
+            "The project {} is already set up in {}. No change.",
+            created.name,
+            created.directory.display()
+        );
+    } else if was_restored {
         say!(
             "Restored the project {} in {}.",
             created.name,
@@ -379,6 +395,16 @@ fn init_command(
     }
     say_text!("{GUIDANCE}");
     Ok(())
+}
+
+#[cfg(feature = "git")]
+fn data_in_place(cwd: &Path) -> Option<PathBuf> {
+    lenka_git::existing_data(cwd)
+}
+
+#[cfg(not(feature = "git"))]
+fn data_in_place(_cwd: &Path) -> Option<PathBuf> {
+    None
 }
 
 #[cfg(feature = "git")]

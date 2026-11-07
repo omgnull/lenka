@@ -52,7 +52,7 @@ sha2 = "0.11.1"
 tempfile = "3"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["formatting", "parsing", "macros"] }
-tokio = { version = "1.54.1", features = ["rt", "macros", "io-std"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-std", "io-util"] }
 toml = "1.2.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
