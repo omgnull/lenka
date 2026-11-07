@@ -4430,3 +4430,26 @@ fn a_link_that_a_hand_edit_removes_gets_a_notice() -> Result<()> {
     assert_eq!(service.call_notes(&other)?.unread.len(), 1);
     Ok(())
 }
+
+#[test]
+fn a_claim_takes_the_next_task_when_a_hand_edit_closed_the_top_task() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let first = create(&service, &agent, "first")?;
+    let second = create(&service, &agent, "second")?;
+    // The edit writes no feed line, so the index still shows the first task as ready.
+    hand_edit(
+        &fx,
+        first,
+        "state.toml",
+        "status = \"todo\"",
+        "status = \"cancelled\"",
+    )?;
+    assert_eq!(service.claim(&agent, None, None, None)?.task, second);
+    assert_eq!(
+        service.detail(first, &[])?.meta.state.status,
+        Status::Cancelled
+    );
+    Ok(())
+}

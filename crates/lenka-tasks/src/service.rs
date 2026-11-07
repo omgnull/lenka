@@ -1779,14 +1779,7 @@ impl TaskService {
                     }
                     id
                 }
-                None => {
-                    let id = self
-                        .next_ready(index, caller.actor, now, &mut reader)
-                        .ok_or_else(|| LenkaError::not_found("No task is ready for this actor."))?;
-                    self.ingest_if_changed(locked, index, id, now)?;
-                    self.check_can_claim(index, id, caller, now, &mut reader)?;
-                    id
-                }
+                None => self.claimable_next(locked, index, caller, now, &mut reader)?,
             };
             let meta = index
                 .tasks
@@ -1939,16 +1932,45 @@ impl TaskService {
         Ok(())
     }
 
+    /// Selects the next ready task that a claim can take. A hand edit can make the index old, so
+    /// the selection reads each candidate again, and tries the next task if the edit closed it.
+    fn claimable_next(
+        &self,
+        locked: &mut Locked<'_>,
+        index: &mut Index,
+        caller: &Caller,
+        now: Timestamp,
+        reader: &mut LinkReader,
+    ) -> Result<TaskId> {
+        let mut rejected = HashSet::new();
+        loop {
+            let id = self
+                .next_ready(index, caller.actor, now, reader, &rejected)
+                .ok_or_else(|| LenkaError::not_found("No task is ready for this actor."))?;
+            self.ingest_if_changed(locked, index, id, now)?;
+            let still_ready = index
+                .tasks
+                .get(&id)
+                .is_some_and(|meta| self.is_ready(index, meta, caller.actor, now, reader));
+            if still_ready && self.check_can_claim(index, id, caller, now, reader).is_ok() {
+                return Ok(id);
+            }
+            rejected.insert(id);
+        }
+    }
+
     fn next_ready(
         &self,
         index: &Index,
         actor: Actor,
         now: Timestamp,
         reader: &mut LinkReader,
+        rejected: &HashSet<TaskId>,
     ) -> Option<TaskId> {
         index
             .order
             .iter()
+            .filter(|id| !rejected.contains(id))
             .filter_map(|id| index.tasks.get(id))
             .filter(|meta| self.is_ready(index, meta, actor, now, reader))
             .min_by_key(|meta| (std::cmp::Reverse(meta.front.priority), meta.id()))
