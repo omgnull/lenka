@@ -166,9 +166,16 @@ impl SettingsState {
             ("Invalid files", &report.invalid_files),
             ("Directories with a bad name", &report.bad_names),
             ("Relation cycles", &cycles),
+            ("Links to tasks that do not exist", &report.missing_links),
             ("Broken links", &report.broken_links),
             ("Unavailable links", &report.unavailable_links),
             ("Missing types or stages", &report.missing_stages),
+            ("Artifact problems", &report.artifact_problems),
+            ("Temporary files of a stopped process", &report.temp_files),
+            (
+                "Inboxes with more notices than lenka reads",
+                &report.oversize_inboxes,
+            ),
         ] {
             if !items.is_empty() {
                 ui.label(RichText::new(format!("{title} ({})", items.len())).color(palette.danger));

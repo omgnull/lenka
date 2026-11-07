@@ -25,8 +25,8 @@ use crate::markdown::{
     join_front, new_body, split_front,
 };
 use crate::model::{
-    ArtifactRecord, Claim, Entry, EntryKind, Link, Priority, State, Status, TaskFront, TaskMeta,
-    VersionMeta,
+    ArtifactRecord, ArtifactVersion, Claim, Entry, EntryKind, Link, Priority, State, Status,
+    TaskFront, TaskMeta, VersionMeta,
 };
 
 const MS_PER_MINUTE: i64 = 60_000;
@@ -313,6 +313,8 @@ pub struct ArtifactView {
     pub path: Option<String>,
     /// Tells if the bytes are here. A clone without Git LFS holds only a pointer file.
     pub downloaded: bool,
+    /// Tells if the file of the current version does not exist.
+    pub missing: bool,
 }
 
 /// The neighbors of a task, for a search of related tasks and blockers.
@@ -349,8 +351,26 @@ pub struct DoctorReport {
     pub unavailable_links: Vec<String>,
     /// Tasks with a type or a stage that the settings do not have.
     pub missing_stages: Vec<String>,
+    /// Local links to tasks that do not exist.
+    pub missing_links: Vec<String>,
+    /// Artifacts with missing or changed bytes, and artifact directories with no record.
+    pub artifact_problems: Vec<String>,
+    /// Temporary files that a stopped process left.
+    pub temp_files: Vec<String>,
+    /// Inboxes with more notices than lenka reads.
+    pub oversize_inboxes: Vec<String>,
     /// The reason that an unfinished write cannot complete. All writes stop until it can.
     pub unfinished_write: Option<String>,
+}
+
+/// How much work a project check does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DoctorDepth {
+    /// Compare the size of artifact bytes.
+    #[default]
+    Quick,
+    /// Also read all artifact bytes, and compare their hash.
+    Hashes,
 }
 
 impl DoctorReport {
@@ -363,6 +383,10 @@ impl DoctorReport {
             && self.broken_links.is_empty()
             && self.unavailable_links.is_empty()
             && self.missing_stages.is_empty()
+            && self.missing_links.is_empty()
+            && self.artifact_problems.is_empty()
+            && self.temp_files.is_empty()
+            && self.oversize_inboxes.is_empty()
             && self.unfinished_write.is_none()
     }
 }
@@ -1360,7 +1384,13 @@ impl TaskService {
             detail.plan = loaded.plan;
         }
         if parts.contains(&"entries") {
-            detail.entries = read_entries(driver, id)?;
+            let (entries, bad_files) = read_entries_with_problems(driver, id)?;
+            detail.entries = entries;
+            for name in bad_files {
+                detail.warnings.push(format!(
+                    "The entry file {name} is not valid, so this list leaves it out."
+                ));
+            }
         }
         if parts.contains(&"versions") {
             detail.versions = read_versions(driver, id)?;
@@ -2718,6 +2748,43 @@ impl TaskService {
     ///
     /// Returns an error if the data cannot be read.
     pub fn doctor(&self) -> Result<DoctorReport> {
+        self.doctor_with(DoctorDepth::Quick)
+    }
+
+    /// Removes temporary files and artifact directories with no record that a stopped process
+    /// left, and returns their names. A directory stays if a task links to it, because a person
+    /// can restore its record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock fails or a removal fails.
+    pub fn remove_leftovers(&self) -> Result<Vec<String>> {
+        let mut removed = self.project.remove_old_temp_files()?;
+        self.project.write_locked(|_locked| {
+            let mut fresh = Index::default();
+            fresh.scan(self.project.driver())?;
+            let linked: HashSet<ArtifactId> = fresh
+                .tasks
+                .values()
+                .flat_map(|meta| meta.front.artifacts.iter().copied())
+                .collect();
+            for id in old_artifact_directories(&self.project)? {
+                if !linked.contains(&id) {
+                    self.project.artifacts().delete_all(id)?;
+                    removed.push(format!("artifacts/{id}"));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Checks the project, with a choice about the read of artifact bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the check cannot read the task list.
+    pub fn doctor_with(&self, depth: DoctorDepth) -> Result<DoctorReport> {
         let mut fresh = Index::default();
         let driver = self.project.driver();
         fresh.scan(driver)?;
@@ -2740,8 +2807,27 @@ impl TaskService {
                 .map(|err| err.to_string()),
             ..DoctorReport::default()
         };
+        check_task_directories(driver, &fresh, &mut report)?;
+        check_artifacts(&self.project, depth, &mut report)?;
+        report.temp_files = self.project.old_temp_files();
+        report.oversize_inboxes = lenka_core::notices::oversize_inboxes(driver)?;
         let mut reader = LinkReader::default();
         for meta in fresh.tasks.values() {
+            let id_of = |link: &Link| match link {
+                Link::Local(target) => Some(*target),
+                Link::Remote(..) => None,
+            };
+            let parent = meta.front.parent.as_ref();
+            let links = meta.front.blocked_by.iter().chain(&meta.front.relates);
+            for target in links.filter_map(id_of).chain(parent.copied()) {
+                if !fresh.tasks.contains_key(&target) && !fresh.invalid.contains_key(&target) {
+                    report.missing_links.push(format!(
+                        "{} -> {}",
+                        meta.id().short(),
+                        target.short()
+                    ));
+                }
+            }
             if self.stage_position(meta).is_err() {
                 report.missing_stages.push(format!(
                     "{}: type {}, stage {}",
@@ -2763,6 +2849,7 @@ impl TaskService {
             }
         }
         report.invalid_files.sort();
+        report.missing_links.sort();
         report.broken_links.sort();
         report.unavailable_links.sort();
         report.missing_stages.sort();
@@ -3388,8 +3475,17 @@ fn read_last_valid(
 }
 
 fn read_entries(driver: &dyn lenka_plugin_api::StorageDriver, id: TaskId) -> Result<Vec<Entry>> {
+    read_entries_with_problems(driver, id).map(|(entries, _)| entries)
+}
+
+/// Reads the entries of a task, and returns the names of the files that are not valid.
+fn read_entries_with_problems(
+    driver: &dyn lenka_plugin_api::StorageDriver,
+    id: TaskId,
+) -> Result<(Vec<Entry>, Vec<String>)> {
     let dir = DocPath::new(format!("{}/entries", root_of(id)))?;
     let mut entries = Vec::new();
+    let mut bad_files = Vec::new();
     for name in driver.list(&dir)? {
         if !name.ends_with(".md") {
             continue;
@@ -3402,11 +3498,150 @@ fn read_entries(driver: &dyn lenka_plugin_api::StorageDriver, id: TaskId) -> Res
                 entry.text = body;
                 entries.push(entry);
             }
-            Err(error) => tracing::warn!(error = %error, "skipped an invalid entry file"),
+            Err(error) => {
+                tracing::warn!(error = %error, "skipped an invalid entry file");
+                bad_files.push(name);
+            }
         }
     }
     entries.sort_by_key(|entry| entry.id);
-    Ok(entries)
+    Ok((entries, bad_files))
+}
+
+/// Reports task directories with no task file, and entry files that are not valid.
+fn check_task_directories(
+    driver: &dyn lenka_plugin_api::StorageDriver,
+    index: &Index,
+    report: &mut DoctorReport,
+) -> Result<()> {
+    for name in driver.list(&DocPath::new("tasks")?)? {
+        let Ok(id) = TaskId::parse(&name) else {
+            continue;
+        };
+        if !index.tasks.contains_key(&id) && !index.invalid.contains_key(&id) {
+            report
+                .invalid_files
+                .push(format!("{id}: the task directory has no task file."));
+        }
+        match read_entries_with_problems(driver, id) {
+            Ok((_, bad_files)) => {
+                for file in bad_files {
+                    report
+                        .invalid_files
+                        .push(format!("{id}: the entry file {file} is not valid."));
+                }
+            }
+            Err(error) => report
+                .invalid_files
+                .push(format!("{id}: {}", error.message())),
+        }
+    }
+    Ok(())
+}
+
+/// Reports artifact records that are not valid, directories with no record, and bytes that do not
+/// match their record.
+fn check_artifacts(project: &Project, depth: DoctorDepth, report: &mut DoctorReport) -> Result<()> {
+    let old_directories = old_artifact_directories(project)?;
+    for name in project.driver().list(&DocPath::new("artifacts")?)? {
+        let Ok(id) = ArtifactId::parse(&name) else {
+            report.bad_names.push(format!("artifacts/{name}"));
+            continue;
+        };
+        let record = match read_artifact(project, id) {
+            Ok(record) => record,
+            Err(error) => {
+                report
+                    .invalid_files
+                    .push(format!("artifacts/{id}: {}", error.message()));
+                continue;
+            }
+        };
+        let Some(record) = record else {
+            if old_directories.contains(&id) {
+                report
+                    .artifact_problems
+                    .push(format!("{}: the directory has no record.", id.short()));
+            }
+            continue;
+        };
+        for item in &record.versions {
+            let problem = artifact_bytes_problem(project, id, item, depth);
+            if let Some(problem) = problem {
+                report.artifact_problems.push(format!(
+                    "{} version {}: {problem}",
+                    id.short(),
+                    item.version
+                ));
+            }
+        }
+    }
+    report.artifact_problems.sort();
+    Ok(())
+}
+
+/// Compares the bytes of one version with its record. Git LFS pointer files have another report.
+fn artifact_bytes_problem(
+    project: &Project,
+    id: ArtifactId,
+    item: &ArtifactVersion,
+    depth: DoctorDepth,
+) -> Option<String> {
+    let store = project.artifacts();
+    let path = store.local_path(id, item.version, &item.file)?;
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Some("the bytes are missing.".to_owned());
+    };
+    if is_lfs_pointer(&path) {
+        return None;
+    }
+    if meta.len() != item.size {
+        return Some("the size of the bytes differs from the record.".to_owned());
+    }
+    if depth == DoctorDepth::Hashes {
+        return match store.sha256(id, item.version, &item.file) {
+            Ok(hash) if hash == item.sha256 => None,
+            Ok(_) => Some("the hash of the bytes differs from the record.".to_owned()),
+            Err(error) => Some(error.message().to_owned()),
+        };
+    }
+    None
+}
+
+/// Returns the artifact directories with no record and with no recent change.
+fn old_artifact_directories(project: &Project) -> Result<Vec<ArtifactId>> {
+    let Some(root) = project.driver().local_dir() else {
+        return Ok(Vec::new());
+    };
+    let mut found = Vec::new();
+    for name in project.driver().list(&DocPath::new("artifacts")?)? {
+        let Ok(id) = ArtifactId::parse(&name) else {
+            continue;
+        };
+        let record = DocPath::new(format!("artifacts/{name}/artifact.toml"))?;
+        if project.driver().stat(&record)?.is_none()
+            && has_only_old_files(&root.join("artifacts").join(&name))
+        {
+            found.push(id);
+        }
+    }
+    Ok(found)
+}
+
+fn has_only_old_files(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().all(|entry| {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if meta.is_dir() {
+            has_only_old_files(&entry.path())
+        } else {
+            lenka_core::is_leftover(&meta)
+        }
+    })
 }
 
 fn read_versions(
@@ -3496,7 +3731,8 @@ pub fn artifact_view(project: &Project, record: &ArtifactRecord) -> ArtifactView
     let path = project
         .artifacts()
         .local_path(record.id, record.version, &current.file);
-    let downloaded = path.as_deref().is_none_or(|path| !is_lfs_pointer(path));
+    let missing = path.as_deref().is_some_and(|path| !path.exists());
+    let downloaded = !missing && path.as_deref().is_none_or(|path| !is_lfs_pointer(path));
     ArtifactView {
         id: record.id.short(),
         full_id: record.id.to_string(),
@@ -3507,6 +3743,7 @@ pub fn artifact_view(project: &Project, record: &ArtifactRecord) -> ArtifactView
         sha256: current.sha256.clone(),
         path: path.map(|path| path.display().to_string()),
         downloaded,
+        missing,
     }
 }
 

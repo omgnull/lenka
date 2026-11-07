@@ -449,8 +449,18 @@ impl ArtifactService {
     ///
     /// Returns an error if the data cannot be read.
     pub fn list(&self) -> Result<Vec<ArtifactRecord>> {
+        self.list_with_problems().map(|(records, _)| records)
+    }
+
+    /// Returns all artifacts, sorted by ID, and the IDs of the artifacts with an invalid record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data cannot be read.
+    pub fn list_with_problems(&self) -> Result<(Vec<ArtifactRecord>, Vec<ArtifactId>)> {
         let dir = DocPath::new("artifacts")?;
         let mut records = Vec::new();
+        let mut invalid = Vec::new();
         for name in self.project.driver().list(&dir)? {
             let Ok(id) = ArtifactId::parse(&name) else {
                 continue;
@@ -461,10 +471,11 @@ impl ArtifactService {
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(artifact = %id, code = error.code().as_str(), "skipped an invalid artifact");
+                    invalid.push(id);
                 }
             }
         }
-        Ok(records)
+        Ok((records, invalid))
     }
 
     /// Reads the bytes of a version. No version selects the current version.

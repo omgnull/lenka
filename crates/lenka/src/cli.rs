@@ -65,9 +65,9 @@ enum Command {
     Git(GitCommand),
     /// Show the compiled plugins and their state.
     Plugins,
-    /// Report invalid files, broken links, cycles, missing LFS, and network paths.
+    /// Report damaged files, broken links, cycles, missing bytes, and network paths.
     #[cfg(feature = "tasks")]
-    Doctor,
+    Doctor(DoctorOptions),
     /// Work with tasks.
     #[cfg(feature = "tasks")]
     #[command(subcommand)]
@@ -260,7 +260,7 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
             push_on_finish,
         }) => git_enable(&context, &plugins()?, remote, push_on_finish).map(|()| ok),
         #[cfg(feature = "tasks")]
-        Command::Doctor => doctor(&context, &plugins()?),
+        Command::Doctor(options) => doctor(&context, &plugins()?, &options),
         #[cfg(feature = "tasks")]
         Command::Task(command) => {
             crate::task_cmd::run(&context, &plugins()?, *command).map(|()| ok)
@@ -645,10 +645,42 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+/// The options of `lenka doctor`.
 #[cfg(feature = "tasks")]
-fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
+#[derive(Debug, clap::Args)]
+struct DoctorOptions {
+    /// Also read all artifact bytes, and compare their hash.
+    #[arg(long)]
+    hashes: bool,
+    /// Remove the temporary files and the unlinked artifact directories with no record that a
+    /// stopped process left.
+    #[arg(long)]
+    remove_leftovers: bool,
+}
+
+#[cfg(feature = "tasks")]
+fn doctor(context: &RunContext, host: &Host, options: &DoctorOptions) -> anyhow::Result<ExitCode> {
     let project = host.project_for(&context.person()?, None)?;
-    let report = lenka_tasks::service_of(&project)?.doctor()?;
+    let service = lenka_tasks::service_of(&project)?;
+    let removed = if options.remove_leftovers {
+        service.remove_leftovers()?
+    } else {
+        Vec::new()
+    };
+    let depth = if options.hashes {
+        lenka_tasks::DoctorDepth::Hashes
+    } else {
+        lenka_tasks::DoctorDepth::Quick
+    };
+    #[cfg_attr(
+        not(feature = "memory"),
+        expect(unused_mut, reason = "only the memory check adds to the report")
+    )]
+    let mut report = service.doctor_with(depth)?;
+    #[cfg(feature = "memory")]
+    report
+        .invalid_files
+        .extend(lenka_memory::memory_of(&project)?.check_files()?);
     let network = project
         .driver()
         .local_dir()
@@ -659,10 +691,14 @@ fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
         "project": project.name(),
         "clean": clean,
         "report": report,
+        "removed": removed,
         "network_file_system": network,
         "lfs_not_downloaded": not_downloaded,
     });
     context.print(&value, |_| {
+        for item in &removed {
+            say!("Removed {item}");
+        }
         if clean {
             say!("The project {} has no problems.", project.name());
             return;
@@ -679,9 +715,16 @@ fn doctor(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
         list("Bad names", &report.bad_names);
         let cycles: Vec<String> = report.cycles.iter().map(|cycle| cycle.join(" -> ")).collect();
         list("Cycles", &cycles);
+        list("Links to tasks that do not exist", &report.missing_links);
         list("Broken links", &report.broken_links);
         list("Unavailable links", &report.unavailable_links);
         list("Tasks on a missing stage", &report.missing_stages);
+        list("Artifact problems", &report.artifact_problems);
+        list(
+            "Temporary files of a stopped process. Run `lenka doctor --remove-leftovers`",
+            &report.temp_files,
+        );
+        list("Inboxes with more notices than lenka reads", &report.oversize_inboxes);
         if let Some(reason) = &report.unfinished_write {
             say!("An unfinished write stops all writes: {reason}");
         }
@@ -709,7 +752,9 @@ fn not_downloaded(project: &lenka_core::Project) -> anyhow::Result<Vec<String>> 
             continue;
         };
         if let Ok(Some(record)) = lenka_tasks::read_artifact(project, id)
-            && !lenka_tasks::artifact_view(project, &record).downloaded
+            && let view = lenka_tasks::artifact_view(project, &record)
+            && !view.downloaded
+            && !view.missing
         {
             found.push(format!("{} ({})", id.short(), record.name));
         }

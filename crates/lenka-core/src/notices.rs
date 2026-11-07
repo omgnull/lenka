@@ -157,6 +157,28 @@ pub fn hex(bytes: &[u8]) -> String {
     text
 }
 
+/// Returns the inboxes that are larger than the part that lenka reads. Lenka ignores their oldest
+/// notices.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be read.
+pub fn oversize_inboxes(driver: &dyn StorageDriver) -> Result<Vec<String>> {
+    let dir = DocPath::new(".runtime/inbox")?;
+    let mut found = Vec::new();
+    for name in driver.list(&dir)? {
+        let path = dir.join(&name)?;
+        if driver
+            .stat(&path)?
+            .is_some_and(|stat| stat.len > MAX_INBOX_READ_BYTES)
+        {
+            found.push(path.as_str().to_owned());
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
 /// Returns the path of an inbox.
 ///
 /// # Errors

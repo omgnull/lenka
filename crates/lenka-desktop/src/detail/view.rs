@@ -976,7 +976,9 @@ impl DetailState {
                                 format_bytes(artifact.size)
                             ),
                         );
-                        if !artifact.downloaded {
+                        if artifact.missing {
+                            chip(ui, "Bytes missing", palette.danger);
+                        } else if !artifact.downloaded {
                             chip(ui, "Not downloaded", palette.warning);
                         }
                     });

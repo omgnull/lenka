@@ -6,6 +6,7 @@
 mod common;
 
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use common::{Machine, TestResult, text};
 use serde_json::Value;
@@ -790,10 +791,22 @@ fn an_artifact_write_never_goes_through_a_symlink() -> TestResult {
     std::os::unix::fs::symlink(&victim, next.join("f.txt"))?;
     fs::write(repo.join("f.txt"), "bytes from an agent\n")?;
     let short = text(&created, "artifact").to_owned();
-    let _ = machine.run(
+    let output = machine.run(
         &repo,
-        &["artifact", "update", &short, "1", &file, "--reason", "r"],
+        &[
+            "artifact",
+            "update",
+            &short,
+            &file,
+            "--version",
+            "1",
+            "--reason",
+            "r",
+        ],
     )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "the write must stop");
+    assert!(stderr.contains("symlink"), "the store refuses it: {stderr}");
     assert_eq!(fs::read_to_string(&victim)?, "original");
     Ok(())
 }
@@ -1111,7 +1124,7 @@ fn a_clone_file_in_the_home_directory_applies_only_there() -> TestResult {
     let home = temp.path().join("fakehome");
     let below = home.join("code/other/deep");
     fs::create_dir_all(&below)?;
-    let run = |dir: &std::path::Path, args: &[&str]| -> Result<Value, Box<dyn std::error::Error>> {
+    let run = |dir: &Path, args: &[&str]| -> Result<Value, Box<dyn std::error::Error>> {
         let mut command = machine.command(dir, args);
         command.env("HOME", &home).env("USERPROFILE", &home);
         let output = command.output()?;
@@ -1128,5 +1141,364 @@ fn a_clone_file_in_the_home_directory_applies_only_there() -> TestResult {
     assert!(!below_list.contains("\"default\":true"), "{below_list}");
     let home_list = run(&home, &["--json", "call", "project.list"])?.to_string();
     assert!(home_list.contains("private"), "{home_list}");
+    Ok(())
+}
+
+/// Runs `lenka --json doctor`, and returns its result.
+fn doctor_of(machine: &Machine, repo: &Path, more: &[&str]) -> TestResult<Value> {
+    let mut args = vec!["--json", "doctor"];
+    args.extend_from_slice(more);
+    let output = machine.run(repo, &args)?;
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        output.status.success(),
+        value["clean"] == true,
+        "the exit code follows the result: {value}"
+    );
+    Ok(value)
+}
+
+fn task_directory(data: &Path, short: &str) -> TestResult<PathBuf> {
+    fs::read_dir(data.join("tasks"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains(short))
+        .ok_or_else(|| "the task directory exists".into())
+}
+
+/// Makes a file look as a stopped process left it long ago.
+fn make_old(path: &Path) -> TestResult<()> {
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(path)?
+        .set_modified(old)?;
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_a_missing_task_file_and_a_link_to_a_missing_task() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let one = machine.json(&repo, &["task", "create", "One"])?;
+    let one_id = text(&one, "task").to_owned();
+    let two = machine.json(&repo, &["task", "create", "Two", "--blocked-by", &one_id])?;
+    let two_id = text(&two, "task").to_owned();
+    assert_eq!(doctor_of(&machine, &repo, &[])?["clean"], true);
+
+    let dir = task_directory(&data, &one_id)?;
+    fs::remove_file(dir.join("task.md"))?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"]
+            .to_string()
+            .contains("no task file"),
+        "{value}"
+    );
+
+    fs::remove_dir_all(&dir)?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    let links = value["report"]["missing_links"].to_string();
+    assert!(
+        links.contains(&two_id) && links.contains(&one_id),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_and_show_report_a_damaged_entry_file() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(
+        &repo,
+        &[
+            "task", "entry", &id, "--kind", "comment", "--text", "A note.",
+        ],
+    )?;
+    let entries = task_directory(&data, &id)?.join("entries");
+    let file = fs::read_dir(&entries)?
+        .filter_map(Result::ok)
+        .next()
+        .ok_or("an entry file exists")?
+        .path();
+    fs::write(&file, "This is not an entry.\n")?;
+
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"]
+            .to_string()
+            .contains("entry file"),
+        "{value}"
+    );
+    let shown = machine.json(&repo, &["task", "show", &id, "--include", "entries"])?;
+    assert!(
+        shown["untrusted_data"]["warnings"]
+            .to_string()
+            .contains("not valid"),
+        "{shown}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_artifact_damage() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    fs::write(repo.join("a.txt"), "first")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let task_id = text(&task, "task").to_owned();
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let short = text(&created, "artifact").to_owned();
+    let dir = data.join("artifacts").join(&full);
+    let bytes = dir.join("versions/000001/a.txt");
+    assert_eq!(doctor_of(&machine, &repo, &[])?["clean"], true);
+    assert_eq!(doctor_of(&machine, &repo, &["--hashes"])?["clean"], true);
+
+    // Other bytes of the same size need the hash.
+    fs::write(&bytes, "other")?;
+    assert_eq!(doctor_of(&machine, &repo, &[])?["clean"], true);
+    let value = doctor_of(&machine, &repo, &["--hashes"])?;
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("hash"),
+        "{value}"
+    );
+
+    fs::write(&bytes, "another size")?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("size"),
+        "{value}"
+    );
+
+    // A missing file is not a downloaded file.
+    fs::remove_file(&bytes)?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("missing"),
+        "{value}"
+    );
+    assert_eq!(
+        value["lfs_not_downloaded"].as_array().map(Vec::len),
+        Some(0),
+        "{value}"
+    );
+    machine.json(
+        &repo,
+        &[
+            "task",
+            "update",
+            &task_id,
+            "--version",
+            "1",
+            "--artifact-add",
+            &short,
+        ],
+    )?;
+    let shown = machine.json(&repo, &["task", "show", &task_id, "--include", "artifacts"])?;
+    let row = &shown["untrusted_data"]["artifacts"][0];
+    assert_eq!(row["missing"], true, "{shown}");
+    assert_eq!(row["downloaded"], false, "{shown}");
+
+    let record = dir.join("artifact.toml");
+    fs::write(&record, "This is not TOML = = =\n")?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"].to_string().contains(&full),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_bad_memory_files() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data/memory");
+    let added = machine.json(&repo, &["memory", "add", "A memory."])?;
+    let full = text(&added, "full_id").to_owned();
+    assert_eq!(doctor_of(&machine, &repo, &[])?["clean"], true);
+    fs::write(data.join(format!("{full}.md")), "Not a record.\n")?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"].to_string().contains(&full),
+        "{value}"
+    );
+    fs::remove_file(data.join(format!("{full}.md")))?;
+    fs::write(data.join("stray.txt"), "A stray file.\n")?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"]
+            .to_string()
+            .contains("stray.txt"),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_stops_on_a_project_id_that_differs_from_the_list() -> TestResult {
+    let (temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let file = temp.path().join("config/projects.toml");
+    let old = fs::read_to_string(&file)?;
+    let line = old
+        .lines()
+        .find(|line| line.trim_start().starts_with("id = "))
+        .ok_or("the list has an ID")?;
+    let other = "id = \"01a1b33d-fde0-769e-a9d8-a92845a222ff\"";
+    fs::write(&file, old.replace(line, other))?;
+    assert_eq!(machine.fails(&repo, &["doctor"])?, "project_not_available");
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_old_leftovers_and_removes_them_on_request() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    let task_dir = task_directory(&data, &id)?;
+
+    // A new file can belong to a running writer.
+    let temp_file = task_dir.join(".tmp-99-1");
+    fs::write(&temp_file, "bytes")?;
+    let orphan = data.join("artifacts/01a1b33d-fde0-769e-a9d8-a92845a222ff/versions/000001");
+    fs::create_dir_all(&orphan)?;
+    let orphan_file = orphan.join(".tmp-1");
+    fs::write(&orphan_file, "bytes")?;
+    assert_eq!(doctor_of(&machine, &repo, &[])?["clean"], true);
+    doctor_of(&machine, &repo, &["--remove-leftovers"])?;
+    assert!(
+        temp_file.exists() && orphan_file.exists(),
+        "a recent file stays"
+    );
+
+    make_old(&temp_file)?;
+    make_old(&orphan_file)?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["temp_files"]
+            .to_string()
+            .contains(".tmp-99-1"),
+        "{value}"
+    );
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("no record"),
+        "{value}"
+    );
+
+    let value = doctor_of(&machine, &repo, &["--remove-leftovers"])?;
+    assert_eq!(value["clean"], true, "{value}");
+    assert!(
+        value["removed"].to_string().contains(".tmp-99-1"),
+        "{value}"
+    );
+    assert!(!temp_file.exists());
+    assert!(
+        !data
+            .join("artifacts/01a1b33d-fde0-769e-a9d8-a92845a222ff")
+            .exists()
+    );
+    machine.json(&repo, &["task", "show", &id])?;
+    Ok(())
+}
+
+/// A person can restore the record of an artifact that a task links to.
+#[test]
+fn the_removal_of_leftovers_keeps_the_bytes_of_a_linked_artifact() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    fs::write(repo.join("a.txt"), "first")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let task_id = text(&task, "task").to_owned();
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let short = text(&created, "artifact").to_owned();
+    machine.json(
+        &repo,
+        &[
+            "task",
+            "update",
+            &task_id,
+            "--version",
+            "1",
+            "--artifact-add",
+            &short,
+        ],
+    )?;
+    let dir = data.join("artifacts").join(&full);
+    let bytes = dir.join("versions/000001/a.txt");
+    fs::remove_file(dir.join("artifact.toml"))?;
+    make_old(&bytes)?;
+    let value = doctor_of(&machine, &repo, &["--remove-leftovers"])?;
+    assert!(bytes.exists(), "the linked bytes stay");
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("no record"),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_an_oversize_inbox_and_show_still_works() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    let inbox = data.join(".runtime/inbox");
+    fs::create_dir_all(&inbox)?;
+    let file = fs::File::create(inbox.join("large.jsonl"))?;
+    file.set_len(17 * 1024 * 1024)?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["oversize_inboxes"]
+            .to_string()
+            .contains("large.jsonl"),
+        "{value}"
+    );
+    machine.json(&repo, &["task", "show", &id])?;
+    Ok(())
+}
+
+#[test]
+fn artifact_list_names_an_invalid_record() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    fs::write(repo.join("a.txt"), "first")?;
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let short = text(&created, "artifact").to_owned();
+    fs::write(
+        data.join("artifacts").join(&full).join("artifact.toml"),
+        "This is not TOML = = =\n",
+    )?;
+    let value = machine.json(&repo, &["artifact", "list"])?;
+    assert_eq!(value["invalid_records"][0], short.as_str(), "{value}");
+    let human = machine.ok(&repo, &["artifact", "list"])?;
+    assert!(
+        human.contains("not valid") && !human.contains("No artifacts"),
+        "{human}"
+    );
     Ok(())
 }

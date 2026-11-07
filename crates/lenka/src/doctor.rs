@@ -20,6 +20,12 @@ const NETWORK_TYPES: &[&str] = &[
     "gpfs",
     "9p",
     "beegfs",
+    "davfs",
+    "vboxsf",
+    "fuse.sshfs",
+    "fuse.rclone",
+    "fuse.glusterfs",
+    "fuse.ceph",
 ];
 
 /// Reads the type of the mount that holds a path, from the text of `/proc/self/mountinfo`.
@@ -71,7 +77,7 @@ fn unescape(field: &str) -> String {
 /// Tells if a mount type is a network file system.
 #[must_use]
 pub fn is_network_type(kind: &str) -> bool {
-    NETWORK_TYPES.contains(&kind) || kind == "fuse.sshfs" || kind == "fuse.rclone"
+    NETWORK_TYPES.contains(&kind)
 }
 
 /// Returns the network mount type of a path. Only Linux can show this.
@@ -115,6 +121,8 @@ bad line
     fn network_types() {
         assert!(is_network_type("nfs4"));
         assert!(is_network_type("fuse.sshfs"));
+        assert!(is_network_type("fuse.glusterfs"));
+        assert!(is_network_type("vboxsf"));
         assert!(!is_network_type("ext4"));
         assert!(!is_network_type("btrfs"));
     }

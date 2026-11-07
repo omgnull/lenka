@@ -351,6 +351,31 @@ impl MemoryService {
         })
     }
 
+    /// Reports the files of the memory directory that the tools skip.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read.
+    pub fn check_files(&self) -> Result<Vec<String>> {
+        let mut problems = Vec::new();
+        for name in self.project.driver().list(&DocPath::new(MEMORY_DIR)?)? {
+            if name.starts_with(lenka_core::layout::TEMP_PREFIX) {
+                continue;
+            }
+            let id = name
+                .strip_suffix(".md")
+                .and_then(|stem| MemoryId::parse(stem).ok());
+            let Some(id) = id else {
+                problems.push(format!("memory/{name}: this is not a memory file."));
+                continue;
+            };
+            if let Err(error) = self.read_record(id) {
+                problems.push(format!("memory/{name}: {}", error.message()));
+            }
+        }
+        Ok(problems)
+    }
+
     /// Returns all valid records, sorted by ID, which is the order of time. An invalid file is
     /// skipped with a warning, because one bad file must not hide the other records.
     ///

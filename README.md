@@ -140,6 +140,11 @@ A link shows only the title, status, and stage of its target.
 
 A drawing is an artifact with the media type `application/vnd.lenka.drawing+json`. Its file is sorted, formatted JSON, so Git can compare it. An agent can read and write this file through `artifact.update`, and an open desktop app shows the new version.
 
+`lenka doctor` reports damaged files, broken links, missing artifact bytes, and files that a stopped process left. Its exit code is not zero if it finds a problem. It has two options:
+
+- `--hashes` also reads all artifact bytes and compares their hash.
+- `--remove-leftovers` removes temporary files and artifact directories with no record, if they had no change for 10 minutes. A directory stays if a task links to it.
+
 ## Plugins
 
 All features are plugins. Cargo features select lenka's own plugins:

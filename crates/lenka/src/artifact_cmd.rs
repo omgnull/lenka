@@ -78,7 +78,11 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
         ArtifactCommand::Delete { artifact } => ("artifact.delete", json!({"artifact": artifact})),
         ArtifactCommand::List => {
             let project = host.project_for(&caller, None)?;
-            let records = artifacts_of(&project)?.list()?;
+            let (records, invalid) = artifacts_of(&project)?.list_with_problems()?;
+            let invalid: Vec<String> = invalid
+                .iter()
+                .map(lenka_plugin_api::ArtifactId::short)
+                .collect();
             let rows: Vec<Value> = records
                 .iter()
                 .map(|record| {
@@ -91,10 +95,13 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
                     })
                 })
                 .collect();
-            let value = json!({"artifacts": rows});
+            let value = json!({"artifacts": rows, "invalid_records": invalid});
             context.print(&value, |_| {
-                if rows.is_empty() {
+                if rows.is_empty() && invalid.is_empty() {
                     say!("No artifacts.");
+                }
+                for id in &invalid {
+                    say!("{id}  The record of this artifact is not valid. Run `lenka doctor`.");
                 }
                 for row in &rows {
                     say!(

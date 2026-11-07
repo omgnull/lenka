@@ -2568,6 +2568,41 @@ fn reach_loop_limit(service: &TaskService, agent: &Caller, id: TaskId) -> Result
     Ok(())
 }
 
+/// The state of a task with invalid files is not known, so the task still blocks others.
+#[test]
+fn an_invalid_blocker_with_no_record_still_blocks() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let blocker = create(&service, &human, "Blocker")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Local(blocker)],
+        ..task("Blocked")
+    };
+    let blocked = service.create(&human, new)?.id();
+    fs::write(task_file(&fx, blocker, "task.md"), "not a task\n")
+        .map_err(|err| LenkaError::io("write", &err))?;
+    let versions = task_file(&fx, blocker, "versions");
+    if versions.exists() {
+        fs::remove_dir_all(versions).map_err(|err| LenkaError::io("remove", &err))?;
+    }
+    // A new process with no snapshot has no earlier record of the task.
+    fs::remove_dir_all(fx.data_dir("api").join(".runtime"))
+        .map_err(|err| LenkaError::io("remove", &err))?;
+    let other_host = build_host(&fx.paths, &fx.clock)?;
+    let fresh = service_of(&other_host.open_by_name("api")?)?;
+    let shown = fresh.detail(blocked, &[])?;
+    assert_eq!(shown.blockers.len(), 1);
+    assert_eq!(shown.blockers[0].id, blocker.short());
+    assert_eq!(shown.blockers[0].title, None);
+    assert_eq!(
+        code(fresh.claim(&agent, Some(blocked), None, None)),
+        ErrorCode::Blocked
+    );
+    assert!(ready_ids(&fresh, &agent)?.is_empty());
+    Ok(())
+}
+
 #[test]
 fn a_stage_completion_by_a_person_ends_the_loop_stop() -> Result<()> {
     let fx = fixture()?;

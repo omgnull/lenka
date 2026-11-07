@@ -110,6 +110,13 @@ fn project_form<'a>(harness: &'a mut Harness<'static, TestApp>) -> &'a mut NewPr
     }
 }
 
+/// Sets the path as a folder pick does. A dialog takes a new place one frame after a new size, so
+/// the test waits for that frame before the next click.
+fn set_directory(harness: &mut Harness<'static, TestApp>, folder: &std::path::Path) {
+    project_form(harness).directory = folder.display().to_string();
+    harness.run_steps(3);
+}
+
 fn pending_pick(harness: &mut Harness<'static, TestApp>) -> PendingFolder {
     project_form(harness)
         .pending
@@ -204,7 +211,7 @@ fn a_new_project_needs_an_absolute_path_and_a_clean_directory() {
     let folder = fixture.root.join("documents");
     std::fs::create_dir_all(&folder).expect("a folder");
     std::fs::write(folder.join("notes.txt"), "text").expect("a file");
-    project_form(&mut harness).directory = folder.display().to_string();
+    set_directory(&mut harness, &folder);
     click(&mut harness, "Create project");
     let message = project_form(&mut harness)
         .error
@@ -1245,10 +1252,22 @@ fn the_project_check_shows_a_stuck_write() {
     click(&mut harness, "Settings");
     harness.state_mut().app_mut().settings.doctor = Some(lenka_tasks::DoctorReport {
         unfinished_write: Some("The path tasks/a is a directory.".to_owned()),
+        missing_links: vec!["a missing link".to_owned()],
+        artifact_problems: vec!["an artifact problem".to_owned()],
+        temp_files: vec!["a temporary file".to_owned()],
+        oversize_inboxes: vec!["a large inbox".to_owned()],
         ..lenka_tasks::DoctorReport::default()
     });
     harness.run_steps(3);
     assert!(has_label(&harness, "The path tasks/a is a directory."));
+    for item in [
+        "a missing link",
+        "an artifact problem",
+        "a temporary file",
+        "a large inbox",
+    ] {
+        assert!(has_label(&harness, item), "{item}");
+    }
 }
 
 #[test]
@@ -1850,9 +1869,12 @@ fn the_dialog_keeps_a_path_as_it_is_and_clears_an_old_error() {
         "an edit clears the error"
     );
 
-    let folder = fixture.root.join("chosen ");
+    // Windows removes a space at the end of a folder name, so only other systems can test it.
+    let folder = fixture
+        .root
+        .join(if cfg!(windows) { " chosen" } else { "chosen " });
     std::fs::create_dir_all(&folder).expect("a folder");
-    project_form(&mut harness).directory = folder.display().to_string();
+    set_directory(&mut harness, &folder);
     click(&mut harness, "Create project");
     assert_eq!(open_project_name(&harness), "api");
     assert!(
@@ -1873,7 +1895,7 @@ fn a_folder_with_another_driver_keeps_the_open_project_and_the_list() {
     click(&mut harness, "Project");
     click(&mut harness, "New project");
     type_into(&mut harness, "Project name", "foreign");
-    project_form(&mut harness).directory = folder.display().to_string();
+    set_directory(&mut harness, &folder);
     click(&mut harness, "Create project");
     let message = project_form(&mut harness)
         .error

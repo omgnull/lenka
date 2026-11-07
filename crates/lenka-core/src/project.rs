@@ -19,6 +19,9 @@ use crate::notices::ProjectEvent;
 use crate::secret::{self, SecretPolicy, TextCheck};
 use crate::settings::{PROJECT_FILE, ProjectConfig};
 
+/// The age after which a temporary file or an artifact directory with no record has no writer.
+pub const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// A group of document changes with its checks.
 #[derive(Debug, Default)]
 pub struct Commit {
@@ -184,6 +187,39 @@ impl Project {
         }
     }
 
+    /// Returns the temporary files that a stopped process left, with paths from the data
+    /// directory. A writer changes its file all the time, so an old file has no writer.
+    #[must_use]
+    pub fn old_temp_files(&self) -> Vec<String> {
+        let Some(root) = self.driver.local_dir() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        collect_old_temp_files(root, root, &mut found);
+        found.sort();
+        found
+    }
+
+    /// Removes the temporary files that a stopped process left, under the write lock. These files
+    /// are not data, so this write does not use the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock fails or a file cannot be removed.
+    pub fn remove_old_temp_files(&self) -> Result<Vec<String>> {
+        self.write_locked(|_locked| {
+            let found = self.old_temp_files();
+            let Some(root) = self.driver.local_dir() else {
+                return Ok(found);
+            };
+            for path in &found {
+                std::fs::remove_file(root.join(path))
+                    .map_err(|err| LenkaError::io("Remove a temporary file", &err))?;
+            }
+            Ok(found)
+        })
+    }
+
     /// Saves settings that a person edited from `base`.
     ///
     /// A change of the file after the load of `base` stops the save, because the save would
@@ -343,6 +379,39 @@ impl Project {
 
 fn extension_error() -> LenkaError {
     LenkaError::new(ErrorCode::Io, "A project service has the wrong type.")
+}
+
+/// Tells if a file or a directory had no change for the time in [`LEFTOVER_AGE`].
+#[must_use]
+pub fn is_leftover(meta: &std::fs::Metadata) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age >= LEFTOVER_AGE)
+}
+
+fn collect_old_temp_files(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let (name, path) = (entry.file_name(), entry.path());
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if name != ".git" {
+                collect_old_temp_files(root, &path, found);
+            }
+        } else if name
+            .to_string_lossy()
+            .starts_with(crate::layout::TEMP_PREFIX)
+            && is_leftover(&meta)
+            && let Ok(relative) = path.strip_prefix(root)
+        {
+            found.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
 }
 
 fn read_config(driver: &dyn StorageDriver) -> Result<ProjectConfig> {

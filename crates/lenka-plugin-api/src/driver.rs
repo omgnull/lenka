@@ -244,6 +244,14 @@ pub trait ArtifactStore: Send + Sync + fmt::Debug {
     /// Returns an error if the bytes cannot be read.
     fn get(&self, id: ArtifactId, version: u64, name: &str) -> Result<Vec<u8>>;
 
+    /// Calculates the SHA-256 hash of the bytes of a version, with a small part in memory at each
+    /// time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes cannot be read.
+    fn sha256(&self, id: ArtifactId, version: u64, name: &str) -> Result<String>;
+
     /// Reads the bytes of a version, and stops after `max_bytes`. A store must not read a larger
     /// file into memory.
     ///

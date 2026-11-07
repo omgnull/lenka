@@ -211,6 +211,25 @@ impl ArtifactStore for FsStore {
         fs::read(&file).map_err(|err| LenkaError::io("Read the artifact", &err))
     }
 
+    fn sha256(&self, id: ArtifactId, version: u64, name: &str) -> Result<String> {
+        let path = self.file_of(id, version, name)?;
+        self.check_no_symlink(&path)?;
+        let mut input =
+            File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let count = input
+                .read(&mut buffer)
+                .map_err(|err| LenkaError::io("Read the artifact", &err))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        Ok(digest_text(hasher))
+    }
+
     fn get_limited(
         &self,
         id: ArtifactId,
@@ -273,6 +292,7 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(store.get(id, 1, "a.txt")?, b"abc");
+        assert_eq!(store.sha256(id, 1, "a.txt")?, stored.sha256);
 
         let source = temp.path().join("source.bin");
         fs::write(&source, b"abc").map_err(|err| LenkaError::io("write", &err))?;
