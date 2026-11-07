@@ -433,7 +433,7 @@ fn a_directory_inside_a_clone_never_commits_to_the_code() -> TestResult {
             let project = machine.project("plan")?;
 
             // Without `enable`, a sync refuses. The parent repository stays as it was.
-            assert!(sync(&project).is_err());
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse).is_err());
             assert_eq!(git(&repo, &["log", "--format=%s"])?, "code");
 
             let report = enable(
@@ -469,7 +469,7 @@ fn a_bad_remote_in_the_settings_is_refused() -> TestResult {
                 &dir,
                 &["config", "--local", "lenka.remote", "--upload-pack=touch x"],
             )?;
-            assert!(sync(&project).is_err());
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse).is_err());
             git(&dir, &["config", "--local", "lenka.remote", "origin"])?;
 
             let options = EnableOptions {
@@ -521,7 +521,7 @@ fn a_fresh_clone_restores_all_tasks_and_artifact_bytes() -> TestResult {
                 None,
             )?;
 
-            let report = sync(&project)?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.committed);
             assert!(report.pushed);
             assert!(!report.has_conflict());
@@ -569,8 +569,8 @@ fn a_fresh_clone_restores_all_tasks_and_artifact_bytes() -> TestResult {
 
             // New work in the fresh clone reaches the first clone.
             let added = add_task(&restored_tasks, "From the clone")?;
-            assert!(sync(&restored)?.pushed);
-            let report = sync(&project)?;
+            assert!(sync(&restored, lenka_git::OutgoingSecrets::Refuse)?.pushed);
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.merged);
             service.reindex(&person())?;
             assert_eq!(
@@ -626,7 +626,7 @@ fn git_lfs_sends_the_artifact_bytes_and_a_fresh_clone_gets_them() -> TestResult 
                 None,
                 None,
             )?;
-            assert!(sync(&project)?.pushed);
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.pushed);
 
             // The branch holds a pointer file, and the remote holds the bytes.
             let files = git(
@@ -700,7 +700,7 @@ fn a_conflict_stops_the_merge_and_lists_the_files() -> TestResult {
             let project = first.project("api")?;
             let service = service_of(&project)?;
             let id = add_task(&service, "A task")?;
-            assert!(sync(&project)?.pushed);
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.pushed);
 
             let clone = second_root.join("clone");
             git_os(
@@ -722,10 +722,10 @@ fn a_conflict_stops_the_merge_and_lists_the_files() -> TestResult {
 
             change_text(&service, id, "The text of the first clone.")?;
             change_text(&restored_tasks, id, "The text of the second clone.")?;
-            assert!(sync(&project)?.pushed);
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.pushed);
 
             let head = git(&data, &["rev-parse", "HEAD"])?;
-            let report = sync(&restored)?;
+            let report = sync(&restored, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.has_conflict());
             assert!(!report.pushed);
             assert!(!report.merged);
@@ -797,7 +797,7 @@ fn a_shared_project_uses_its_own_repository_and_a_remote_url() -> TestResult {
             assert!(created.directory.join(".git").is_dir());
 
             // A sync with no change is safe.
-            let report = sync(&project)?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.pushed);
             assert!(!report.committed);
             assert!(!report.merged);
@@ -816,7 +816,7 @@ fn a_sync_with_no_remote_only_commits() -> TestResult {
         let project = machine.project("api")?;
         let service = service_of(&project)?;
         add_task(&service, "A task")?;
-        let report = sync(&project)?;
+        let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
         assert!(report.committed);
         assert!(!report.pushed);
         assert_eq!(report.remote, None);
@@ -864,7 +864,7 @@ fn two_clones(root: &Path, url_of: fn(&Path) -> String) -> TestResult<TwoClones>
     git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/main"])?;
     enable_default(&first, &repo, "api")?;
     let project = first.project("api")?;
-    assert!(sync(&project)?.pushed);
+    assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.pushed);
     let first_data = project_dir_of(&project);
 
     let second = Machine::new(&second_root)?;
@@ -955,7 +955,7 @@ fn a_dangling_lfs_pointer_does_not_stop_a_sync_or_a_restore() -> TestResult {
             )?;
 
             let project = clones.second.project("api")?;
-            let report = sync(&project)?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.merged, "{report:?}");
             assert!(report.is_complete(), "{report:?}");
             assert!(report.lfs_warning.is_some(), "{report:?}");
@@ -1005,7 +1005,7 @@ fn a_local_pointer_with_no_object_does_not_stop_a_push() -> TestResult {
             fs::write(file, dangling_pointer())?;
 
             let project = clones.first.project("api")?;
-            let report = sync(&project)?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
             assert!(report.is_complete(), "{report:?}");
             assert!(report.pushed, "{report:?}");
             let listed = git(
@@ -1058,7 +1058,7 @@ fn a_failed_merge_puts_the_tree_back() -> TestResult {
         let project = clones.second.project("api")?;
         let head = git(data, &["rev-parse", "HEAD"])?;
         for _ in 0..2 {
-            assert!(sync(&project).is_err());
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse).is_err());
             assert_eq!(git(data, &["status", "--porcelain"])?, "");
             assert_eq!(git(data, &["rev-parse", "HEAD"])?, head);
             assert!(!data.join(&memory).exists());
@@ -1079,14 +1079,14 @@ fn a_stopped_process_after_a_merge_still_gets_a_reindex() -> TestResult {
             let source = clones.first.project("api")?;
             let service = service_of(&source)?;
             add_task(&service, "New")?;
-            assert!(sync(&source)?.pushed);
+            assert!(sync(&source, lenka_git::OutgoingSecrets::Refuse)?.pushed);
 
             let project = clones.second.project("api")?;
-            assert!(sync(&project)?.merged);
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.merged);
             // The process stopped here, so a later sync tells the caller again.
-            assert!(sync(&project)?.merged);
+            assert!(sync(&project, lenka_git::OutgoingSecrets::Refuse)?.merged);
             mark_indexed(&project)?;
-            assert!(!sync(&project)?.merged);
+            assert!(!sync(&project, lenka_git::OutgoingSecrets::Refuse)?.merged);
             Ok(())
         },
     )
@@ -1101,8 +1101,8 @@ fn a_merge_with_nothing_new_does_not_ask_for_a_reindex() -> TestResult {
             let temp = tempfile::tempdir()?;
             let clones = two_clones(temp.path(), plain_path)?;
             let project = clones.second.project("api")?;
-            assert!(!sync(&project)?.merged);
-            assert!(!sync(&project)?.merged);
+            assert!(!sync(&project, lenka_git::OutgoingSecrets::Refuse)?.merged);
+            assert!(!sync(&project, lenka_git::OutgoingSecrets::Refuse)?.merged);
             assert_eq!(
                 Command::new("git")
                     .args(["config", "--local", "lenka.needsReindex"])

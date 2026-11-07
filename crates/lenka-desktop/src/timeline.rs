@@ -4,11 +4,29 @@
 //! The calculations of the roadmap and the Gantt chart. This module has no UI.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use lenka_plugin_api::{Day, TaskId};
 use lenka_tasks::{BoardRow, Link, TaskFront};
 
 use crate::data::BoardModel;
+
+/// The offset of the local time from UTC, in seconds.
+static LOCAL_OFFSET: OnceLock<i32> = OnceLock::new();
+
+/// Reads the local offset. Call this before the app starts other threads, because the library
+/// refuses the read on some systems after that. A failed read gives UTC.
+pub(crate) fn remember_local_offset() {
+    LOCAL_OFFSET.get_or_init(|| {
+        time::UtcOffset::current_local_offset().map_or(0, time::UtcOffset::whole_seconds)
+    });
+}
+
+/// Returns today for the person at this machine.
+pub(crate) fn local_today() -> Day {
+    let offset = LOCAL_OFFSET.get().copied().unwrap_or(0);
+    Day::at_offset(time::OffsetDateTime::now_utc().unix_timestamp(), offset)
+}
 
 /// A range of days, with the first day and the last day. Both are day numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -40,6 +40,13 @@ pub fn real_path(path: &Path) -> std::io::Result<PathBuf> {
 /// Removes the Windows prefix for an extended path, from a drive path or a network path.
 fn without_verbatim_prefix(text: &str) -> Option<String> {
     let rest = text.strip_prefix(r"\\?\")?;
+    // Windows removes such an end from a plain path, and the plain path then names another file.
+    if rest
+        .split('\\')
+        .any(|part| part.ends_with('.') || part.ends_with(' '))
+    {
+        return None;
+    }
     if let Some(network) = rest.strip_prefix(r"UNC\") {
         return Some(format!(r"\\{network}"));
     }
@@ -114,6 +121,9 @@ mod tests {
             Some(r"\\host\share")
         );
         assert_eq!(plain(r"\\?\Volume{abc}\repo"), None);
+        assert_eq!(plain(r"\\?\C:\work\repo."), None);
+        assert_eq!(plain(r"\\?\C:\work \repo"), None);
+        assert_eq!(plain(r"\\?\UNC\host\share."), None);
         assert_eq!(plain(r"C:\work"), None);
         assert_eq!(plain("/work/repo"), None);
     }

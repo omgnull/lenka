@@ -2315,3 +2315,22 @@ fn a_date_that_a_person_types_stays_after_another_change() {
     let detail = harness.state().app().detail.as_ref().expect("a panel");
     assert_eq!(detail.start_input_text(), "2026-0");
 }
+
+/// The text of each small field counts as unsaved work, so that the app asks before it loses it.
+#[test]
+fn text_in_a_small_field_counts_as_unsaved() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["A task"]);
+    open_detail(&mut harness, "A task");
+    for field in 0..5 {
+        let detail = harness
+            .state_mut()
+            .app_mut()
+            .detail
+            .as_mut()
+            .expect("a panel");
+        assert!(!detail.has_unsaved_text(), "field {field}");
+        detail.type_in_small_field(field, "2026-0");
+        assert!(detail.has_unsaved_text(), "field {field}");
+        detail.type_in_small_field(field, "");
+    }
+}

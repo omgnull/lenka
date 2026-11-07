@@ -7,7 +7,7 @@
 //! from another clone can hold only these files. So one stray file cannot stop the sync of another
 //! clone, and a remote cannot add a file that Git or lenka reads as a control file.
 
-use lenka_plugin_api::{ArtifactId, EntryId, MemoryId, TaskId};
+use lenka_plugin_api::{ArtifactId, DocPath, EntryId, MemoryId, TaskId};
 
 /// The start of the name of a temporary file. A stopped process can leave such a file.
 pub const TEMP_PREFIX: &str = ".tmp-";
@@ -60,6 +60,7 @@ pub fn is_artifact_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_ARTIFACT_FILE_NAME
         && !name.starts_with('.')
+        && DocPath::new(name).is_ok()
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))

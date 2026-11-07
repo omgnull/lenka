@@ -129,6 +129,18 @@ impl Day {
         Self(OffsetDateTime::now_utc().date())
     }
 
+    /// Returns the day of a moment at an offset from UTC. A value outside the known range gives
+    /// the day of the Unix epoch.
+    #[must_use]
+    pub fn at_offset(unix_seconds: i64, offset_seconds: i32) -> Self {
+        let local = unix_seconds.saturating_add(i64::from(offset_seconds));
+        Self(
+            OffsetDateTime::from_unix_timestamp(local)
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+                .date(),
+        )
+    }
+
     /// Returns the day number, for date calculations. Day numbers are consecutive.
     #[must_use]
     pub fn number(self) -> i32 {
@@ -197,6 +209,16 @@ impl From<Day> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_moment_has_the_local_day_of_its_offset() {
+        // 2026-03-15 23:30 UTC.
+        let moment = 1_773_617_400;
+        assert_eq!(Day::at_offset(moment, 0).to_string(), "2026-03-15");
+        assert_eq!(Day::at_offset(moment, 3_600).to_string(), "2026-03-16");
+        assert_eq!(Day::at_offset(moment, -3_600).to_string(), "2026-03-15");
+        assert_eq!(Day::at_offset(i64::MAX, 0).to_string(), "1970-01-01");
+    }
 
     #[test]
     fn a_time_keeps_its_value_in_a_round_trip() {

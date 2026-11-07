@@ -764,6 +764,47 @@ fn a_conflict_marker_in_a_local_file_is_not_committed() -> TestResult {
     Ok(())
 }
 
+/// A hand edit gets no secret check at its write, so the last place for a check is the push.
+#[test]
+fn a_sync_does_not_push_a_secret_from_a_hand_edit() -> TestResult {
+    let pair = pair()?;
+    let (first, _second) = two_clones(&pair)?;
+    let task = pair.first.json(&first, &["task", "create", "A task"])?;
+    pair.first.json(&first, &["sync"])?;
+    let id = text(&task, "task").to_owned();
+    let data = first.join(".git/lenka-data");
+    let task_dir = fs::read_dir(data.join("tasks"))?
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().contains(id.as_str()))
+        .ok_or("the task directory exists")?;
+    let full_id = task_dir.file_name().to_string_lossy().into_owned();
+    let file = task_dir.path().join("task.md");
+    let token = format!("{}{}", "ghp_", "a1B2".repeat(10));
+    fs::write(&file, format!("{}\n{token}\n", fs::read_to_string(&file)?))?;
+
+    let (passed, report) = sync_report(&pair.first, &first)?;
+    assert!(!passed, "{report}");
+    assert_eq!(report["pushed"], false, "{report}");
+    let error = report["push_error"].as_str().unwrap_or_default();
+    assert!(error.contains("allow-secret"), "{report}");
+    assert!(error.contains(full_id.as_str()), "{report}");
+    let on_remote = pair.first.git(
+        &data,
+        &[
+            "show",
+            &format!("origin/lenka-data:tasks/{full_id}/task.md"),
+        ],
+    )?;
+    assert!(!on_remote.contains(&token), "the token reached the remote");
+
+    let output = pair
+        .first
+        .run(&first, &["sync", "--allow-secret", "--json"])?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["pushed"], true, "{report}");
+    Ok(())
+}
+
 #[test]
 fn a_failed_push_still_reports_the_merge_and_rebuilds_the_index() -> TestResult {
     let pair = pair()?;

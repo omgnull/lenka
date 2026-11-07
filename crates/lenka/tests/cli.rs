@@ -2020,3 +2020,43 @@ fn an_argument_that_is_not_text_causes_no_panic() -> TestResult {
     assert_eq!(output.status.code(), Some(2));
     Ok(())
 }
+
+/// lenka checks each path before the journal write, so a bad path shows a journal of another origin.
+#[test]
+fn a_journal_with_a_bad_path_does_not_stop_the_project() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    machine.json(&repo, &["task", "create", "A task"])?;
+    let runtime = repo.join(".git/lenka-data/.runtime");
+    let journal = runtime.join("pending.json");
+    let outside = repo.join(".git/outside");
+    fs::write(
+        &journal,
+        r#"[{"op":"put","path":"../../outside","text":"bad"}]"#,
+    )?;
+    let listed = machine.json(&repo, &["task", "list"])?;
+    assert!(listed.to_string().contains("A task"), "{listed}");
+    machine.json(&repo, &["task", "create", "Another task"])?;
+    assert!(
+        !outside.exists(),
+        "a journal must not write outside the data"
+    );
+    assert!(fs::read(&journal)?.is_empty(), "the journal must go");
+    Ok(())
+}
+
+/// A wrong name in the list has no effect, so a person must learn about it.
+#[test]
+fn a_wrong_plugin_name_gives_a_warning() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    fs::write(
+        machine.root.join("config/plugins.toml"),
+        "disabled = [\"taks\"]\n",
+    )?;
+    let output = machine.run(&repo, &["task", "list"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("taks"), "{stderr}");
+    assert!(stderr.contains("plugins.toml"), "{stderr}");
+    Ok(())
+}

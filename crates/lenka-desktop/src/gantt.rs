@@ -50,7 +50,7 @@ fn overall_span(rows: &[GanttRow]) -> DaySpan {
         .map(|row| row.span)
         .reduce(DaySpan::union)
         .unwrap_or_else(|| {
-            let today = Day::today().number();
+            let today = crate::timeline::local_today().number();
             DaySpan {
                 start: today - 7,
                 end: today + 30,

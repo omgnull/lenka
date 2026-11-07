@@ -8,7 +8,7 @@ use egui::{
     Align2, FontId, Id, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind, Ui, Vec2,
     WidgetInfo,
 };
-use lenka_plugin_api::{Day, TaskId};
+use lenka_plugin_api::TaskId;
 
 use crate::actions::Action;
 use crate::chart::{AXIS_HEIGHT, AxisKind, draw_axis, draw_today, zoom_and_pan, zoom_buttons};
@@ -33,7 +33,7 @@ fn overall_span(rows: &[Rollup]) -> DaySpan {
         .filter_map(|row| row.span)
         .reduce(DaySpan::union)
         .unwrap_or_else(|| {
-            let today = Day::today().number();
+            let today = crate::timeline::local_today().number();
             DaySpan {
                 start: today - 30,
                 end: today + 120,

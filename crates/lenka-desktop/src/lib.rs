@@ -46,6 +46,7 @@ pub fn run(
     caller: lenka_plugin_api::Caller,
     project: Option<String>,
 ) -> anyhow::Result<()> {
+    timeline::remember_local_offset();
     // Load the fonts first, so that the app opens no window with no text.
     let fonts = fonts::load_system()?;
     let options = eframe::NativeOptions {

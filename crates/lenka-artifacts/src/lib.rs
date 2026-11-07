@@ -112,7 +112,7 @@ fn safe_file_name(raw: &str) -> String {
             }
         })
         .collect();
-    let clean = clean.trim_start_matches('.');
+    let clean = clean.trim_matches('.');
     if !lenka_core::layout::is_artifact_file_name(clean) {
         "artifact".to_owned()
     } else {
@@ -868,6 +868,9 @@ mod tests {
         assert_eq!(safe_file_name("design v2.png"), "design_v2.png");
         assert_eq!(safe_file_name("../../etc/passwd"), "_.._etc_passwd");
         assert_eq!(safe_file_name("...."), "artifact");
+        assert_eq!(safe_file_name("notes."), "notes");
+        assert_eq!(safe_file_name("con.txt"), "artifact");
+        assert_eq!(safe_file_name("console.txt"), "console.txt");
         assert_eq!(safe_file_name(""), "artifact");
     }
 

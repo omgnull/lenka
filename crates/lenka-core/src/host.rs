@@ -165,6 +165,15 @@ impl Builder {
             None => Paths::from_env()?,
         };
         let settings = read_plugin_settings(&paths)?;
+        for name in settings.disabled.iter().chain(&settings.enabled) {
+            if !self
+                .plugins
+                .iter()
+                .any(|plugin| plugin.info().name == *name)
+            {
+                tracing::warn!(plugin = %name, "plugins.toml names a plugin that this build does not have");
+            }
+        }
         let mut registry = Registry::default();
         let mut states = Vec::new();
         for plugin in &self.plugins {

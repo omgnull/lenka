@@ -58,7 +58,7 @@ enum Command {
     Migrate,
     /// Commit, fetch, merge, and push through the Git plugin.
     #[cfg(feature = "git")]
-    Sync,
+    Sync(SyncOptions),
     /// Set up the Git plugin for a project.
     #[cfg(feature = "git")]
     #[command(subcommand)]
@@ -309,7 +309,7 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
         #[cfg(feature = "tasks")]
         Command::Reindex => reindex(&context, &plugins()?).map(|()| ok),
         #[cfg(feature = "git")]
-        Command::Sync => sync(&context, &plugins()?),
+        Command::Sync(options) => sync(&context, &plugins()?, &options),
         #[cfg(feature = "git")]
         Command::Git(GitCommand::Enable {
             remote,
@@ -692,13 +692,18 @@ fn versions_before_sync(
 }
 
 #[cfg(feature = "git")]
-fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
+fn sync(context: &RunContext, host: &Host, options: &SyncOptions) -> anyhow::Result<ExitCode> {
     require_plugin(host, "git")?;
     let caller = context.person()?;
     let project = host.project_for(&caller, None)?;
     #[cfg(feature = "tasks")]
     let before = versions_before_sync(&project);
-    let report = lenka_git::sync(&project)?;
+    let secrets = if options.allow_secret {
+        lenka_git::OutgoingSecrets::Allow
+    } else {
+        lenka_git::OutgoingSecrets::Refuse
+    };
+    let report = lenka_git::sync(&project, secrets)?;
     if report.merged {
         #[cfg(feature = "tasks")]
         {
@@ -765,6 +770,14 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 /// The options of `lenka doctor`.
+#[cfg(feature = "git")]
+#[derive(Debug, clap::Args)]
+struct SyncOptions {
+    /// Push a file that matches a secret pattern. The remote and its history then keep the file.
+    #[arg(long)]
+    allow_secret: bool,
+}
+
 #[cfg(feature = "tasks")]
 #[derive(Debug, clap::Args)]
 struct DoctorOptions {

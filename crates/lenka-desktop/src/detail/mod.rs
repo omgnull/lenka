@@ -252,7 +252,32 @@ impl DetailState {
 
     /// Tells if a close of the panel would lose text of the person.
     pub(crate) fn has_unsaved_text(&self) -> bool {
-        self.is_dirty() || !self.entry_text.trim().is_empty()
+        self.is_dirty()
+            || [
+                &self.entry_text,
+                &self.label_input,
+                &self.link_search,
+                &self.artifact_path,
+            ]
+            .iter()
+            .any(|text| !text.trim().is_empty())
+            || self.start_input != day_text(self.data.meta.front.start)
+            || self.due_input != day_text(self.data.meta.front.due)
+    }
+
+    /// Sets the text of the small fields, as a person who types in them.
+    #[cfg(test)]
+    pub(crate) fn type_in_small_field(&mut self, field: usize, text: &str) {
+        let target = [
+            &mut self.label_input,
+            &mut self.link_search,
+            &mut self.artifact_path,
+            &mut self.start_input,
+            &mut self.due_input,
+        ];
+        if let Some(target) = target.into_iter().nth(field) {
+            *target = text.to_owned();
+        }
     }
 
     /// Tells if the task has a newer version than the base of the drafts.

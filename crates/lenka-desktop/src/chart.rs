@@ -4,7 +4,6 @@
 //! The parts that the roadmap and the Gantt chart share.
 
 use egui::{Align2, FontId, Modifiers, Pos2, Rect, Response, Stroke, Ui, Vec2};
-use lenka_plugin_api::Day;
 
 use crate::theme::Palette;
 use crate::timeline::{Scale, Tick, day_ticks, month_ticks};
@@ -89,7 +88,7 @@ pub(crate) fn draw_axis(ui: &Ui, axis: Rect, grid_bottom: f32, kind: AxisKind, s
 /// Draws the marker of today over a chart.
 pub(crate) fn draw_today(ui: &Ui, chart: Rect, scale: &Scale) {
     let palette = Palette::of(ui);
-    let x = chart.left() + scale.x_of(f64::from(Day::today().number()));
+    let x = chart.left() + scale.x_of(f64::from(crate::timeline::local_today().number()));
     if x < chart.left() || x > chart.right() {
         return;
     }

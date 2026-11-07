@@ -34,7 +34,7 @@ fn gpu_exists() -> bool {
 }
 
 fn day(offset: i32) -> Day {
-    Day::from_number(Day::today().number() + offset)
+    Day::from_number(crate::timeline::local_today().number() + offset)
 }
 
 struct Sample {

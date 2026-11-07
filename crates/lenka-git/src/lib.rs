@@ -529,6 +529,73 @@ fn uses_lfs(git: &Git) -> Result<bool> {
 /// Sends the branch to a remote. The hooks stay off, so this function uploads Git LFS objects
 /// itself. Without them, a fresh clone cannot download the artifact bytes. A pointer with no local
 /// object does not stop the push, because `doctor` reports that artifact.
+/// Tells what a push does with a file that matches a secret pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutgoingSecrets {
+    /// Stop the push. This is the default, because a hand edit gets no check at its write.
+    #[default]
+    Refuse,
+    /// Push the file, for a person who chose this.
+    Allow,
+}
+
+/// Checks the files that a push adds or changes. A write through lenka has a check, but a hand edit
+/// and a merge do not.
+fn check_outgoing(git: &Git, remote: &str, secrets: OutgoingSecrets) -> Result<()> {
+    if secrets == OutgoingSecrets::Allow {
+        return Ok(());
+    }
+    let tracking = format!("refs/remotes/{remote}/{BRANCH}");
+    let listing = if git.passes(["rev-parse", "--verify", "-q", tracking.as_str()])? {
+        git.output([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=d",
+            tracking.as_str(),
+            "HEAD",
+        ])?
+    } else {
+        git.output(["ls-tree", "-r", "-z", "--name-only", "HEAD"])?
+    };
+    if !listing.status.success() {
+        return Err(git_error("list the changed files", &listing));
+    }
+    for name in listing.stdout.split(|byte| *byte == 0) {
+        if !name.is_empty() {
+            check_outgoing_file(git, name)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_outgoing_file(git: &Git, name: &[u8]) -> Result<()> {
+    let path = git.dir.join(os_path(name));
+    let shown = String::from_utf8_lossy(name).escape_default().to_string();
+    let mut file = match files::open_regular(&path, files::Links::Refuse) {
+        Ok(file) => file,
+        // A later write can remove the file, and a symlink has no bytes to check.
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(LenkaError::io("Read a file for the secret check", &err)),
+    };
+    lenka_core::secret::check_stream(&shown, &mut file).map_err(|error| {
+        LenkaError::new(
+            error.code(),
+            format!(
+                "{error} lenka did not push. Remove this text, and rotate the secret, because the local commits keep it. To push the file anyway, run `lenka sync --allow-secret`."
+            ),
+        )
+    })
+}
+
 fn push(git: &Git, remote: &str) -> Result<()> {
     if uses_lfs(git)? {
         git.run_network(
@@ -1204,7 +1271,7 @@ impl SyncReport {
 /// remote does not exist, or a merge of a person is open. Returns [`ErrorCode::InvalidFile`] or
 /// [`ErrorCode::FormatTooNew`] for a branch that lenka refuses. Returns [`ErrorCode::Io`] if `git`
 /// fails, for example on unrelated histories.
-pub fn sync(project: &Project) -> Result<SyncReport> {
+pub fn sync(project: &Project, secrets: OutgoingSecrets) -> Result<SyncReport> {
     let git = open_data_repo(project, Prompt::Allowed)?;
     let settings = LocalSettings::read(&git)?;
     if !settings.enabled {
@@ -1254,7 +1321,7 @@ pub fn sync(project: &Project) -> Result<SyncReport> {
         Some(2) => {}
         _ => return Err(git_error("ls-remote", &listing)),
     }
-    match push(&git, remote) {
+    match check_outgoing(&git, remote, secrets).and_then(|()| push(&git, remote)) {
         Ok(()) => report.pushed = true,
         Err(error) => report.push_error = Some(error.to_string()),
     }
@@ -1414,6 +1481,7 @@ impl GitHook {
         let git = open_data_repo(project, Prompt::Denied)?;
         commit_locked(project, &git, message)?;
         if finished && settings.push_on_finish && has_remote(&git, &settings.remote)? {
+            check_outgoing(&git, &settings.remote, OutgoingSecrets::Refuse)?;
             push(&git, &settings.remote)?;
         }
         Ok(())

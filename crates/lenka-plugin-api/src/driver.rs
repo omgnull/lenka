@@ -53,10 +53,23 @@ fn is_valid_part(part: &str) -> bool {
         && part != ".."
         && !part.eq_ignore_ascii_case(".git")
         && !part.eq_ignore_ascii_case("git~1")
+        && !part.ends_with('.')
+        && !is_reserved_on_windows(part)
         && part.len() <= 255
         && part
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Tells if Windows gives a name a special meaning. A clone on Windows must be able to hold each
+/// path, so the rule applies on all systems. Windows also ignores the end of a name with a dot.
+fn is_reserved_on_windows(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
+    match stem.as_bytes() {
+        b"CON" | b"PRN" | b"AUX" | b"NUL" => true,
+        [b'C', b'O', b'M', digit] | [b'L', b'P', b'T', digit] => digit.is_ascii_digit(),
+        _ => false,
+    }
 }
 
 impl fmt::Debug for DocPath {
@@ -309,6 +322,21 @@ mod tests {
         }
         assert!(DocPath::new(".runtime/inbox/abc-1.jsonl").is_ok());
         assert!(DocPath::new(".gitignore").is_ok());
+        for bad in [
+            ".git.",
+            "a.",
+            "con",
+            "CON.txt",
+            "nul.tar.gz",
+            "com1",
+            "LPT9.md",
+            "aux",
+        ] {
+            assert!(DocPath::new(bad).is_err(), "{bad}");
+        }
+        for good in ["console", "com10", "lpt", "contest.md", "a.b", "auxiliary"] {
+            assert!(DocPath::new(good).is_ok(), "{good}");
+        }
         for bad in [".git/config", "a/.GIT/hooks", "GIT~1/config"] {
             assert!(DocPath::new(bad).is_err(), "{bad} must fail");
         }

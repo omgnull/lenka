@@ -132,6 +132,12 @@ pub fn repair(driver: &dyn StorageDriver, txn: &mut dyn WriteTxn) -> Result<bool
         txn.journal_clear()?;
         return Ok(false);
     };
+    // `run` checks each path before the journal write, so this journal does not come from lenka.
+    if ops.iter().any(|op| DocPath::new(op.path()).is_err()) {
+        tracing::warn!("ignored a write journal with a path that is not valid");
+        txn.journal_clear()?;
+        return Ok(false);
+    }
     let mut appends = replay_plan(driver, &ops)?;
     for op in &ops {
         apply_replay(txn, op, &mut appends).map_err(|err| {
