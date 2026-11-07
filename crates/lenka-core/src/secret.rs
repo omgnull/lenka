@@ -58,7 +58,24 @@ const PREFIXES: &[(&str, &str, usize)] = &[
     ("Stripe key", "sk_live_", 16),
     ("npm token", "npm_", 30),
     ("PyPI token", "pypi-", 40),
+    ("GitHub token", "ghr_", 30),
+    ("GitLab token", "glrt-", 16),
+    ("GitLab token", "gldt-", 16),
+    ("Slack token", "xoxe-", 16),
+    ("Slack token", "xapp-", 16),
+    ("Slack webhook", "hooks.slack.com/services/", 8),
+    ("Stripe key", "rk_live_", 16),
+    ("Hugging Face token", "hf_", 30),
+    ("SendGrid key", "SG.", 16),
+    ("Google OAuth token", "ya29.", 30),
+    ("DigitalOcean token", "dop_v1_", 30),
 ];
+
+/// Prefixes that also start normal words. A token after these prefixes must look random.
+const WORD_PREFIXES: &[&str] = &["sk-", "npm_", "pypi-", "hf_"];
+
+/// Prefixes of AWS keys. The rest of such a key has only uppercase letters and digits.
+const AWS_PREFIXES: &[&str] = &["AKIA", "ASIA"];
 
 /// Names of settings that often hold a secret value.
 const ASSIGNMENT_NAMES: &[&str] = &[
@@ -72,14 +89,20 @@ const ASSIGNMENT_NAMES: &[&str] = &[
     "access_token",
     "client_secret",
     "private_key",
+    "token",
+    "pwd",
 ];
+
+/// The count of bytes that the check reads for the rest of a setting name, such as `_access_key`.
+const MAX_NAME_SUFFIX_BYTES: usize = 64;
 
 fn is_token_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
+/// A token can follow `-` or `_`, as in `MY_` before a token.
 fn is_word_start(text: &[u8], index: usize) -> bool {
-    index == 0 || !is_token_char(text[index - 1])
+    index == 0 || !text[index - 1].is_ascii_alphanumeric()
 }
 
 fn token_len(bytes: &[u8]) -> usize {
@@ -95,6 +118,8 @@ pub fn find_pattern(text: &str) -> Option<&'static str> {
     find_token(text).or_else(|| {
         if has_url_password(text) {
             Some("password in a URL")
+        } else if has_bearer_token(text) {
+            Some("bearer token")
         } else if has_secret_assignment(text) {
             Some("secret assignment")
         } else {
@@ -133,13 +158,19 @@ pub fn check_stream(location: &str, reader: &mut dyn std::io::Read) -> Result<()
             return Ok(());
         }
         let filled = kept + count;
-        let is_binary =
-            *binary.get_or_insert_with(|| buffer[..filled.min(BINARY_PROBE)].contains(&0));
-        let text = String::from_utf8_lossy(&buffer[..filled]);
-        let found = if is_binary {
-            find_token(&text)
-        } else {
-            find_pattern(&text)
+        let shape =
+            *binary.get_or_insert_with(|| StreamShape::of(&buffer[..filled.min(BINARY_PROBE)]));
+        let found = match shape {
+            StreamShape::Text => find_pattern(&String::from_utf8_lossy(&buffer[..filled])),
+            StreamShape::Binary => find_token(&String::from_utf8_lossy(&buffer[..filled])),
+            StreamShape::Utf16 => {
+                let bytes: Vec<u8> = buffer[..filled]
+                    .iter()
+                    .copied()
+                    .filter(|byte| *byte != 0)
+                    .collect();
+                find_pattern(&String::from_utf8_lossy(&bytes))
+            }
         };
         if let Some(pattern) = found {
             return Err(LenkaError::new(
@@ -155,9 +186,95 @@ pub fn check_stream(location: &str, reader: &mut dyn std::io::Read) -> Result<()
     }
 }
 
+/// The kind of a stream, from the zero bytes near its start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamShape {
+    Text,
+    /// Latin text in UTF-16 has a zero byte after or before each letter.
+    Utf16,
+    Binary,
+}
+
+impl StreamShape {
+    fn of(probe: &[u8]) -> Self {
+        let zeros = probe.iter().filter(|byte| **byte == 0).count();
+        if zeros == 0 {
+            return Self::Text;
+        }
+        let at = |offset: usize| {
+            probe
+                .iter()
+                .skip(offset)
+                .step_by(2)
+                .filter(|byte| **byte == 0)
+                .count()
+        };
+        let half = probe.len() / 2;
+        if probe.starts_with(&[0xff, 0xfe])
+            || probe.starts_with(&[0xfe, 0xff])
+            || at(0).max(at(1)) * 10 >= half * 9
+        {
+            return Self::Utf16;
+        }
+        // A few zero bytes do not make a file binary, and they must not hide text.
+        if zeros * 100 < probe.len() {
+            Self::Text
+        } else {
+            Self::Binary
+        }
+    }
+}
+
+/// Tells if a token has the form of a key. A long normal name has only lowercase words.
+fn looks_random(token: &[u8]) -> bool {
+    token
+        .iter()
+        .any(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+}
+
+/// Tells if a text after a prefix has the form of that prefix.
+fn token_fits(prefix: &str, min_len: usize, rest: &[u8]) -> bool {
+    if AWS_PREFIXES.contains(&prefix) {
+        let run = rest
+            .iter()
+            .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+            .count();
+        return run >= min_len && rest[..run].iter().any(u8::is_ascii_digit);
+    }
+    let len = token_len(rest);
+    len >= min_len && (!WORD_PREFIXES.contains(&prefix) || looks_random(&rest[..len]))
+}
+
+/// A certificate can mention a private key in other text, so the two parts share one line.
+fn has_private_key_block(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.find("-----BEGIN ")
+            .is_some_and(|start| line[start..].contains("PRIVATE KEY-----"))
+    })
+}
+
+fn has_bearer_token(text: &str) -> bool {
+    text.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(position) = lower[from..].find("bearer ") {
+            let after = from + position + "bearer ".len();
+            from = after;
+            let len = token_len(&line.as_bytes()[after..]);
+            if len >= 20
+                && looks_random(&line.as_bytes()[after..after + len])
+                && !is_placeholder(&line[after..after + len])
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// Finds a token with a fixed form.
 fn find_token(text: &str) -> Option<&'static str> {
-    if text.contains("-----BEGIN ") && text.contains("PRIVATE KEY") {
+    if has_private_key_block(text) {
         return Some("private key block");
     }
     let bytes = text.as_bytes();
@@ -166,7 +283,7 @@ fn find_token(text: &str) -> Option<&'static str> {
         while let Some(position) = text[from..].find(prefix) {
             let start = from + position;
             let after = start + prefix.len();
-            if is_word_start(bytes, start) && token_len(&bytes[after..]) >= *min_len {
+            if is_word_start(bytes, start) && token_fits(prefix, *min_len, &bytes[after..]) {
                 return Some(name);
             }
             from = after;
@@ -211,17 +328,27 @@ fn has_url_password(text: &str) -> bool {
             .find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '`' | ')'))
             .unwrap_or(rest.len());
         let authority = &rest[..end];
-        if let Some((user_info, _host)) = authority.rsplit_once('@')
-            && let Some((_user, password)) = user_info.split_once(':')
-            && password.len() >= 3
-            && !is_placeholder(password)
-        {
-            return true;
+        let Some((user_info, _host)) = authority.rsplit_once('@') else {
+            continue;
+        };
+        match user_info.split_once(':') {
+            Some((_user, password)) => {
+                // Digits here are often a port, as in `http://host:8080@other`.
+                let is_port = password.len() <= 5 && password.bytes().all(|b| b.is_ascii_digit());
+                if password.len() >= 3 && !is_port && !is_placeholder(password) {
+                    return true;
+                }
+            }
+            // A long user part with no colon is a token, as in a Git URL.
+            None if user_info.len() >= 32 && looks_random(user_info.as_bytes()) => return true,
+            None => {}
         }
     }
     false
 }
 
+/// Tells if a value is a sample. A placeholder word counts only as a whole word of the value, so
+/// that a real value such as `yourdomain2` is not a sample.
 fn is_placeholder(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     value.starts_with('<')
@@ -229,17 +356,41 @@ fn is_placeholder(value: &str) -> bool {
         || value.starts_with('{')
         || value.starts_with('%')
         || value.chars().all(|c| c == '*' || c == 'x' || c == 'X')
-        || [
-            "example",
-            "changeme",
-            "password",
-            "secret",
-            "placeholder",
-            "redacted",
-            "your",
-        ]
+        || lower.split(|c: char| !c.is_alphanumeric()).any(|part| {
+            [
+                "example",
+                "changeme",
+                "password",
+                "secret",
+                "placeholder",
+                "redacted",
+                "your",
+            ]
+            .contains(&part)
+        })
+}
+
+/// Tells if a value names the place of a secret, and is not the secret. A secret in Base64 can
+/// hold `/`, so a path counts only at the start of the value.
+fn is_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let scheme = value
+        .split_once(':')
+        .is_some_and(|(name, _)| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic()));
+    ["/", "./", "../", "~/"]
         .iter()
-        .any(|word| lower.contains(word))
+        .any(|start| value.starts_with(start))
+        || scheme
+        || lower.contains(".env.")
+        || lower.contains("environ")
+}
+
+/// Tells if a value is a normal name with words between hyphens, such as `my-service-account-v2`.
+fn is_hyphen_name(value: &str) -> bool {
+    value.split('-').count() >= 3
+        && value
+            .bytes()
+            .all(|b| b == b'-' || b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// The count of bytes of an assignment value that the check reads.
@@ -263,7 +414,9 @@ fn has_secret_assignment(text: &str) -> bool {
 }
 
 fn assignment_value_is_secret(rest: &str) -> bool {
-    let trimmed = rest.trim_start_matches(['"', '\'', ' ', '\t']);
+    // A name can continue, as in `SECRET_ACCESS_KEY`.
+    let suffix = token_len(&rest.as_bytes()[..rest.len().min(MAX_NAME_SUFFIX_BYTES)]);
+    let trimmed = rest[suffix..].trim_start_matches(['"', '\'', ' ', '\t']);
     let Some(value) = trimmed.strip_prefix(['=', ':']) else {
         return false;
     };
@@ -276,9 +429,11 @@ fn assignment_value_is_secret(rest: &str) -> bool {
     let value = &value[..end];
     // A real secret value is long and mixes character kinds. This keeps normal prose out.
     value.len() >= 12
-        && !is_placeholder(value)
         && value.chars().any(|c| c.is_ascii_digit())
         && value.chars().any(|c| c.is_ascii_alphabetic())
+        && !is_placeholder(value)
+        && !is_reference(value)
+        && !is_hyphen_name(value)
 }
 
 /// Runs the check on all texts.
@@ -300,7 +455,7 @@ pub fn check(texts: &[TextCheck], policy: SecretPolicy) -> Result<()> {
             return Err(LenkaError::new(
                 ErrorCode::SecretDetected,
                 format!(
-                    "The text in {}{line} matches the pattern \"{pattern}\". Remove the value and refer to it by name. Only a person can override this check, through the CLI.",
+                    "The text in {}{line} matches the pattern \"{pattern}\". Remove the value and refer to it by name. Only a person can override this check, in the desktop app or with `--allow-secret` where a command has this option.",
                     item.location
                 ),
             ));
@@ -385,7 +540,7 @@ mod tests {
         let url = format!("postgres://admin:{}@db.internal/app", "s3cr3tValue");
         let assignment = format!("api_key = \"{}\"", fake("Zz9", 20));
         for text in [
-            fake("AKIA", 16),
+            format!("AKIA{}", "A1B2".repeat(4)),
             fake("ghp_", 36),
             fake("sk-ant-", 40),
             fake("glpat-", 20),
@@ -396,6 +551,83 @@ mod tests {
         ] {
             assert!(find_pattern(&text).is_some(), "no match for pattern kind");
         }
+    }
+
+    /// Builds a value with no secret form in the source, so that a scan of this file stays clean.
+    fn value() -> String {
+        "a1B2c3D4".repeat(5)
+    }
+
+    #[test]
+    fn finds_common_forms_of_settings_and_tokens() {
+        let long = value();
+        let cases = [
+            format!("AWS_SECRET_ACCESS_KEY={long}"),
+            format!("aws_{}_access_key = {long}", "secret"),
+            format!("SECRET_KEY = '{long}'"),
+            format!("password_prod={long}"),
+            format!("token={long}"),
+            format!("pwd={long}"),
+            format!("Authorization: Bearer {long}"),
+            format!("password = yourdomain{}", "12345"),
+            format!("api_key = secret{}", "12345678"),
+            format!("postgres://u:yourpass{}@db/x", 9),
+            format!("https://{long}@github.com/a/b"),
+            // A secret in Base64 can hold a slash.
+            format!("{}={}/{long}", "aws_secret_access_key", "wJalr"),
+            fake("ghr_", 36),
+            fake("xoxe-", 20),
+            fake("xapp-", 20),
+            fake("rk_live_", 20),
+            fake("hf_", 36),
+            fake("SG.", 20),
+            fake("glrt-", 20),
+            fake("gldt-", 20),
+            fake("ya29.", 36),
+            fake("dop_v1_", 36),
+            format!("https://hooks.slack.com/services/{long}"),
+            format!("token-{}", fake("ghp_", 36)),
+            format!("MY_{}", fake("ghp_", 36)),
+        ];
+        for text in cases {
+            let label = text.split_at(8.min(text.len())).0.to_owned();
+            assert!(find_pattern(&text).is_some(), "no match: {label}");
+        }
+    }
+
+    #[test]
+    fn normal_text_with_the_form_of_a_setting_passes() {
+        for text in [
+            "ASIA_PACIFIC_NORTHEAST_REGION_1",
+            "ASIAPACIFICNORTHEASTREGION",
+            "sk-learn-pipeline-migration-notes-for-the-team",
+            "npm_config_registry_cache_directory_override",
+            "pypi-simple-index-mirror-configuration-notes-long-enough-to-count",
+            "-----BEGIN CERTIFICATE-----\nThe PRIVATE KEY stays on another machine.",
+            "secret: my-service-account-v2",
+            "secret = /etc/ssl/app2/key.pem",
+            "api_key: process.env.API_KEY_2",
+            "client_secret=vault:kv/app/client2",
+            "http://foo:8080@bar",
+            "Bearer <token>",
+            "The bearer token goes in the header.",
+            "max_tokens: 4096",
+        ] {
+            assert_eq!(find_pattern(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_stream_in_utf16_or_with_a_leading_zero_byte_is_still_checked() {
+        let text = format!("password={}\n", value());
+        let wide: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(stream_error(&wide), Some(ErrorCode::SecretDetected));
+        let mut with_mark = vec![0xff, 0xfe];
+        with_mark.extend_from_slice(&wide);
+        assert_eq!(stream_error(&with_mark), Some(ErrorCode::SecretDetected));
+        let mut with_zero = vec![0_u8];
+        with_zero.extend_from_slice(text.repeat(4).as_bytes());
+        assert_eq!(stream_error(&with_zero), Some(ErrorCode::SecretDetected));
     }
 
     #[test]
