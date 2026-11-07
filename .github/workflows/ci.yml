@@ -48,7 +48,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: ["", tasks, artifacts, memory, git, mcp, "tasks,artifacts,mcp"]
+        features: ["", tasks, artifacts, memory, git, mcp, desktop, "tasks,artifacts,mcp"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,6 +57,9 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal -c clippy --no-self-update
           rustup default stable
+      - name: Install GUI libraries
+        if: matrix.features == 'desktop'
+        run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo clippy -p lenka --no-default-features --features "${{ matrix.features }}" --locked -- -D warnings
 
