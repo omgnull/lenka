@@ -233,17 +233,26 @@ fn looks_random(token: &[u8]) -> bool {
         .any(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
 }
 
-/// Tells if a text after a prefix has the form of that prefix.
-fn token_fits(prefix: &str, min_len: usize, rest: &[u8]) -> bool {
+/// Tells if a text after a prefix has the form of that prefix. It also gives the count of bytes
+/// that it read.
+///
+/// The caller can skip these bytes after a failed test. A later prefix in the same run has a
+/// shorter part of the same run after it, so that prefix also fails. This keeps the check linear
+/// for a repeated prefix, such as `sk-sk-sk-`.
+fn token_fits(prefix: &str, min_len: usize, rest: &[u8]) -> (bool, usize) {
     if AWS_PREFIXES.contains(&prefix) {
         let run = rest
             .iter()
             .take_while(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
             .count();
-        return run >= min_len && rest[..run].iter().any(u8::is_ascii_digit);
+        return (
+            run >= min_len && rest[..run].iter().any(u8::is_ascii_digit),
+            run,
+        );
     }
     let len = token_len(rest);
-    len >= min_len && (!WORD_PREFIXES.contains(&prefix) || looks_random(&rest[..len]))
+    let fits = len >= min_len && (!WORD_PREFIXES.contains(&prefix) || looks_random(&rest[..len]));
+    (fits, len)
 }
 
 /// A certificate can mention a private key in other text, so the two parts share one line.
@@ -291,10 +300,16 @@ fn find_token(text: &str) -> Option<&'static str> {
         while let Some(position) = text[from..].find(prefix) {
             let start = from + position;
             let after = start + prefix.len();
-            if is_word_start(bytes, start) && token_fits(prefix, *min_len, &bytes[after..]) {
+            from = after;
+            if !is_word_start(bytes, start) {
+                continue;
+            }
+            let (fits, read) = token_fits(prefix, *min_len, &bytes[after..]);
+            if fits {
                 return Some(name);
             }
-            from = after;
+            // The run has only ASCII bytes, so its end is a character boundary.
+            from = after + read;
         }
     }
     has_jwt(text).then_some("JSON web token")
@@ -311,6 +326,9 @@ fn has_jwt(text: &str) -> bool {
         }
         let first = token_len(&bytes[start..]);
         let second_start = start + first;
+        // A later `eyJ` in the first part has the same parts after it, and a shorter first
+        // part, so it also fails. This skip keeps the check linear for `eyJ-eyJ-eyJ-`.
+        from = second_start;
         if first < 10 || bytes.get(second_start) != Some(&b'.') {
             continue;
         }
@@ -495,6 +513,36 @@ mod tests {
             let seconds = started.elapsed().as_secs();
             assert!(seconds < 10, "{unit}: {seconds} s");
         }
+    }
+
+    #[test]
+    fn a_repeated_prefix_stays_fast() {
+        // The cost was quadratic, and the `sk-` text of 1 MiB took 210 seconds in a release
+        // build. Each text of 1 MiB now takes less than 0.1 seconds in a debug build. The sizes
+        // increase, so that a quadratic cost fails the test in seconds and not in an hour.
+        for size in [16, 64, 256, 1024].map(|kib| kib * 1024) {
+            for unit in [
+                "sk-", "npm_", "hf_", "pypi-", "eyJ-", "eyJ_", "AKIA", "AKIA_",
+            ] {
+                let text = unit.repeat(size / unit.len());
+                let started = std::time::Instant::now();
+                assert_eq!(find_pattern(&text), None, "{unit}");
+                let elapsed = started.elapsed();
+                assert!(elapsed.as_secs_f64() < 2.0, "{unit} {size}: {elapsed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_token_after_a_repeated_prefix_is_still_found() {
+        // The check skips a run after a failed prefix. A token at the end of the run must count.
+        for unit in ["sk-", "npm_", "hf_", "pypi-"] {
+            let text = format!("{} {}", unit.repeat(100), fake(unit, 40));
+            assert!(find_pattern(&text).is_some(), "{unit}");
+        }
+        let jwt = format!("eyJ{0}.eyJ{0}.{0}", "abcdefghijkl");
+        assert!(find_pattern(&["eyJ-".repeat(100), jwt.clone()].concat()).is_some());
+        assert!(find_pattern(&format!("eyJ{}.ab.{jwt}", "abcdefghijkl")).is_some());
     }
 
     #[test]
