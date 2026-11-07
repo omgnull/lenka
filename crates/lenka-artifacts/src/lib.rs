@@ -150,7 +150,8 @@ fn guess_media_type(name: &str) -> &'static str {
 fn open_source(path: &Path) -> Result<std::fs::File> {
     let file = files::open_regular(path, Links::Refuse)
         .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
-    let real = lenka_core::gitdir::real_path(path)
+    // `check_source` made the path with this same call. On Windows, its form differs from `real_path`.
+    let real = std::fs::canonicalize(path)
         .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
     if real != path {
         return Err(LenkaError::invalid_argument(
@@ -843,8 +844,8 @@ mod tests {
     #[test]
     fn a_source_through_a_swapped_parent_directory_is_refused() -> Result<()> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
-        let real = lenka_core::gitdir::real_path(temp.path())
-            .map_err(|err| LenkaError::io("real path", &err))?;
+        let real =
+            std::fs::canonicalize(temp.path()).map_err(|err| LenkaError::io("real path", &err))?;
         let outside = real.join("outside");
         let link = real.join("link");
         std::fs::create_dir(&outside).map_err(|err| LenkaError::io("create", &err))?;
