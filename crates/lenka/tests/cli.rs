@@ -1954,3 +1954,33 @@ fn an_unknown_type_is_a_wrong_argument() -> TestResult {
     assert!(machine.fails(&repo, &args)?.contains("invalid_argument"));
     Ok(())
 }
+
+/// The snapshot is a cache, so a read needs no write access.
+#[cfg(unix)]
+#[test]
+fn a_read_works_in_a_read_only_data_directory() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let data = repo.join(".git/lenka-data");
+    let runtime = data.join(".runtime");
+    for name in fs::read_dir(&runtime)? {
+        let path = name?.path();
+        if path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o555))?;
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o555))?;
+    let shown = machine.run(&repo, &["--json", "task", "show", text(&task, "task")]);
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755))?;
+    let shown = shown?;
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    Ok(())
+}

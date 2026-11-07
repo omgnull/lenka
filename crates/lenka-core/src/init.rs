@@ -339,8 +339,12 @@ fn holds_other_files(directory: &Path) -> Result<bool> {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let allowed = match name.as_ref() {
-            ".gitignore" | ".gitattributes" | ".runtime" | ".DS_Store" | "Thumbs.db"
-            | "desktop.ini" => true,
+            // These names can also be files of the person, and a create must not replace them.
+            ".gitignore" => fs::read(entry.path()).is_ok_and(|text| text == GITIGNORE.as_bytes()),
+            ".gitattributes" => {
+                fs::read(entry.path()).is_ok_and(|text| text == GITATTRIBUTES.as_bytes())
+            }
+            ".runtime" | ".DS_Store" | "Thumbs.db" | "desktop.ini" => true,
             "tasks" | "artifacts" | "memory" => {
                 fs::read_dir(entry.path()).is_ok_and(|mut inner| inner.next().is_none())
             }
@@ -376,7 +380,12 @@ fn write_new_project(directory: &Path, config: &ProjectConfig) -> Result<()> {
             crate::layout::TEMP_PREFIX,
             std::process::id()
         ));
-        fs::write(&temp, text)
+        // A flush comes first, because a power failure can keep the rename and lose the text.
+        fs::File::create(&temp)
+            .and_then(|mut file| {
+                std::io::Write::write_all(&mut file, text.as_bytes())?;
+                file.sync_all()
+            })
             .and_then(|()| fs::rename(&temp, directory.join(name)))
             .map_err(|err| LenkaError::io("Write a project file", &err))?;
     }
@@ -394,6 +403,9 @@ pub fn register_existing(
     name: Option<&str>,
     directory: &Path,
 ) -> Result<Created> {
+    // A later process can run in another directory, so the list needs an absolute path.
+    let directory = cwd.join(directory);
+    let directory = directory.as_path();
     let text = fs::read_to_string(directory.join(PROJECT_FILE))
         .map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
     let config = ProjectConfig::parse(&text)?;
@@ -675,6 +687,41 @@ mod tests {
     }
 
     #[test]
+    fn a_create_keeps_git_files_of_the_person() -> Result<()> {
+        for name in [".gitignore", ".gitattributes"] {
+            let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+            let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+            let target = temp.path().join("target");
+            fs::create_dir_all(&target).map_err(|err| LenkaError::io("mkdir", &err))?;
+            fs::write(target.join(name), "my rules\n")
+                .map_err(|err| LenkaError::io("write", &err))?;
+            let location = Location::Directory(target.clone());
+            assert!(create_project(&paths, temp.path(), Some("api"), &location).is_err());
+            let kept = fs::read_to_string(target.join(name))
+                .map_err(|err| LenkaError::io("read", &err))?;
+            assert_eq!(kept, "my rules\n");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_relative_directory_of_existing_data_becomes_absolute() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let target = temp.path().join("store");
+        let location = Location::Directory(target);
+        create_project(&paths, temp.path(), Some("first"), &location)?;
+        let other = Paths::new(temp.path().join("config-2"), temp.path().join("data-2"));
+        register_existing(&other, temp.path(), Some("api"), Path::new("store"))?;
+        assert!(
+            ProjectsFile::load(&other)?.projects["api"]
+                .directory
+                .is_absolute()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_stopped_create_can_run_again() -> Result<()> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
         let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
@@ -682,9 +729,11 @@ mod tests {
         for part in ["tasks", "artifacts", "memory", ".runtime/inbox"] {
             fs::create_dir_all(target.join(part)).map_err(|err| LenkaError::io("mkdir", &err))?;
         }
-        for name in [".gitignore", ".tmp-init-1", ".DS_Store"] {
+        for name in [".tmp-init-1", ".DS_Store"] {
             fs::write(target.join(name), "x").map_err(|err| LenkaError::io("write", &err))?;
         }
+        fs::write(target.join(".gitignore"), GITIGNORE)
+            .map_err(|err| LenkaError::io("write", &err))?;
         let created = create_project(
             &paths,
             temp.path(),

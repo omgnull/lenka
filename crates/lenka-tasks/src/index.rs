@@ -828,7 +828,10 @@ pub fn open_index(project: &Arc<Project>) -> Result<(Index, Vec<TaskId>)> {
     let changed = index.scan(driver)?;
     index.reload_claims(driver)?;
     if !changed.is_empty() {
-        index.save_snapshot(project)?;
+        // The snapshot is a cache, so a read-only directory must not stop a read.
+        if let Err(error) = index.save_snapshot(project) {
+            tracing::debug!(code = error.code().as_str(), "the snapshot was not stored");
+        }
     }
     Ok((index, changed))
 }

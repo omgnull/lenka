@@ -122,14 +122,29 @@ impl FsStore {
             .map_err(|err| LenkaError::io("Store the artifact", &err));
         if result.is_err() {
             let _ = fs::remove_file(temp);
-        } else if cfg!(unix)
+            return result;
+        }
+        if cfg!(unix)
             && let Some(dir) = target.parent()
-            && let Ok(handle) = File::open(dir)
         {
             // A record must not name bytes that a power failure removes with the rename.
-            let _ = handle.sync_all();
+            let synced = File::open(dir).and_then(|handle| handle.sync_all());
+            if let Err(err) = accept_missing_sync(synced) {
+                let _ = fs::remove_file(target);
+                return Err(LenkaError::io("Flush the artifact directory", &err));
+            }
         }
-        result
+        Ok(())
+    }
+}
+
+/// Accepts a file system that cannot flush a directory. Any other error stops the write.
+fn accept_missing_sync(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(err) if matches!(err.kind(), ErrorKind::Unsupported | ErrorKind::InvalidInput) => {
+            Ok(())
+        }
+        other => other,
     }
 }
 
@@ -298,6 +313,16 @@ impl ArtifactStore for FsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_directory_flush_is_accepted() {
+        use std::io::Error;
+        assert!(accept_missing_sync(Ok(())).is_ok());
+        assert!(accept_missing_sync(Err(Error::from(ErrorKind::Unsupported))).is_ok());
+        assert!(accept_missing_sync(Err(Error::from(ErrorKind::InvalidInput))).is_ok());
+        assert!(accept_missing_sync(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
+        assert!(accept_missing_sync(Err(Error::other("disk error"))).is_err());
+    }
 
     #[test]
     fn round_trip_with_a_known_hash() -> Result<()> {

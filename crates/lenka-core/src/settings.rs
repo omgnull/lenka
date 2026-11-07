@@ -215,6 +215,15 @@ impl ProjectConfig {
     /// Returns [`ErrorCode::InvalidFile`] for bad text, and [`ErrorCode::FormatTooNew`] for a
     /// format that this process does not know.
     pub fn parse(text: &str) -> Result<Self> {
+        // A newer format can have new keys, and these must not hide the reason to refuse the file.
+        #[derive(Deserialize)]
+        struct FormatOnly {
+            #[serde(default)]
+            format_version: u32,
+        }
+        if let Ok(found) = toml::from_str::<FormatOnly>(text) {
+            check_format_is_known(found.format_version)?;
+        }
         let config: Self = toml::from_str(text)
             .map_err(|err| LenkaError::invalid_file(format!("lenka.toml: {}", err.message())))?;
         config.validate()?;
@@ -227,15 +236,7 @@ impl ProjectConfig {
     ///
     /// Returns [`ErrorCode::InvalidFile`] if a type has no stages or a duplicate stage.
     pub fn validate(&self) -> Result<()> {
-        if self.format_version > FORMAT_VERSION {
-            return Err(LenkaError::new(
-                ErrorCode::FormatTooNew,
-                format!(
-                    "The data format is {}, and this lenka knows {}. Update lenka.",
-                    self.format_version, FORMAT_VERSION
-                ),
-            ));
-        }
+        check_format_is_known(self.format_version)?;
         if self.format_version == 0 {
             return Err(LenkaError::invalid_file(
                 "lenka.toml has the data format 0, which is not valid.",
@@ -569,6 +570,20 @@ impl Paths {
     }
 }
 
+/// Refuses a format that is newer than this lenka.
+fn check_format_is_known(version: u32) -> Result<()> {
+    if version > FORMAT_VERSION {
+        return Err(LenkaError::new(
+            ErrorCode::FormatTooNew,
+            format!(
+                "The data format is {}, and this lenka knows {}. Update lenka.",
+                version, FORMAT_VERSION
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Validates a project name. A name is used as a file name, and as a TOML key.
 ///
 /// # Errors
@@ -593,6 +608,13 @@ pub fn validate_project_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_newer_format_with_new_limits_is_too_new() {
+        let text = "format_version = 99\n[limits]\na_later_limit = 1\n";
+        let error = ProjectConfig::parse(text).err().map(|error| error.code());
+        assert_eq!(error, Some(ErrorCode::FormatTooNew));
+    }
 
     #[test]
     fn a_save_keeps_unknown_keys_and_removes_a_removed_type() {

@@ -198,6 +198,7 @@ impl StorageDriver for LocalDriver {
 
     fn read_start(&self, path: &DocPath, max_bytes: u64) -> Result<Vec<u8>> {
         self.check_no_symlink(path)?;
+        self.check_regular_file(path)?;
         let file = match File::open(self.file_of(path)) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -276,6 +277,7 @@ impl StorageDriver for LocalDriver {
         // A journal has no size limit, because a large write must also survive a crash.
         let path = journal_path()?;
         self.check_no_symlink(&path)?;
+        self.check_regular_file(&path)?;
         match fs::read(self.file_of(&path)) {
             Ok(bytes) if bytes.is_empty() => Ok(None),
             Ok(bytes) => Ok(Some(bytes)),
@@ -611,6 +613,26 @@ mod tests {
         );
         assert_eq!(
             driver.read_from(&doc, 0).err().map(|e| e.code()),
+            Some(ErrorCode::InvalidFile)
+        );
+        assert_eq!(
+            driver.read_start(&doc, 10).err().map(|e| e.code()),
+            Some(ErrorCode::InvalidFile)
+        );
+        let journal = temp.path().join(journal_path()?.as_str());
+        fs::create_dir_all(
+            journal
+                .parent()
+                .ok_or_else(|| LenkaError::not_found("parent"))?,
+        )
+        .map_err(|err| LenkaError::io("t", &err))?;
+        let made = std::process::Command::new("mkfifo")
+            .arg(&journal)
+            .status()
+            .map_err(|err| LenkaError::io("t", &err))?;
+        assert!(made.success());
+        assert_eq!(
+            driver.journal_read().err().map(|e| e.code()),
             Some(ErrorCode::InvalidFile)
         );
         Ok(())
