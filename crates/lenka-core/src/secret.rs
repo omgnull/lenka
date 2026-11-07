@@ -491,7 +491,7 @@ mod tests {
         for unit in ["secret=", "password=", "password:a"] {
             let text = unit.repeat(1024 * 1024 / unit.len());
             let started = std::time::Instant::now();
-            let _ = find_pattern(&text);
+            std::hint::black_box(find_pattern(&text));
             let seconds = started.elapsed().as_secs();
             assert!(seconds < 10, "{unit}: {seconds} s");
         }

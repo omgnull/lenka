@@ -245,7 +245,7 @@ async fn exactly_one_process_wins_a_claim() -> TestResult {
         calls.push(tokio::spawn(async move {
             let result = client.call_tool(params("task.claim", &args)).await;
             let answer = result.map(|item| (item.is_error, result_text(&item)));
-            let _ = client.cancel().await;
+            client.cancel().await.ok();
             answer
         }));
     }

@@ -2233,6 +2233,7 @@ impl TaskService {
                 .ok_or_else(|| task_missing(id))?;
             check_write_claim(index, id, caller, claim, now)?;
             check_not_closed(&meta)?;
+            check_loop_not_stopped(&meta, caller)?;
             let mut ops = self.pause_ops(index, id, meta.state.clone(), caller, now)?;
             if matches!(claim, ClaimRef::Override) && index.claims.contains_key(&id) {
                 ops.extend(notice_ops(
@@ -2438,6 +2439,10 @@ impl TaskService {
             }
             if let Some(meta) = index.tasks.get(&id) {
                 check_loop_not_stopped(meta, caller)?;
+            }
+            // A hand edit or a merge can make a task invalid, and a delete removes its history.
+            if caller.actor != Actor::Human {
+                check_not_invalid(index, id)?;
             }
             if index
                 .children
@@ -3972,7 +3977,8 @@ pub fn artifact_view(project: &Project, record: &ArtifactRecord) -> ArtifactView
 fn is_lfs_pointer(path: &std::path::Path) -> bool {
     use std::io::Read;
     const PREFIX: &[u8] = b"version https://git-lfs.github.com/spec/";
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(mut file) = lenka_core::files::open_regular(path, lenka_core::files::Links::Refuse)
+    else {
         return false;
     };
     let mut head = [0_u8; 40];

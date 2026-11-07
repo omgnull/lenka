@@ -278,6 +278,10 @@ where
             break;
         }
     }
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "The end of the input ends the session, also after a read error."
+    )]
     let _ = tokio::io::copy_buf(input, writer).await;
 }
 

@@ -88,7 +88,12 @@ pub fn network_mount(path: &Path) -> Option<String> {
         return None;
     }
     let real = std::fs::canonicalize(path).ok()?;
-    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let text = lenka_core::files::read_text_limited(
+        Path::new("/proc/self/mountinfo"),
+        lenka_core::files::Links::Follow,
+        lenka_core::files::SETTINGS_LIMIT,
+    )
+    .ok()?;
     mount_type(&text, &real)
         .filter(|kind| is_network_type(kind))
         .map(str::to_owned)

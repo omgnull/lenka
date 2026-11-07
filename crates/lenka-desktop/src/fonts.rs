@@ -118,6 +118,10 @@ fn output_with_limit(mut command: Command, limit: Duration) -> Option<Output> {
     std::thread::Builder::new()
         .name("lenka-font-search".to_owned())
         .spawn(move || {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "A send fails only if the search stopped its wait."
+            )]
             let _ = sender.send(command.output());
         })
         .ok()?;
@@ -187,7 +191,8 @@ pub(crate) fn read_font(path: &Path, limit: u64) -> Result<Vec<u8>, FontRefusal>
     if metadata.len() > limit {
         return Err(FontRefusal::TooLarge);
     }
-    let file = std::fs::File::open(path).map_err(|_err| FontRefusal::Unreadable)?;
+    let file = lenka_core::files::open_regular(path, lenka_core::files::Links::Follow)
+        .map_err(|_err| FontRefusal::Unreadable)?;
     let mut bytes = Vec::new();
     // The file can grow after the size check, so the read has a limit too.
     file.take(limit + 1)

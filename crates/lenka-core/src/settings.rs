@@ -3,6 +3,7 @@
 
 //! Project settings, the user project list, and the clone file.
 
+use crate::files::{Links, SETTINGS_LIMIT, read_text_limited};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -364,7 +365,7 @@ impl ProjectsFile {
     /// Returns an error if the file is not valid.
     pub fn load(paths: &Paths) -> Result<Self> {
         let file = paths.projects_file();
-        match fs::read_to_string(&file) {
+        match read_text_limited(&file, Links::Follow, SETTINGS_LIMIT) {
             Ok(text) => toml::from_str(&text).map_err(|err| {
                 LenkaError::invalid_file(format!("projects.toml: {}", err.message()))
             }),
@@ -409,7 +410,7 @@ impl CloneFile {
     ///
     /// Returns an error if the file is not valid.
     pub fn load(file: &Path) -> Result<Option<Self>> {
-        match fs::read_to_string(file) {
+        match read_text_limited(file, Links::Follow, SETTINGS_LIMIT) {
             Ok(text) => toml::from_str(&text).map(Some).map_err(|err| {
                 LenkaError::invalid_file(format!("{CLONE_FILE}: {}", err.message()))
             }),

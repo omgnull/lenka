@@ -3,6 +3,10 @@
 
 //! Tests of the client hook and its install command with real processes.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 #[expect(dead_code, reason = "this test binary uses only a part of the helpers")]
 mod common;
 

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use lenka_plugin_api::{Actor, Caller, ErrorCode, LenkaError, ProjectScope, Result};
 
+use crate::files::{Links, SETTINGS_LIMIT, read_limited, read_text_limited};
 use crate::gitdir;
 use crate::notices::{agent_key, person_key};
 use crate::settings::{
@@ -144,7 +145,7 @@ pub fn project_driver_in(directory: &Path) -> Result<Option<String>> {
     if !file.is_file() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&file).map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
+    let text = read_settings(&file)?;
     Ok(Some(ProjectConfig::parse(&text)?.storage.driver))
 }
 
@@ -246,8 +247,7 @@ fn create_locked(
     }
     let settings_file = directory.join(PROJECT_FILE);
     let config = if settings_file.is_file() {
-        let text = fs::read_to_string(&settings_file)
-            .map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
+        let text = read_settings(&settings_file)?;
         ProjectConfig::parse(&text)?
     } else {
         if holds_other_files(&directory)? {
@@ -345,10 +345,8 @@ fn holds_other_files(directory: &Path) -> Result<bool> {
         let name = name.to_string_lossy();
         let allowed = match name.as_ref() {
             // These names can also be files of the person, and a create must not replace them.
-            ".gitignore" => fs::read(entry.path()).is_ok_and(|text| text == GITIGNORE.as_bytes()),
-            ".gitattributes" => {
-                fs::read(entry.path()).is_ok_and(|text| text == GITATTRIBUTES.as_bytes())
-            }
+            ".gitignore" => holds_text(&entry.path(), GITIGNORE),
+            ".gitattributes" => holds_text(&entry.path(), GITATTRIBUTES),
             ".runtime" | ".DS_Store" | "Thumbs.db" | "desktop.ini" => true,
             "tasks" | "artifacts" | "memory" => {
                 fs::read_dir(entry.path()).is_ok_and(|mut inner| inner.next().is_none())
@@ -411,8 +409,7 @@ pub fn register_existing(
     // A later process can run in another directory, so the list needs an absolute path.
     let directory = cwd.join(directory);
     let directory = directory.as_path();
-    let text = fs::read_to_string(directory.join(PROJECT_FILE))
-        .map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
+    let text = read_settings(&directory.join(PROJECT_FILE))?;
     let config = ProjectConfig::parse(&text)?;
     let name = name.map_or_else(|| config.name.clone(), str::to_owned);
     validate_project_name(&name)?;
@@ -525,7 +522,22 @@ pub fn caller_for(paths: &Paths, cwd: &Path, setup: CallerSetup) -> Result<Calle
     })
 }
 
+/// Reads `lenka.toml`. This file can come from a remote, so a symlink fails.
+fn read_settings(file: &Path) -> Result<String> {
+    read_text_limited(file, Links::Refuse, SETTINGS_LIMIT)
+        .map_err(|err| LenkaError::io("Read lenka.toml", &err))
+}
+
+/// Tells if a file holds exactly a text that lenka wrote.
+fn holds_text(file: &Path, text: &str) -> bool {
+    read_limited(file, Links::Refuse, text.len() as u64).is_ok_and(|bytes| bytes == text.as_bytes())
+}
+
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 mod tests {
     use super::*;
 

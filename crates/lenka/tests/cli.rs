@@ -3,6 +3,10 @@
 
 //! Tests of the command line with real processes.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 mod common;
 
 use std::fs;

@@ -3,6 +3,10 @@
 
 //! Tests that drive the real UI with a temporary project and no window.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

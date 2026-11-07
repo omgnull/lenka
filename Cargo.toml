@@ -20,6 +20,9 @@ redundant_lifetimes = "warn"
 trivial_numeric_casts = "warn"
 unused_lifetimes = "warn"
 
+[workspace.lints.clippy]
+let_underscore_must_use = "warn"
+
 [workspace.dependencies]
 lenka-plugin-api = { path = "crates/lenka-plugin-api", version = "0.1.0" }
 lenka-core = { path = "crates/lenka-core", version = "0.1.0" }

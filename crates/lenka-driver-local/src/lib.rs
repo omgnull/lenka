@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use lenka_core::files::{self, Links};
 use lenka_core::{Plugin, PluginInfo, Registry};
 use lenka_plugin_api::{DocPath, DocStat, ErrorCode, LenkaError, Result, StorageDriver, WriteTxn};
 
@@ -124,15 +125,17 @@ impl LocalDriver {
             .map_err(|err| LenkaError::io("Open the lock file", &err))
     }
 
-    /// Refuses a path that is not a regular file. The open of a named pipe waits with no limit.
-    fn check_regular_file(&self, path: &DocPath) -> Result<()> {
-        match fs::symlink_metadata(self.file_of(path)) {
-            Ok(meta) if !meta.is_file() => Err(LenkaError::invalid_file(format!(
-                "The path {path} is not a regular file, so lenka cannot read it."
-            ))),
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(LenkaError::io("Read file metadata", &err)),
+    /// Opens a document. A path that is not a regular file fails, because the open of a named pipe
+    /// waits with no limit.
+    fn open_document(&self, path: &DocPath) -> Result<Option<File>> {
+        self.check_no_symlink(path)?;
+        match files::open_regular(&self.file_of(path), Links::Refuse) {
+            Ok(file) => Ok(Some(file)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) if err.kind() == ErrorKind::InvalidInput => Err(LenkaError::invalid_file(
+                format!("The path {path} is not a regular file, so lenka cannot read it."),
+            )),
+            Err(err) => Err(LenkaError::io("Open a document", &err)),
         }
     }
 }
@@ -159,12 +162,8 @@ fn try_lock(file: &File) -> Result<bool> {
 
 impl StorageDriver for LocalDriver {
     fn read(&self, path: &DocPath) -> Result<Option<Vec<u8>>> {
-        self.check_no_symlink(path)?;
-        self.check_regular_file(path)?;
-        let file = match File::open(self.file_of(path)) {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(LenkaError::io("Open a document", &err)),
+        let Some(file) = self.open_document(path)? else {
+            return Ok(None);
         };
         let mut bytes = Vec::new();
         let read = file
@@ -180,12 +179,8 @@ impl StorageDriver for LocalDriver {
     }
 
     fn read_from(&self, path: &DocPath, offset: u64) -> Result<Vec<u8>> {
-        self.check_no_symlink(path)?;
-        self.check_regular_file(path)?;
-        let mut file = match File::open(self.file_of(path)) {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(LenkaError::io("Open a document", &err)),
+        let Some(mut file) = self.open_document(path)? else {
+            return Ok(Vec::new());
         };
         file.seek(SeekFrom::Start(offset))
             .map_err(|err| LenkaError::io("Seek in a document", &err))?;
@@ -197,12 +192,8 @@ impl StorageDriver for LocalDriver {
     }
 
     fn read_start(&self, path: &DocPath, max_bytes: u64) -> Result<Vec<u8>> {
-        self.check_no_symlink(path)?;
-        self.check_regular_file(path)?;
-        let file = match File::open(self.file_of(path)) {
-            Ok(file) => file,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => return Err(LenkaError::io("Open a document", &err)),
+        let Some(file) = self.open_document(path)? else {
+            return Ok(Vec::new());
         };
         let mut bytes = Vec::new();
         file.take(max_bytes)
@@ -276,14 +267,13 @@ impl StorageDriver for LocalDriver {
     fn journal_read(&self) -> Result<Option<Vec<u8>>> {
         // A journal has no size limit, because a large write must also survive a crash.
         let path = journal_path()?;
-        self.check_no_symlink(&path)?;
-        self.check_regular_file(&path)?;
-        match fs::read(self.file_of(&path)) {
-            Ok(bytes) if bytes.is_empty() => Ok(None),
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(LenkaError::io("Read the journal", &err)),
-        }
+        let Some(mut file) = self.open_document(&path)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|err| LenkaError::io("Read the journal", &err))?;
+        Ok((!bytes.is_empty()).then_some(bytes))
     }
 
     fn local_dir(&self) -> Option<&Path> {
@@ -347,7 +337,7 @@ impl LocalTxn<'_> {
             // A new directory stays after a power failure only if its parent has a flush.
             for part in new_parts {
                 if let Some(above) = part.parent() {
-                    sync_dir(above);
+                    sync_dir(above)?;
                 }
             }
         }
@@ -363,13 +353,9 @@ fn missing_parents(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Flushes a directory, so that a rename stays after a power failure. Windows cannot do this.
-fn sync_dir(dir: &Path) {
-    if cfg!(unix)
-        && let Ok(handle) = File::open(dir)
-    {
-        let _ = handle.sync_all();
-    }
+/// Flushes a directory, so that a rename stays after a power failure.
+fn sync_dir(dir: &Path) -> Result<()> {
+    files::sync_directory(dir).map_err(|err| LenkaError::io("Flush a directory", &err))
 }
 
 /// Creates a new temporary file in a directory. The file cannot exist already, so this call never
@@ -405,7 +391,7 @@ impl WriteTxn for LocalTxn<'_> {
             .and_then(|()| handle.sync_data())
             .map_err(|err| LenkaError::io("Write the journal", &err))?;
         if is_new && let Some(parent) = file.parent() {
-            sync_dir(parent);
+            sync_dir(parent)?;
         }
         Ok(())
     }
@@ -458,11 +444,15 @@ impl WriteTxn for LocalTxn<'_> {
             fs::rename(&temp, &file)
         })();
         if let Err(err) = result {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The write already failed, and that error goes to the caller."
+            )]
             let _ = fs::remove_file(&temp);
             return Err(LenkaError::io("Write a document", &err));
         }
         if self.strict_flush {
-            sync_dir(parent);
+            sync_dir(parent)?;
         }
         Ok(())
     }
@@ -507,6 +497,10 @@ impl WriteTxn for LocalTxn<'_> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 mod tests {
     use super::*;
     use lenka_core::Op;

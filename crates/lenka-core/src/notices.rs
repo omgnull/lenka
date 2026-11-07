@@ -9,7 +9,9 @@
 use crate::input::{MAX_REASON_BYTES, MAX_SHORT_BYTES, clip};
 use std::path::Path;
 
-use lenka_plugin_api::{AgentKey, DocPath, NoticeId, Result, StorageDriver, Timestamp};
+use lenka_plugin_api::{
+    AgentKey, ArtifactId, DocPath, NoticeId, Result, StorageDriver, TaskId, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -149,10 +151,9 @@ pub fn person_key(worktree: &Path) -> AgentKey {
 /// Formats bytes in lowercase hexadecimal.
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        let _ = write!(text, "{byte:02x}");
+        text.push_str(&format!("{byte:02x}"));
     }
     text
 }
@@ -287,7 +288,18 @@ pub fn parse_inbox(bytes: &[u8]) -> Vec<Notice> {
     let text = String::from_utf8_lossy(bytes);
     text.lines()
         .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(has_valid_ids)
         .collect()
+}
+
+/// Tool results show the IDs of a notice outside `untrusted_data`, so a line that holds other text
+/// in these fields counts as a damaged line.
+fn has_valid_ids(notice: &Notice) -> bool {
+    let subject = match &notice.subject {
+        Subject::Task(id) => TaskId::parse(id).is_ok(),
+        Subject::Artifact(id) => ArtifactId::parse(id).is_ok(),
+    };
+    subject && TaskId::parse(&notice.claimed_task).is_ok()
 }
 
 /// Formats an inbox file from notices.
@@ -331,14 +343,14 @@ mod tests {
     fn a_bad_inbox_line_is_skipped() -> Result<()> {
         let notice = Notice {
             id: NoticeId::generate(),
-            subject: Subject::Task("t".to_owned()),
+            subject: Subject::Task(TaskId::generate().to_string()),
             version: 2,
             changed: vec!["plan".to_owned()],
             author: "agent:a".to_owned(),
             reason: "r".to_owned(),
             at: Timestamp::from_unix_ms(1),
             claim: "c".to_owned(),
-            claimed_task: "t".to_owned(),
+            claimed_task: TaskId::generate().to_string(),
         };
         let text = format!("not json\n{}", format_inbox(std::slice::from_ref(&notice))?);
         assert_eq!(parse_inbox(text.as_bytes()), vec![notice]);

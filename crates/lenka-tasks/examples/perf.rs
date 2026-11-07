@@ -123,7 +123,11 @@ fn percentile(values: &mut [Duration], part: f64) -> Duration {
 }
 
 fn rss_mib() -> f64 {
-    let Ok(text) = fs::read_to_string("/proc/self/status") else {
+    let Ok(text) = lenka_core::files::read_text_limited(
+        Path::new("/proc/self/status"),
+        lenka_core::files::Links::Follow,
+        lenka_core::files::SETTINGS_LIMIT,
+    ) else {
         return 0.0;
     };
     text.lines()
@@ -224,7 +228,9 @@ fn run(dir: &Path) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     match args.get(1).map(String::as_str) {
         Some("gen") => {
             let count = args

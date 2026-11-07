@@ -3,12 +3,12 @@
 
 //! The filesystem artifact store. The bytes stay as they are, and Git LFS can track them.
 
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use lenka_core::files::{self, Links};
 use lenka_core::{Plugin, PluginInfo, Registry};
 use lenka_plugin_api::{ArtifactId, ArtifactStore, DocPath, LenkaError, Result, StoredBytes};
 use sha2::{Digest, Sha256};
@@ -121,6 +121,10 @@ impl FsStore {
             .and_then(|()| fs::rename(temp, target))
             .map_err(|err| LenkaError::io("Store the artifact", &err));
         if result.is_err() {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The write already failed, and that error goes to the caller."
+            )]
             let _ = fs::remove_file(temp);
             return result;
         }
@@ -128,23 +132,16 @@ impl FsStore {
             && let Some(dir) = target.parent()
         {
             // A record must not name bytes that a power failure removes with the rename.
-            let synced = File::open(dir).and_then(|handle| handle.sync_all());
-            if let Err(err) = accept_missing_sync(synced) {
+            if let Err(err) = files::sync_directory(dir) {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "The write already failed, and that error goes to the caller."
+                )]
                 let _ = fs::remove_file(target);
                 return Err(LenkaError::io("Flush the artifact directory", &err));
             }
         }
         Ok(())
-    }
-}
-
-/// Accepts a file system that cannot flush a directory. Any other error stops the write.
-fn accept_missing_sync(result: std::io::Result<()>) -> std::io::Result<()> {
-    match result {
-        Err(err) if matches!(err.kind(), ErrorKind::Unsupported | ErrorKind::InvalidInput) => {
-            Ok(())
-        }
-        other => other,
     }
 }
 
@@ -162,7 +159,7 @@ fn digest_text(hasher: Sha256) -> String {
     let digest = hasher.finalize();
     let mut text = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        let _ = write!(text, "{byte:02x}");
+        text.push_str(&format!("{byte:02x}"));
     }
     text
 }
@@ -176,8 +173,8 @@ impl ArtifactStore for FsStore {
         source: &Path,
     ) -> Result<StoredBytes> {
         let target = self.file_of(id, version, name)?;
-        let mut input =
-            File::open(source).map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+        let mut input = files::open_regular(source, Links::Refuse)
+            .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
         let (temp, mut output) = self.begin_write(&target)?;
         let mut hasher = Sha256::new();
         let mut size = 0_u64;
@@ -186,6 +183,10 @@ impl ArtifactStore for FsStore {
             let count = match input.read(&mut buffer) {
                 Ok(count) => count,
                 Err(err) => {
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        reason = "The write already failed, and that error goes to the caller."
+                    )]
                     let _ = fs::remove_file(&temp);
                     return Err(LenkaError::io("Read the artifact source", &err));
                 }
@@ -195,6 +196,10 @@ impl ArtifactStore for FsStore {
             }
             hasher.update(&buffer[..count]);
             if let Err(err) = output.write_all(&buffer[..count]) {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "The write already failed, and that error goes to the caller."
+                )]
                 let _ = fs::remove_file(&temp);
                 return Err(LenkaError::io("Write the artifact", &err));
             }
@@ -217,6 +222,10 @@ impl ArtifactStore for FsStore {
         let target = self.file_of(id, version, name)?;
         let (temp, mut output) = self.begin_write(&target)?;
         if let Err(err) = output.write_all(bytes) {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The write already failed, and that error goes to the caller."
+            )]
             let _ = fs::remove_file(&temp);
             return Err(LenkaError::io("Write the artifact", &err));
         }
@@ -240,15 +249,17 @@ impl ArtifactStore for FsStore {
             ));
         }
         check_regular_file(&file)?;
-        fs::read(&file).map_err(|err| LenkaError::io("Read the artifact", &err))
+        // A caller with a memory limit uses `get_limited`.
+        files::read_limited(&file, Links::Refuse, u64::MAX)
+            .map_err(|err| LenkaError::io("Read the artifact", &err))
     }
 
     fn sha256(&self, id: ArtifactId, version: u64, name: &str) -> Result<String> {
         let path = self.file_of(id, version, name)?;
         self.check_no_symlink(&path)?;
         check_regular_file(&path)?;
-        let mut input =
-            File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
+        let mut input = files::open_regular(&path, Links::Refuse)
+            .map_err(|err| LenkaError::io("Read the artifact", &err))?;
         let mut hasher = Sha256::new();
         let mut buffer = vec![0_u8; 64 * 1024];
         loop {
@@ -273,8 +284,8 @@ impl ArtifactStore for FsStore {
         let path = self.file_of(id, version, name)?;
         self.check_no_symlink(&path)?;
         check_regular_file(&path)?;
-        let file =
-            fs::File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
+        let file = files::open_regular(&path, Links::Refuse)
+            .map_err(|err| LenkaError::io("Read the artifact", &err))?;
         let mut bytes = Vec::new();
         file.take(max_bytes.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -313,16 +324,6 @@ impl ArtifactStore for FsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_a_missing_directory_flush_is_accepted() {
-        use std::io::Error;
-        assert!(accept_missing_sync(Ok(())).is_ok());
-        assert!(accept_missing_sync(Err(Error::from(ErrorKind::Unsupported))).is_ok());
-        assert!(accept_missing_sync(Err(Error::from(ErrorKind::InvalidInput))).is_ok());
-        assert!(accept_missing_sync(Err(Error::from(ErrorKind::PermissionDenied))).is_err());
-        assert!(accept_missing_sync(Err(Error::other("disk error"))).is_err());
-    }
 
     #[test]
     fn round_trip_with_a_known_hash() -> Result<()> {

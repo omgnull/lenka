@@ -202,7 +202,8 @@ fn init_logs() {
             level.min(tracing_subscriber::filter::LevelFilter::INFO),
         );
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(crate::output::SafeLogWriter::default)
+        .with_ansi(false)
         .with_max_level(level)
         .with_target(false)
         .finish()
@@ -240,6 +241,10 @@ fn usage_error(error: &clap::Error) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "No channel is left to report a failed print."
+    )]
     let _ = error.print();
     if is_answer {
         ExitCode::SUCCESS
@@ -434,8 +439,12 @@ fn restore(
 
 /// Refuses a restore if another clone on this machine uses the same project name.
 fn check_free_name(paths: &Paths, name: Option<&str>, directory: &Path) -> anyhow::Result<()> {
-    let text = std::fs::read_to_string(directory.join(lenka_core::settings::PROJECT_FILE))
-        .context("Read lenka.toml")?;
+    let text = lenka_core::files::read_text_limited(
+        &directory.join(lenka_core::settings::PROJECT_FILE),
+        lenka_core::files::Links::Refuse,
+        lenka_core::files::SETTINGS_LIMIT,
+    )
+    .context("Read lenka.toml")?;
     let config = lenka_core::ProjectConfig::parse(&text)?;
     let name = name.unwrap_or(&config.name);
     let projects = ProjectsFile::load(paths)?;

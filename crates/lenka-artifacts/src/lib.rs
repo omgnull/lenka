@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use lenka_core::files::{self, Links};
 use lenka_core::notices::{self, FEED_PATH};
 use lenka_core::secret::{self, SecretPolicy, TextCheck};
 use lenka_core::{
@@ -142,6 +143,21 @@ fn guess_media_type(name: &str) -> &'static str {
         "rs" | "py" | "js" | "ts" | "go" | "c" | "h" | "cpp" | "java" | "sh" => "text/plain",
         _ => "application/octet-stream",
     }
+}
+
+/// Opens a source path that `check_source` made real. A swap of the file or of a parent directory
+/// for a symlink after that check fails here, so the read stays in the worktree.
+fn open_source(path: &Path) -> Result<std::fs::File> {
+    let file = files::open_regular(path, Links::Refuse)
+        .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+    let real = lenka_core::gitdir::real_path(path)
+        .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+    if real != path {
+        return Err(LenkaError::invalid_argument(
+            "The artifact source changed during the call. Try again.",
+        ));
+    }
+    Ok(file)
 }
 
 /// Refuses a source file that an agent cannot use. An agent can use only files inside its current
@@ -585,8 +601,7 @@ fn check_not_lfs_pointer(prepared: &Prepared) -> Result<()> {
     let mut start = [0_u8; LFS_POINTER_STARTS[0].len()];
     let count = match &prepared.content {
         Content::Path(path) => {
-            let mut file = std::fs::File::open(path)
-                .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+            let mut file = open_source(path)?;
             let mut count = 0;
             while count < start.len() {
                 let read = file
@@ -621,8 +636,7 @@ fn check_content(prepared: &Prepared) -> Result<Option<String>> {
     let location = format!("artifact {}", prepared.file);
     match &prepared.content {
         Content::Path(path) => {
-            let file = std::fs::File::open(path)
-                .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
+            let file = open_source(path)?;
             let mut reader = HashingReader {
                 inner: file,
                 hasher: Sha256::new(),
@@ -653,11 +667,10 @@ impl std::io::Read for HashingReader {
 }
 
 fn digest_text(hasher: Sha256) -> String {
-    use std::fmt::Write as _;
     let digest = hasher.finalize();
     let mut text = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        let _ = write!(text, "{byte:02x}");
+        text.push_str(&format!("{byte:02x}"));
     }
     text
 }
@@ -824,6 +837,30 @@ impl ToolProvider for ArtifactTools {
 
 #[cfg(test)]
 mod tests {
+
+    /// The swap of a parent directory for a symlink keeps the file and its inode the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_source_through_a_swapped_parent_directory_is_refused() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let real = lenka_core::gitdir::real_path(temp.path())
+            .map_err(|err| LenkaError::io("real path", &err))?;
+        let outside = real.join("outside");
+        let link = real.join("link");
+        std::fs::create_dir(&outside).map_err(|err| LenkaError::io("create", &err))?;
+        std::fs::write(outside.join("file"), "text")
+            .map_err(|err| LenkaError::io("write", &err))?;
+        std::os::unix::fs::symlink(&outside, &link).map_err(|err| LenkaError::io("link", &err))?;
+        assert!(open_source(&outside.join("file")).is_ok());
+        assert_eq!(
+            open_source(&link.join("file"))
+                .map(|_| ())
+                .map_err(|err| err.code()),
+            Err(lenka_plugin_api::ErrorCode::InvalidArgument)
+        );
+        Ok(())
+    }
+
     use super::*;
 
     #[test]

@@ -9,6 +9,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use lenka_core::files::{Links, open_regular, read_text_limited};
 use lenka_core::init::{CallerSetup, caller_for};
 use lenka_core::notices::parse_inbox;
 use lenka_core::{Notice, Paths, ProjectsFile, Subject};
@@ -63,6 +64,10 @@ impl ShownNotices {
     fn save_markers(&self) {
         for (marker, newest) in &self.markers {
             if !fs::symlink_metadata(marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    reason = "A failed write only shows the notice again in the next call."
+                )]
                 let _ = fs::write(marker, newest.to_string());
             }
         }
@@ -82,6 +87,10 @@ fn read_input() -> Option<String> {
             .lock()
             .take(MAX_INPUT_BYTES)
             .read_to_string(&mut text);
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "A send fails only if the hook stopped its wait."
+        )]
         let _ = sender.send(read.ok().map(|_| text));
     });
     receiver.recv_timeout(INPUT_WAIT).ok().flatten()
@@ -216,10 +225,7 @@ fn has_symlink(base: &Path, path: &Path) -> bool {
 /// Reads the end of a file, because new notices are at the end. The result holds only whole lines.
 fn read_end(path: &Path) -> Option<Vec<u8>> {
     // A symlink can point out of the data, and the open of a named pipe waits with no limit.
-    if !fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut file = fs::File::open(path).ok()?;
+    let mut file = open_regular(path, Links::Refuse).ok()?;
     let len = file.metadata().ok()?.len();
     let start = len.saturating_sub(MAX_INBOX_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
@@ -233,11 +239,8 @@ fn read_end(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn read_limited(path: &Path) -> Option<Vec<u8>> {
-    if !fs::symlink_metadata(path).ok()?.is_file() {
-        return None;
-    }
     let mut bytes = Vec::new();
-    fs::File::open(path)
+    open_regular(path, Links::Refuse)
         .ok()?
         .take(MAX_INBOX_BYTES)
         .read_to_end(&mut bytes)
@@ -362,7 +365,7 @@ pub fn install(paths: &Paths, cwd: &Path, assume_yes: bool, json_mode: bool) -> 
         Ok(meta) => Some(meta.permissions()),
         Err(_) => None,
     };
-    let mut root = match fs::read_to_string(&file) {
+    let mut root = match read_text_limited(&file, Links::Follow, MAX_INPUT_BYTES) {
         Ok(text) => serde_json::from_str(&text).with_context(|| {
             format!(
                 "{} is not valid JSON. Repair the file, and try again",

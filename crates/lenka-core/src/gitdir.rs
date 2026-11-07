@@ -5,10 +5,14 @@
 //!
 //! The hook has a time limit of 10 ms, so it cannot start another process.
 
+use crate::files::{Links, read_text_limited};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The Git location of a directory.
+/// The limit of a small file that Git keeps for a worktree.
+const GIT_FILE_LIMIT: u64 = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitLocation {
     /// The top directory of the worktree.
@@ -72,7 +76,7 @@ pub fn locate(start: &Path) -> Option<GitLocation> {
 }
 
 fn read_git_file(file: &Path, base: &Path) -> Option<PathBuf> {
-    let text = fs::read_to_string(file).ok()?;
+    let text = read_text_limited(file, Links::Refuse, GIT_FILE_LIMIT).ok()?;
     let target = text.strip_prefix("gitdir:")?.trim();
     let path = Path::new(target);
     let full = if path.is_absolute() {
@@ -84,7 +88,8 @@ fn read_git_file(file: &Path, base: &Path) -> Option<PathBuf> {
 }
 
 fn common_dir_of(git_dir: &Path) -> PathBuf {
-    let Ok(text) = fs::read_to_string(git_dir.join("commondir")) else {
+    let Ok(text) = read_text_limited(&git_dir.join("commondir"), Links::Refuse, GIT_FILE_LIMIT)
+    else {
         return git_dir.to_path_buf();
     };
     let path = Path::new(text.trim());

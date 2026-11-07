@@ -3,6 +3,10 @@
 
 //! Behavior tests of the task engine: ready work, stages, claims, notices, links, and repair.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1272,7 +1276,7 @@ fn a_child_with_an_invalid_state_holds_its_parent_open() -> Result<()> {
         .join("state.toml");
     write_file(&state, "not valid = [")?;
     let snapshot = fx.data_dir("api").join(".runtime/index/snapshot.json");
-    let _ = fs::remove_file(snapshot);
+    fs::remove_file(snapshot).ok();
     let host = build_host(&fx.paths, &fx.clock)?;
     let other = service_of(&host.open_by_name("api")?)?;
     let finish = Finish::Done {
@@ -2407,7 +2411,8 @@ fn each_state_write_records_a_hand_edit_first() -> Result<()> {
         }
         let version = service.detail(id, &[])?.meta.state.version;
         hand_edit(&fx, id, "task.md", "Text.", "Edited by hand.")?;
-        let _ = write(&service, &human, id);
+        // This test checks the record of the edit, and a write can refuse an edited task.
+        write(&service, &human, id).ok();
         let root = fx.data_dir("api").join("tasks").join(id.to_string());
         let meta = root.join(format!("versions/{:06}/meta.toml", version + 1));
         let recorded = fs::read_to_string(&meta).unwrap_or_default();
@@ -3724,5 +3729,304 @@ fn the_time_of_a_write_starts_after_the_wait_for_the_lock() -> Result<()> {
             .map_err(|_| LenkaError::invalid_argument("The writer stopped."))?
     })?;
     assert!(after.front.created_at > before);
+    Ok(())
+}
+
+/// One cell of the operation and state matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Update,
+    Claim,
+    Advance,
+    FinishDone,
+    FinishReleased,
+    Pause,
+    SetStatus,
+    AddEntry,
+    Delete,
+}
+
+const OPS: [Op; 9] = [
+    Op::Update,
+    Op::Claim,
+    Op::Advance,
+    Op::FinishDone,
+    Op::FinishReleased,
+    Op::Pause,
+    Op::SetStatus,
+    Op::AddEntry,
+    Op::Delete,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskState {
+    Open,
+    Done,
+    Cancelled,
+    Invalid,
+    LoopStopped,
+    HeldByOther,
+    HeldBySelf,
+}
+
+const STATES: [TaskState; 7] = [
+    TaskState::Open,
+    TaskState::Done,
+    TaskState::Cancelled,
+    TaskState::Invalid,
+    TaskState::LoopStopped,
+    TaskState::HeldByOther,
+    TaskState::HeldBySelf,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Who {
+    Agent,
+    Person,
+    PersonOverride,
+    AgentOverride,
+}
+
+const WHO: [Who; 4] = [
+    Who::Agent,
+    Who::Person,
+    Who::PersonOverride,
+    Who::AgentOverride,
+];
+
+fn run_op(service: &TaskService, who: &Caller, id: TaskId, op: Op, claim: &ClaimRef) -> Result<()> {
+    let version = service
+        .detail(id, &[])
+        .map_or(1, |view| view.meta.state.version);
+    match op {
+        Op::Update => {
+            let patch = TaskPatch {
+                claim: claim.clone(),
+                ..text_change(version)
+            };
+            service.update(who, id, patch).map(|_| ())
+        }
+        Op::Claim => service.claim(who, Some(id), None, None).map(|_| ()),
+        Op::Advance => service
+            .advance(who, id, claim, "A check.", None)
+            .map(|_| ()),
+        Op::FinishDone => {
+            let done = Finish::Done {
+                evidence: "A check.".to_owned(),
+                unchecked_reason: None,
+            };
+            service.finish(who, id, claim, &done).map(|_| ())
+        }
+        Op::FinishReleased => service
+            .finish(who, id, claim, &Finish::Released)
+            .map(|_| ()),
+        Op::Pause => service.pause(who, id, claim).map(|_| ()),
+        Op::SetStatus => service
+            .set_status(who, id, Status::Backlog, claim)
+            .map(|_| ()),
+        Op::AddEntry => {
+            let entry = NewEntry {
+                kind: EntryKind::Comment,
+                text: "A note.".to_owned(),
+                replaces: None,
+                secret_policy: lenka_core::SecretPolicy::Enforce,
+            };
+            service.add_entry(who, id, entry).map(|_| ())
+        }
+        Op::Delete => service.delete(who, id),
+    }
+}
+
+/// Runs one cell in a new project, and checks the rules that hold in all cells.
+fn run_cell(op: Op, state: TaskState, who: Who) -> Result<String> {
+    let fx = fixture()?;
+    let mut service = fx.project("api")?;
+    let (other, doer, human) = (fx.agent("other"), fx.agent("doer"), fx.human());
+    // An advance needs a later stage, and the default types have one stage.
+    if op == Op::Advance {
+        let mut config: ProjectConfig = (*service.project().config()).clone();
+        let stage = |name: &str| Stage {
+            name: name.to_owned(),
+            actor: Actor::Any,
+            unblocks: false,
+        };
+        let stages = vec![stage("first"), stage("second")];
+        config.types.insert("pair".to_owned(), TypeDef { stages });
+        service.project().save_config(config)?;
+    }
+    let new = NewTask {
+        kind: if op == Op::Advance { "pair" } else { "" }.to_owned(),
+        ..NewTask::default()
+    };
+    let id = service
+        .create(
+            &human,
+            NewTask {
+                title: "T".to_owned(),
+                description: "Text.".to_owned(),
+                ..new
+            },
+        )?
+        .id();
+    let acting = if matches!(who, Who::Agent | Who::AgentOverride) {
+        &doer
+    } else {
+        &human
+    };
+    match state {
+        TaskState::Open => {}
+        TaskState::Done => {
+            let done = Finish::Done {
+                evidence: "A check.".to_owned(),
+                unchecked_reason: None,
+            };
+            if op == Op::Advance {
+                service.advance(&human, id, &ClaimRef::Override, "A check.", None)?;
+            }
+            service.finish(&human, id, &ClaimRef::Override, &done)?;
+        }
+        TaskState::Cancelled => {
+            service.set_status(&human, id, Status::Cancelled, &ClaimRef::Implicit)?;
+        }
+        TaskState::Invalid => {
+            fs::write(task_file(&fx, id, "task.md"), "garbage")
+                .map_err(|err| LenkaError::io("write", &err))?;
+            let host = build_host(&fx.paths, &fx.clock)?;
+            service = service_of(&host.open_by_name("api")?)?;
+        }
+        TaskState::LoopStopped => reach_loop_limit(&service, &other, id)?,
+        TaskState::HeldByOther => {
+            service.claim(&other, Some(id), None, None)?;
+        }
+        TaskState::HeldBySelf => {
+            service.claim(acting, Some(id), None, None)?;
+        }
+    }
+    let notices = |service: &TaskService| -> Result<usize> {
+        Ok(lenka_core::notices::read_inbox(service.project().driver(), &other.agent_key)?.len())
+    };
+    let notices_before = notices(&service)?;
+    let state_before = fs::read_to_string(task_file(&fx, id, "state.toml")).unwrap_or_default();
+    let claim = if matches!(who, Who::PersonOverride | Who::AgentOverride) {
+        ClaimRef::Override
+    } else {
+        ClaimRef::Implicit
+    };
+    let result = run_op(&service, acting, id, op, &claim);
+    let cell = format!("{op:?} {state:?} {who:?}");
+    let state_after = fs::read_to_string(task_file(&fx, id, "state.toml")).unwrap_or_default();
+    match result {
+        Err(error) => {
+            assert_eq!(
+                state_before, state_after,
+                "{cell}: a refused call changed the state"
+            );
+            Ok(error.code().as_str().to_owned())
+        }
+        Ok(()) => {
+            let mut holder_lost = false;
+            if state == TaskState::HeldByOther {
+                let claims = fx.data_dir("api").join(".runtime/claims");
+                holder_lost = !claims.join(format!("{id}.toml")).exists() || op == Op::Claim;
+            }
+            let told = notices(&service)? > notices_before;
+            assert!(
+                !holder_lost || told,
+                "{cell}: the holder lost its claim with no notice"
+            );
+            Ok("ok".to_owned())
+        }
+    }
+}
+
+/// The result of each operation in each state. The columns are the operation, the state, an agent,
+/// a person, a person with an override, and an agent with an override.
+const MATRIX: [&str; 63] = [
+    "Update|Open|ok|ok|ok|actor_denied",
+    "Update|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Update|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Update|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "Update|LoopStopped|loop_limit|ok|ok|loop_limit",
+    "Update|HeldByOther|claim_lost|claim_lost|ok|actor_denied",
+    "Update|HeldBySelf|ok|ok|ok|actor_denied",
+    "Claim|Open|ok|ok|ok|ok",
+    "Claim|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Claim|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Claim|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "Claim|LoopStopped|loop_limit|ok|ok|loop_limit",
+    "Claim|HeldByOther|claim_lost|claim_lost|claim_lost|claim_lost",
+    "Claim|HeldBySelf|ok|ok|ok|ok",
+    "Advance|Open|claim_lost|ok|ok|actor_denied",
+    "Advance|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Advance|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "Advance|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "Advance|LoopStopped|claim_lost|ok|ok|actor_denied",
+    "Advance|HeldByOther|claim_lost|claim_lost|ok|actor_denied",
+    "Advance|HeldBySelf|ok|ok|ok|actor_denied",
+    "FinishDone|Open|claim_lost|ok|ok|actor_denied",
+    "FinishDone|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "FinishDone|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "FinishDone|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "FinishDone|LoopStopped|claim_lost|ok|ok|actor_denied",
+    "FinishDone|HeldByOther|claim_lost|claim_lost|ok|actor_denied",
+    "FinishDone|HeldBySelf|ok|ok|ok|actor_denied",
+    "FinishReleased|Open|claim_lost|claim_lost|ok|actor_denied",
+    "FinishReleased|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "FinishReleased|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "FinishReleased|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "FinishReleased|LoopStopped|claim_lost|claim_lost|ok|actor_denied",
+    "FinishReleased|HeldByOther|claim_lost|claim_lost|ok|actor_denied",
+    "FinishReleased|HeldBySelf|ok|ok|ok|actor_denied",
+    "Pause|Open|ok|ok|ok|actor_denied",
+    "Pause|Done|invalid_argument|invalid_argument|invalid_argument|actor_denied",
+    "Pause|Cancelled|invalid_argument|invalid_argument|invalid_argument|actor_denied",
+    "Pause|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "Pause|LoopStopped|loop_limit|ok|ok|actor_denied",
+    "Pause|HeldByOther|claim_lost|claim_lost|ok|actor_denied",
+    "Pause|HeldBySelf|ok|ok|ok|actor_denied",
+    "SetStatus|Open|actor_denied|ok|ok|actor_denied",
+    "SetStatus|Done|actor_denied|ok|ok|actor_denied",
+    "SetStatus|Cancelled|actor_denied|ok|ok|actor_denied",
+    "SetStatus|Invalid|actor_denied|invalid_file|invalid_file|actor_denied",
+    "SetStatus|LoopStopped|actor_denied|ok|ok|actor_denied",
+    "SetStatus|HeldByOther|actor_denied|claim_lost|ok|actor_denied",
+    "SetStatus|HeldBySelf|actor_denied|ok|ok|actor_denied",
+    "AddEntry|Open|ok|ok|ok|ok",
+    "AddEntry|Done|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "AddEntry|Cancelled|invalid_argument|invalid_argument|invalid_argument|invalid_argument",
+    "AddEntry|Invalid|invalid_file|invalid_file|invalid_file|invalid_file",
+    "AddEntry|LoopStopped|loop_limit|ok|ok|loop_limit",
+    "AddEntry|HeldByOther|ok|ok|ok|ok",
+    "AddEntry|HeldBySelf|ok|ok|ok|ok",
+    "Delete|Open|ok|ok|ok|ok",
+    "Delete|Done|ok|ok|ok|ok",
+    "Delete|Cancelled|ok|ok|ok|ok",
+    "Delete|Invalid|invalid_file|ok|ok|invalid_file",
+    "Delete|LoopStopped|loop_limit|ok|ok|loop_limit",
+    "Delete|HeldByOther|claim_lost|claim_lost|claim_lost|claim_lost",
+    "Delete|HeldBySelf|ok|ok|ok|ok",
+];
+
+/// A new operation or state must get a row here. A state rule that one path misses shows as a wrong
+/// cell, and `run_cell` also checks the rules that hold in all cells.
+#[test]
+fn each_operation_gives_the_expected_result_in_each_state() -> Result<()> {
+    let mut rows = Vec::new();
+    for op in OPS {
+        for state in STATES {
+            let cells = WHO
+                .iter()
+                .map(|who| run_cell(op, state, *who))
+                .collect::<Result<Vec<_>>>()?;
+            rows.push(format!("{op:?}|{state:?}|{}", cells.join("|")));
+        }
+    }
+    let wrong: Vec<_> = rows
+        .iter()
+        .zip(MATRIX)
+        .filter(|(found, expected)| *found != expected)
+        .collect();
+    assert_eq!(rows.len(), MATRIX.len());
+    assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }

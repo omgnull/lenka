@@ -3,6 +3,10 @@
 
 //! Behavior tests of shared memory: tools, search order, secrets, and delete rules.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;

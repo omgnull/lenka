@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use lenka_core::files;
 use lenka_core::gitdir;
 use lenka_core::init::{GIT_DATA_DIR, GITATTRIBUTES};
 use lenka_core::layout::{self, TEMP_PREFIX};
@@ -592,7 +593,15 @@ fn output_with_limit(mut command: Command, limit: Duration) -> std::io::Result<O
             }));
         }
         if start.elapsed() >= limit {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The call already failed with a time limit."
+            )]
             let _ = child.kill();
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The call already failed with a time limit."
+            )]
             let _ = child.wait();
             return Ok(None);
         }
@@ -605,7 +614,15 @@ fn read_in_background(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<
     if let Some(mut pipe) = pipe {
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The caller uses the bytes that this read got."
+            )]
             let _ = pipe.read_to_end(&mut bytes);
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "A send fails only if the call already gave up."
+            )]
             let _ = sender.send(bytes);
         });
     }
@@ -727,6 +744,10 @@ pub fn enable(
         }
     } else if let Some(common) = &linked_common {
         // An `enable` can stop before its last step. A repair of a good worktree changes nothing.
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "A repair of a good worktree changes nothing, and the next step reports a bad one."
+        )]
         let _ = clone_git(common).output([
             OsStr::new("worktree"),
             OsStr::new("repair"),
@@ -926,6 +947,10 @@ fn connect_worktree(common_dir: &Path, dir: &Path) -> Result<()> {
     temp.push(format!("{CONNECT_SUFFIX}{}", std::process::id()));
     let temp = PathBuf::from(temp);
     let connected = link_worktree(&git, &temp.join(GIT_DATA_DIR), dir);
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "A leftover temporary directory does no harm to the data."
+    )]
     let _ = fs::remove_dir_all(&temp);
     connected
 }
@@ -994,6 +1019,10 @@ fn remove_old_connect_dirs(dir: &Path) {
     };
     for entry in entries.flatten() {
         if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "A leftover temporary directory does no harm to the data."
+            )]
             let _ = fs::remove_dir_all(entry.path());
         }
     }
@@ -1009,11 +1038,14 @@ fn forget_absent_worktree(common_dir: &Path) {
     let head = format!("ref: {BRANCH_REF}");
     for entry in entries.flatten() {
         let record = entry.path();
-        let holds_branch =
-            fs::read_to_string(record.join("HEAD")).is_ok_and(|text| text.trim() == head);
-        let absent = fs::read_to_string(record.join("gitdir"))
+        let holds_branch = read_record(&record.join("HEAD")).is_ok_and(|text| text.trim() == head);
+        let absent = read_record(&record.join("gitdir"))
             .is_ok_and(|target| fs::symlink_metadata(record.join(target.trim())).is_err());
         if holds_branch && absent && !record.join("locked").exists() {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "Git reports a record that stays."
+            )]
             let _ = fs::remove_dir_all(&record);
         }
     }
@@ -1405,6 +1437,12 @@ impl EventHook for GitHook {
         }
         result
     }
+}
+
+/// Reads a small record file that Git keeps for a worktree.
+fn read_record(file: &Path) -> std::io::Result<String> {
+    const RECORD_LIMIT: u64 = 64 * 1024;
+    files::read_text_limited(file, files::Links::Refuse, RECORD_LIMIT)
 }
 
 #[cfg(test)]

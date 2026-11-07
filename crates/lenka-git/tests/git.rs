@@ -8,6 +8,10 @@
 //! The tests never read the real configuration of the user. They do not need Git LFS: the one
 //! test for it stops at once on a machine without Git LFS.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 use std::env;
 use std::ffi::OsStr;
 use std::fs;

@@ -3,6 +3,10 @@
 
 //! A source file that changes between the secret check and the copy.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

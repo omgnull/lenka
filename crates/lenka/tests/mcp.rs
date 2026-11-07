@@ -3,6 +3,10 @@
 
 //! Tests of MCP with a real `rmcp` client and the built binary, in both protocol eras.
 
+#![expect(
+    clippy::disallowed_methods,
+    reason = "A test reads files that it wrote, and it needs no guard."
+)]
 #[expect(dead_code, reason = "this test binary uses only a part of the helpers")]
 mod common;
 #[path = "common/mcp.rs"]

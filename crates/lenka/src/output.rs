@@ -29,6 +29,23 @@ fn is_unsafe_on_terminal(item: char) -> bool {
     (item.is_control() && !matches!(item, '\n' | '\t')) || is_direction_control(item)
 }
 
+/// The writer of the logs. A log line can repeat text from a file, so this writer cleans each line
+/// as the other output functions do.
+#[derive(Debug, Default)]
+pub(crate) struct SafeLogWriter;
+
+impl std::io::Write for SafeLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let text = clean_for_terminal(&String::from_utf8_lossy(bytes));
+        std::io::stderr().lock().write_all(text.as_bytes())?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().lock().flush()
+    }
+}
+
 /// Replaces the characters that can change a terminal.
 fn clean_for_terminal(text: &str) -> String {
     text.chars()
@@ -58,21 +75,37 @@ fn escape_for_terminal(json: &str) -> String {
 
 pub(crate) fn write_line(args: std::fmt::Arguments<'_>) {
     let text = clean_for_terminal(&args.to_string());
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "A closed output pipe must not cause a panic."
+    )]
     let _ = writeln!(std::io::stdout().lock(), "{text}");
 }
 
 pub(crate) fn write_error(args: std::fmt::Arguments<'_>) {
     let text = clean_for_terminal(&args.to_string());
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "A closed output pipe must not cause a panic."
+    )]
     let _ = writeln!(std::io::stderr().lock(), "{text}");
 }
 
 pub(crate) fn write_text(args: std::fmt::Arguments<'_>) {
     let text = clean_for_terminal(&args.to_string());
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "A closed output pipe must not cause a panic."
+    )]
     let _ = write!(std::io::stdout().lock(), "{text}");
 }
 
 /// Prints a JSON value on one line.
 pub fn print_json(value: &Value) {
+    #[expect(
+        clippy::let_underscore_must_use,
+        reason = "A closed output pipe must not cause a panic."
+    )]
     let _ = writeln!(
         std::io::stdout().lock(),
         "{}",

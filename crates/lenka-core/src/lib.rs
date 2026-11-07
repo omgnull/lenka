@@ -7,6 +7,7 @@
 //! them by accident.
 
 pub mod clock;
+pub mod files;
 pub mod gitdir;
 pub mod host;
 pub mod init;

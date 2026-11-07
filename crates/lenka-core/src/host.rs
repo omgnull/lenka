@@ -194,7 +194,11 @@ impl Builder {
 }
 
 fn read_plugin_settings(paths: &Paths) -> Result<PluginSettings> {
-    match std::fs::read_to_string(paths.plugins_file()) {
+    match crate::files::read_text_limited(
+        &paths.plugins_file(),
+        crate::files::Links::Follow,
+        crate::files::SETTINGS_LIMIT,
+    ) {
         Ok(text) => toml::from_str(&text)
             .map_err(|err| LenkaError::invalid_file(format!("plugins.toml: {}", err.message()))),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PluginSettings::default()),
@@ -404,9 +408,10 @@ impl Host {
             .stores
             .get(store_name.as_str())
             .ok_or_else(|| {
-                LenkaError::invalid_argument(format!(
-                    "The artifact store {store_name} is not available in this build."
-                ))
+                // The name comes from a file, and this message goes to agents.
+                LenkaError::invalid_argument(
+                    "The artifact store in lenka.toml is not available in this build.",
+                )
             })?;
         let store = store_factory(&entry.directory)?;
         let project = Project::open(
