@@ -701,23 +701,33 @@ mod tests {
     }
 
     /// The open of a named pipe waits with no limit, before the wait limit of the lock starts.
-    #[cfg(unix)]
     #[test]
     fn a_lock_file_that_is_not_regular_gives_an_error_and_no_wait() -> Result<()> {
         type Make = fn(&Path) -> std::io::Result<()>;
-        let kinds: [(&str, Make); 3] = [
-            ("a named pipe", |path| {
-                let made = std::process::Command::new("mkfifo").arg(path).status()?;
-                assert!(made.success());
-                Ok(())
+        #[cfg_attr(
+            not(unix),
+            expect(unused_mut, reason = "Only Unix adds the other kinds.")
+        )]
+        let mut kinds: Vec<(&str, Make)> = vec![("a directory", |path| fs::create_dir(path))];
+        #[cfg(unix)]
+        kinds.extend([
+            ("a named pipe", {
+                fn make(path: &Path) -> std::io::Result<()> {
+                    let made = std::process::Command::new("mkfifo").arg(path).status()?;
+                    assert!(made.success());
+                    Ok(())
+                }
+                make as Make
             }),
-            ("a directory", |path| fs::create_dir(path)),
-            ("a symlink", |path| {
-                let outside = path.with_file_name("outside");
-                fs::write(&outside, "")?;
-                std::os::unix::fs::symlink(outside, path)
+            ("a symlink", {
+                fn make(path: &Path) -> std::io::Result<()> {
+                    let outside = path.with_file_name("outside");
+                    fs::write(&outside, "")?;
+                    std::os::unix::fs::symlink(outside, path)
+                }
+                make as Make
             }),
-        ];
+        ]);
         for (name, make) in kinds {
             let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
             let lock = temp.path().join(LOCK_PATH);
