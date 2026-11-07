@@ -49,6 +49,12 @@ fn isolated(name: &str, config: &str, body: impl FnOnce() -> TestResult) -> Test
     let file = temp.path().join("gitconfig");
     fs::write(&file, config)?;
     let mut command = Command::new(env::current_exe()?);
+    // An inherited Git variable can change the identity, the repository, or the settings.
+    for (key, _) in env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(key);
+        }
+    }
     command
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD_FLAG, "1")
@@ -56,15 +62,6 @@ fn isolated(name: &str, config: &str, body: impl FnOnce() -> TestResult) -> Test
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", temp.path())
         .env("XDG_CONFIG_HOME", temp.path());
-    for var in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_AUTHOR_NAME",
-        "GIT_COMMITTER_NAME",
-    ] {
-        command.env_remove(var);
-    }
     let output = command.output()?;
     assert!(
         output.status.success(),

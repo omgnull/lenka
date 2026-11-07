@@ -32,6 +32,12 @@ impl Machine {
     }
 
     pub fn apply_env(&self, command: &mut Command) {
+        // An inherited Git variable can change the identity, the repository, or the settings.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
         command
             .env("LENKA_CONFIG_DIR", self.root.join("config"))
             .env("LENKA_DATA_DIR", self.root.join("data"))
@@ -41,10 +47,7 @@ impl Machine {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("USER", "tester")
             .env_remove("LENKA_AGENT")
-            .env_remove("LENKA_PROJECT")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE");
+            .env_remove("LENKA_PROJECT");
     }
 
     pub fn command(&self, dir: &Path, args: &[&str]) -> Command {
