@@ -18,6 +18,7 @@ jobs:
   check:
     name: Format, lint, test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +44,7 @@ jobs:
   features:
     name: Build plugin (${{ matrix.features || 'none' }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +63,7 @@ jobs:
   deny:
     name: Dependency policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,3 +71,53 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           rust-version: stable
+
+  mutants:
+    name: Mutation check of the changed lines
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # A report only, for now. Make it block when the noise is low.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The diff needs the base branch.
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Install GUI libraries
+        run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Find the changed lines
+        id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff "origin/${BASE_REF}...HEAD" -- crates/lenka-tasks crates/lenka-core crates/lenka-mcp crates/lenka/src/hook.rs > mutants.diff
+          count=$(cargo mutants --in-diff mutants.diff --list | wc -l)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "The changed lines give ${count} mutants."
+      # One mutant takes about one minute, so a large change gets no run.
+      - name: Skip a large change
+        if: fromJSON(steps.diff.outputs.count) > 40
+        run: echo "::notice::The change gives ${{ steps.diff.outputs.count }} mutants, more than 40, so the mutation check does not run."
+      # A test of one crate often checks the code of another, so the run uses the tests of all
+      # crates. The desktop tests are slow, and they check only the desktop code.
+      - name: Test the mutants
+        if: fromJSON(steps.diff.outputs.count) > 0 && fromJSON(steps.diff.outputs.count) <= 40
+        run: >-
+          cargo mutants --in-diff mutants.diff --no-shuffle -j 2 --timeout 300
+          --test-package lenka-plugin-api,lenka-core,lenka-driver-local,lenka-artifact-fs,lenka-tasks,lenka-artifacts,lenka-memory,lenka-git,lenka-mcp,lenka
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-out
+          path: mutants.out
+          if-no-files-found: ignore
