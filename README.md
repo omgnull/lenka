@@ -193,7 +193,10 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - The only network use is the Git plugin through system Git, and only when you enable it.
 - Data from a remote is untrusted. `lenka sync` and `lenka init` accept a data branch only if each file has a known lenka path. They refuse a symlink, a `.runtime` directory, a `.gitignore` below the data root, a changed `.gitattributes`, a change of the project ID, and conflict markers in a task. A manual `git pull` in a data directory does not have these checks, so use `lenka sync`.
 - A commit holds only the known lenka paths. Other files stay in the clone, and `lenka sync` lists them. Git exclude rules cannot hide data from a commit.
-- Before a push, `lenka sync` runs the secret check on each file that the push adds or changes. This includes a hand edit and a merge. If a file matches a pattern, nothing is pushed. Remove the secret, or run `lenka sync --allow-secret` to push the file. The remote and its history then keep the file.
+- Before a push, lenka runs the secret check on each object that the push sends: the files of all local commits, their Git LFS objects, and the commit messages. This includes a hand edit, a merge, and the push at a finish. If an object matches a pattern, nothing is pushed.
+  - A sync commits a hand edit before the check. So a change of the file is not enough after a match, because an earlier local commit still holds the secret.
+  - To remove the secret, change the file, run `git reset --soft origin/lenka-data` in the data directory, and run `lenka sync` again.
+  - To push it anyway, run `lenka sync --allow-secret`. The remote and its history then keep the secret.
 - `lenka git enable` needs Git 2.30 or later. It does not move the data, so a running lenka process can continue. A stopped call can run again.
 - A push in an agent call stops after 60 seconds, and the tool result reports this. `LENKA_GIT_PUSH_LIMIT_MS` changes the limit. The call also turns off the password questions of SSH, unless you set your own SSH command.
 - A write waits 30 seconds for the lock, and then fails with `busy`. `LENKA_LOCK_WAIT_MS` changes the limit.
