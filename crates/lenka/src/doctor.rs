@@ -26,6 +26,7 @@ const NETWORK_TYPES: &[&str] = &[
     "fuse.rclone",
     "fuse.glusterfs",
     "fuse.ceph",
+    "fuse.s3fs",
 ];
 
 /// Reads the type of the mount that holds a path, from the text of `/proc/self/mountinfo`.
@@ -122,6 +123,7 @@ bad line
         assert!(is_network_type("nfs4"));
         assert!(is_network_type("fuse.sshfs"));
         assert!(is_network_type("fuse.glusterfs"));
+        assert!(is_network_type("fuse.s3fs"));
         assert!(is_network_type("vboxsf"));
         assert!(!is_network_type("ext4"));
         assert!(!is_network_type("btrfs"));

@@ -19,7 +19,7 @@ pub(crate) struct SettingsState {
     /// The draft and the settings that the draft started from.
     pub draft: Option<ProjectConfig>,
     base: Option<ProjectConfig>,
-    link_to: String,
+    pub(crate) link_to: String,
     accept_from: String,
     new_type: String,
     pub error: Option<String>,
@@ -33,8 +33,7 @@ impl SettingsState {
     /// Loads the settings of the project into the draft, unless the person edits a draft.
     pub(crate) fn load(&mut self, session: &Session) {
         let current = (*session.project.config()).clone();
-        let edited = self.draft.is_some() && self.draft != self.base;
-        if edited {
+        if self.draft.is_some() && self.is_dirty() {
             return;
         }
         self.link_to = current.links.link_to.join("\n");

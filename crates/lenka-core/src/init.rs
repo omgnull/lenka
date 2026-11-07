@@ -379,6 +379,13 @@ pub fn register_existing(
     validate_project_name(&name)?;
     let clone_file = paths.with_user_lock(|| {
         let mut projects = ProjectsFile::load(paths)?;
+        if let Some(entry) = projects.projects.get(&name)
+            && entry.directory != directory
+        {
+            return Err(LenkaError::invalid_argument(format!(
+                "The project name {name} is already in use at another directory. Select another name."
+            )));
+        }
         projects.projects.insert(
             name.clone(),
             ProjectEntry {
@@ -571,6 +578,29 @@ mod tests {
         let clone = CloneFile::load(&clone_file_for(&cwd))?
             .ok_or_else(|| LenkaError::not_found("clone"))?;
         assert_eq!(clone.projects.len(), 13);
+        Ok(())
+    }
+
+    #[test]
+    fn a_registered_name_keeps_its_directory() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        for dir in [&first, &second] {
+            fs::create_dir_all(dir).map_err(|err| LenkaError::io("mkdir", &err))?;
+            let config = ProjectConfig::new("api").to_text()?;
+            fs::write(dir.join(PROJECT_FILE), config)
+                .map_err(|err| LenkaError::io("write", &err))?;
+        }
+        register_existing(&paths, temp.path(), None, &first)?;
+        let refused = register_existing(&paths, temp.path(), None, &second);
+        assert_eq!(
+            refused.err().map(|error| error.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+        assert_eq!(ProjectsFile::load(&paths)?.projects["api"].directory, first);
+        register_existing(&paths, temp.path(), None, &first)?;
         Ok(())
     }
 

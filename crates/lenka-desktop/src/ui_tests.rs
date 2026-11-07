@@ -2074,3 +2074,151 @@ fn a_slow_file_does_not_stop_the_ui() {
     let detail = tasks.detail(ids[0], &[]).expect("detail");
     assert_eq!(detail.meta.front.artifacts.len(), 1);
 }
+
+#[test]
+fn a_new_drawing_does_not_replace_unsaved_edits() {
+    let (_fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    let count = shapes_of(&harness).len();
+    assert!(count > 0);
+    harness.state_mut().app_mut().dialog = Some(Dialog::NewDrawing {
+        task: ids[0],
+        name: "Another".to_owned(),
+        error: None,
+    });
+    harness.run();
+    click(&mut harness, "Create drawing");
+    assert_eq!(shapes_of(&harness).len(), count, "the edits stay");
+    let error = match &harness.state().app().dialog {
+        Some(Dialog::NewDrawing { error, .. }) => error.clone(),
+        other => panic!("the dialog must stay open, but found {other:?}"),
+    };
+    assert!(error.expect("an error").message.contains("open drawing"));
+}
+
+#[test]
+fn a_remote_link_as_a_parent_gives_an_error_and_keeps_the_parent() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Parent task", "Child task"]);
+    let (host, tasks) = fixture.other_process();
+    let person = fixture.person();
+    let version = tasks
+        .detail(ids[1], &[])
+        .expect("detail")
+        .meta
+        .state
+        .version;
+    tasks
+        .update(
+            &person,
+            ids[1],
+            TaskPatch {
+                expected_version: version,
+                parent: Some(Some(ids[0])),
+                reason: Some("A move".to_owned()),
+                ..TaskPatch::default()
+            },
+        )
+        .expect("an update");
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    harness.run_steps(5);
+    open_detail(&mut harness, "Child task");
+    click(&mut harness, "Relations");
+    let remote = format!("{}/{}", lenka_plugin_api::ProjectId::generate(), ids[0]);
+    {
+        let detail = harness
+            .state_mut()
+            .app_mut()
+            .detail
+            .as_mut()
+            .expect("a detail");
+        detail.link_kind = crate::detail::LinkKind::Parent;
+        detail.link_search = remote;
+    }
+    harness.run_steps(3);
+    click(&mut harness, "Add link");
+    let detail = harness.state().app().detail.as_ref().expect("a detail");
+    let error = detail.field_error.clone().expect("an error");
+    assert!(error.contains("parent"), "{error}");
+    let after = lenka_tasks::service_of(&project).expect("service");
+    assert_eq!(
+        after.detail(ids[1], &[]).expect("detail").meta.front.parent,
+        Some(ids[0])
+    );
+}
+
+/// A person must answer for each file, so a second file cannot replace the first question.
+#[test]
+fn two_finished_files_for_a_held_task_ask_one_at_a_time() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let (host, tasks) = fixture.other_process();
+    tasks
+        .claim(&fixture.agent(), Some(ids[0]), None, None)
+        .expect("a claim");
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let store = lenka_artifacts::artifacts_of(&project).expect("the store");
+    let person = fixture.person();
+    let add = |name: &str| {
+        store
+            .create(
+                &person,
+                lenka_artifacts::Source::Bytes {
+                    name,
+                    media_type: "text/plain",
+                    bytes: b"Some notes",
+                },
+                None,
+                None,
+            )
+            .expect("an artifact")
+    };
+    let (first, second) = (add("a.txt"), add("b.txt"));
+    harness.run_steps(5);
+    {
+        let app = harness.state_mut().app_mut();
+        app.add_finished_file_for_test(ids[0], first);
+        app.add_finished_file_for_test(ids[0], second);
+    }
+    harness.run_steps(3);
+    assert!(matches!(
+        harness.state().app().dialog,
+        Some(Dialog::Confirm { .. })
+    ));
+    assert_eq!(harness.state().app().pending_file_count_for_test(), 1);
+    click(&mut harness, "Cancel");
+    harness.run_steps(3);
+    assert!(matches!(
+        harness.state().app().dialog,
+        Some(Dialog::Confirm { .. })
+    ));
+    assert_eq!(harness.state().app().pending_file_count_for_test(), 0);
+}
+
+#[test]
+fn entry_text_stays_when_a_person_selects_another_task() {
+    let (_fixture, mut harness, ids) = start_with_tasks(&["First task", "Second task"]);
+    open_detail(&mut harness, "First task");
+    click(&mut harness, "Entries");
+    type_into(&mut harness, "Entry text", "A note with no save");
+    let before = harness.state().app().detail.as_ref().expect("a detail").id;
+    harness.state_mut().app_mut().select(ids[1]);
+    harness.run_steps(3);
+    let detail = harness.state().app().detail.as_ref().expect("a detail");
+    assert_eq!(detail.id, before);
+    assert_eq!(detail.entry_text, "A note with no save");
+}
+
+#[test]
+fn link_text_in_the_settings_stays_after_a_return_to_the_settings() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["A task"]);
+    click(&mut harness, "Settings");
+    harness.state_mut().app_mut().settings.link_to = "edited".to_owned();
+    harness.run_steps(3);
+    click(&mut harness, "Tree");
+    click(&mut harness, "Settings");
+    assert_eq!(harness.state().app().settings.link_to, "edited");
+}

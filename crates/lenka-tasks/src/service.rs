@@ -435,6 +435,50 @@ pub struct ArtifactRouting<'a> {
 }
 
 impl ArtifactRouting<'_> {
+    /// Checks the loop limit of an artifact under the write lock, and returns the write of its
+    /// counter. A second process cannot pass the limit between the check and the write.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::LoopLimit`] if an agent reached the limit.
+    pub fn check_loop(
+        &self,
+        project: &Project,
+        caller: &Caller,
+        artifact: ArtifactId,
+    ) -> Result<Option<Op>> {
+        if caller.actor != Actor::Agent {
+            return Ok(None);
+        }
+        let marked = self
+            .index
+            .artifact_users
+            .get(&artifact)
+            .is_some_and(|users| {
+                users.iter().any(|task| {
+                    self.index
+                        .tasks
+                        .get(task)
+                        .is_some_and(|meta| meta.state.loop_until_done)
+                })
+            });
+        if marked {
+            return Ok(None);
+        }
+        let key = &artifact.to_string();
+        let limit = project.config().limits.loop_limit;
+        let recent = read_loop_counts(project.driver(), key, self.now)?;
+        if recent.len() >= limit as usize {
+            return Err(LenkaError::new(
+                ErrorCode::LoopLimit,
+                format!(
+                    "This artifact reached the limit of {limit} material agent changes in one hour. Wait, or ask a person to make the change."
+                ),
+            ));
+        }
+        loop_count_op(project.driver(), key, self.now).map(Some)
+    }
+
     /// Tells if a task links to the artifact.
     #[must_use]
     pub fn is_linked(&self, artifact: ArtifactId) -> bool {
@@ -1243,44 +1287,6 @@ impl TaskService {
             now,
         ))?);
         Ok(ops)
-    }
-
-    /// Records a material agent change of an artifact, and checks the loop limit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorCode::LoopLimit`] if the limit is reached.
-    pub fn check_artifact_loop(&self, caller: &Caller, artifact: ArtifactId) -> Result<Option<Op>> {
-        if caller.actor != Actor::Agent {
-            return Ok(None);
-        }
-        {
-            let index = self.read_index()?;
-            let marked = index.artifact_users.get(&artifact).is_some_and(|users| {
-                users.iter().any(|task| {
-                    index
-                        .tasks
-                        .get(task)
-                        .is_some_and(|meta| meta.state.loop_until_done)
-                })
-            });
-            if marked {
-                return Ok(None);
-            }
-        }
-        let key = &artifact.to_string();
-        let limit = self.project.config().limits.loop_limit;
-        let now = self.now();
-        let recent = read_loop_counts(self.project.driver(), key, now)?;
-        if recent.len() >= limit as usize {
-            return Err(LenkaError::new(
-                ErrorCode::LoopLimit,
-                format!(
-                    "This artifact reached the limit of {limit} material agent changes in one hour. Wait, or ask a person to make the change."
-                ),
-            ));
-        }
-        loop_count_op(self.project.driver(), key, now).map(Some)
     }
 
     // ---- Read ----
@@ -2208,6 +2214,15 @@ impl TaskService {
                     caller,
                     now,
                 ))?);
+                // The holder loses its claim here, so it must learn the reason.
+                ops.extend(notice_ops(
+                    index,
+                    id,
+                    Subject::Task(id.to_string()),
+                    caller,
+                    &status_change_meta(&state, caller, status, now),
+                    now,
+                )?);
             }
             ops.push(feed_op(&simple_event(
                 FeedKind::State,
@@ -2242,6 +2257,8 @@ impl TaskService {
                 .get(&id)
                 .cloned()
                 .ok_or_else(|| task_missing(id))?;
+            check_not_closed(&meta)?;
+            check_loop_not_stopped(&meta, caller)?;
             let entry = Entry {
                 id: EntryId::generate(),
                 kind: new.kind,
@@ -2304,6 +2321,9 @@ impl TaskService {
         self.with_write(|locked, index, now| {
             if !index.tasks.contains_key(&id) && !index.invalid.contains_key(&id) {
                 return Err(task_missing(id));
+            }
+            if let Some(meta) = index.tasks.get(&id) {
+                check_loop_not_stopped(meta, caller)?;
             }
             if index
                 .children
@@ -2763,6 +2783,10 @@ impl TaskService {
         self.project.write_locked(|_locked| {
             let mut fresh = Index::default();
             fresh.scan(self.project.driver())?;
+            // A task with invalid files can hold a link that this scan cannot see.
+            if !fresh.invalid.is_empty() {
+                return Ok(());
+            }
             let linked: HashSet<ArtifactId> = fresh
                 .tasks
                 .values()
@@ -2818,6 +2842,14 @@ impl TaskService {
         }
         check_artifacts(&self.project, depth, &mut report)?;
         report.temp_files = self.project.old_temp_files();
+        // A task file with a symlink already has a line from the scan.
+        for path in self.project.symlinks() {
+            if !report.invalid_files.iter().any(|line| line.contains(&path)) {
+                report.invalid_files.push(format!(
+                    "{path} is a symlink, and lenka does not follow symlinks in the data directory."
+                ));
+            }
+        }
         report.oversize_inboxes = lenka_core::notices::oversize_inboxes(driver)?;
         let mut reader = LinkReader::default();
         for meta in fresh.tasks.values() {
@@ -2926,6 +2958,26 @@ fn holder_for<'a>(claim: &'a Claim, caller: &Caller) -> &'a str {
 }
 
 /// Refuses a change of a closed task. Only [`TaskService::set_status`] opens a closed task.
+/// Describes a status change for a notice. A status change has no version file.
+fn status_change_meta(
+    state: &State,
+    caller: &Caller,
+    status: Status,
+    now: Timestamp,
+) -> VersionMeta {
+    VersionMeta {
+        version: state.version,
+        author: caller.label.clone(),
+        at: now,
+        reason: format!(
+            "A person changed the status to {}, and this ended the claim.",
+            status.as_str()
+        ),
+        material: true,
+        changed: vec!["status".to_owned()],
+    }
+}
+
 fn check_not_closed(meta: &TaskMeta) -> Result<()> {
     if meta.state.status.is_closed() {
         return Err(LenkaError::invalid_argument(format!(
@@ -3498,8 +3550,16 @@ fn read_entries_with_problems(
         if !name.ends_with(".md") {
             continue;
         }
-        let Some(text) = read_text(driver, dir.join(&name)?.as_str())? else {
-            continue;
+        // A bad file must not hide the other entries. An I/O error is not a bad file.
+        let text = match read_text(driver, dir.join(&name)?.as_str()) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(error) if error.code() == ErrorCode::InvalidFile => {
+                tracing::warn!(error = %error, "skipped an invalid entry file");
+                bad_files.push(name);
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         match split_front::<Entry>(&name, &text) {
             Ok((mut entry, body)) => {
@@ -3574,7 +3634,7 @@ fn check_artifacts(project: &Project, depth: DoctorDepth, report: &mut DoctorRep
             continue;
         };
         for item in &record.versions {
-            let problem = artifact_bytes_problem(project, id, item, depth);
+            let problem = artifact_bytes_problem(project, id, item, record.version, depth);
             if let Some(problem) = problem {
                 report.artifact_problems.push(format!(
                     "{} version {}: {problem}",
@@ -3588,23 +3648,30 @@ fn check_artifacts(project: &Project, depth: DoctorDepth, report: &mut DoctorRep
     Ok(())
 }
 
-/// Compares the bytes of one version with its record. Git LFS pointer files have another report.
+/// Compares the bytes of one version with its record. The current version has another report if
+/// it is a Git LFS pointer file.
 fn artifact_bytes_problem(
     project: &Project,
     id: ArtifactId,
     item: &ArtifactVersion,
+    current: u64,
     depth: DoctorDepth,
 ) -> Option<String> {
     let store = project.artifacts();
-    let path = store.local_path(id, item.version, &item.file)?;
-    let Ok(meta) = std::fs::symlink_metadata(&path) else {
-        return Some("the bytes are missing.".to_owned());
-    };
-    if is_lfs_pointer(&path) {
-        return None;
-    }
-    if meta.len() != item.size {
-        return Some("the size of the bytes differs from the record.".to_owned());
+    // A store with no local path can still calculate a hash.
+    if let Some(path) = store.local_path(id, item.version, &item.file) {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return Some("the bytes are missing.".to_owned());
+        };
+        if is_lfs_pointer(&path) {
+            return (item.version != current).then(|| {
+                "the bytes are not downloaded (a Git LFS pointer file), so lenka cannot check them."
+                    .to_owned()
+            });
+        }
+        if meta.len() != item.size {
+            return Some("the size of the bytes differs from the record.".to_owned());
+        }
     }
     if depth == DoctorDepth::Hashes {
         return match store.sha256(id, item.version, &item.file) {

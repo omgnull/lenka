@@ -208,7 +208,35 @@ impl Project {
             return Vec::new();
         };
         let mut found = Vec::new();
-        collect_old_temp_files(root, root, &mut found);
+        walk_data_files(root, &mut |path, meta| {
+            if path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with(crate::layout::TEMP_PREFIX)
+            }) && is_leftover(meta)
+                && let Some(relative) = relative_text(root, path)
+            {
+                found.push(relative);
+            }
+        });
+        found.sort();
+        found
+    }
+
+    /// Returns the symlinks in the data directory, with paths from the data directory. All read
+    /// paths skip or refuse a symlink, so the data behind it looks absent.
+    #[must_use]
+    pub fn symlinks(&self) -> Vec<String> {
+        let Some(root) = self.driver.local_dir() else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        walk_data_files(root, &mut |path, meta| {
+            if meta.file_type().is_symlink()
+                && let Some(relative) = relative_text(root, path)
+            {
+                found.push(relative);
+            }
+        });
         found.sort();
         found
     }
@@ -225,11 +253,16 @@ impl Project {
             let Some(root) = self.driver.local_dir() else {
                 return Ok(found);
             };
-            for path in &found {
-                std::fs::remove_file(root.join(path))
-                    .map_err(|err| LenkaError::io("Remove a temporary file", &err))?;
+            let mut removed = Vec::with_capacity(found.len());
+            for path in found {
+                match std::fs::remove_file(root.join(&path)) {
+                    Ok(()) => removed.push(path),
+                    // Another process removed it, and a cleanup must not stop for that.
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(LenkaError::io("Remove a temporary file", &err)),
+                }
             }
-            Ok(found)
+            Ok(removed)
         })
     }
 
@@ -244,6 +277,7 @@ impl Project {
     /// settings are not valid or the write fails.
     pub fn save_config_over(&self, base: &ProjectConfig, config: ProjectConfig) -> Result<()> {
         config.validate()?;
+        check_same_id(base, &config)?;
         self.write_locked(|locked| {
             let path = DocPath::new(PROJECT_FILE)?;
             let bytes = self
@@ -277,6 +311,7 @@ impl Project {
     /// Returns an error if the settings are not valid or the write fails.
     pub fn save_config(&self, config: ProjectConfig) -> Result<()> {
         config.validate()?;
+        check_same_id(&self.config(), &config)?;
         let text = config.to_text()?;
         self.write_locked(|locked| {
             locked.commit(&Commit {
@@ -407,28 +442,43 @@ pub fn is_leftover(meta: &std::fs::Metadata) -> bool {
         .is_some_and(|age| age >= LEFTOVER_AGE)
 }
 
-fn collect_old_temp_files(root: &std::path::Path, dir: &std::path::Path, found: &mut Vec<String>) {
+/// Refuses a change of the stable ID, because links and the project list use it.
+fn check_same_id(old: &ProjectConfig, new: &ProjectConfig) -> Result<()> {
+    if old.id != new.id {
+        return Err(LenkaError::invalid_argument(
+            "A settings save cannot change the project ID.",
+        ));
+    }
+    Ok(())
+}
+
+/// Calls a function for each path below a directory that is not a directory. The walk does not
+/// follow a symlink, and it skips the Git directory.
+fn walk_data_files(
+    dir: &std::path::Path,
+    visit: &mut impl FnMut(&std::path::Path, &std::fs::Metadata),
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let (name, path) = (entry.file_name(), entry.path());
+        let path = entry.path();
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         if meta.is_dir() {
-            if name != ".git" {
-                collect_old_temp_files(root, &path, found);
+            if entry.file_name() != ".git" {
+                walk_data_files(&path, visit);
             }
-        } else if name
-            .to_string_lossy()
-            .starts_with(crate::layout::TEMP_PREFIX)
-            && is_leftover(&meta)
-            && let Ok(relative) = path.strip_prefix(root)
-        {
-            found.push(relative.to_string_lossy().replace('\\', "/"));
+        } else {
+            visit(&path, &meta);
         }
     }
+}
+
+fn relative_text(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn read_config(driver: &dyn StorageDriver) -> Result<ProjectConfig> {

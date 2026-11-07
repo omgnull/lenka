@@ -356,10 +356,10 @@ impl ArtifactService {
         let checks = vec![TextCheck::new("reason", reason)];
         secret::check(&checks, SecretPolicy::Enforce)?;
         self.tasks.check_artifact_coordinator(id, caller, claim)?;
-        let loop_op = self.tasks.check_artifact_loop(caller, id)?;
         self.tasks.with_artifact_write(|locked, routing, now| {
             let mut record = read_artifact(&self.project, id)?.ok_or_else(|| missing(id))?;
             locked.check_version("The artifact", record.version, expected_version)?;
+            let loop_op = routing.check_loop(&self.project, caller, id)?;
             let version = record.version + 1;
             let stored = self.store(id, version, &prepared)?;
             let old = record.current().version;
@@ -384,7 +384,7 @@ impl ArtifactService {
                 feed_op(FeedKind::Artifact, id, version, &caller.label, reason, now)?,
             ];
             ops.extend(routing.notice_ops(id, version, caller, &["content".to_owned()], reason)?);
-            ops.extend(loop_op.clone());
+            ops.extend(loop_op);
             locked.commit(&Commit {
                 checks: checks.clone(),
                 ops,
@@ -469,10 +469,11 @@ impl ArtifactService {
             match read_artifact(&self.project, id) {
                 Ok(Some(record)) => records.push(record),
                 Ok(None) => {}
-                Err(error) => {
+                Err(error) if error.code() == ErrorCode::InvalidFile => {
                     tracing::warn!(artifact = %id, code = error.code().as_str(), "skipped an invalid artifact");
                     invalid.push(id);
                 }
+                Err(error) => return Err(error),
             }
         }
         Ok((records, invalid))
@@ -503,12 +504,18 @@ impl ArtifactService {
     ///
     /// Returns [`ErrorCode::InvalidFile`] if the version is larger than the limit, or an error if
     /// the bytes cannot be read.
-    pub fn read_newest_limited(&self, id: ArtifactId, max_bytes: u64) -> Result<Vec<u8>> {
+    pub fn read_newest_limited(
+        &self,
+        id: ArtifactId,
+        max_bytes: u64,
+    ) -> Result<(ArtifactRecord, Vec<u8>)> {
         let record = self.record(id)?;
         let item = record.current();
-        self.project
-            .artifacts()
-            .get_limited(id, record.version, &item.file, max_bytes)
+        let bytes =
+            self.project
+                .artifacts()
+                .get_limited(id, record.version, &item.file, max_bytes)?;
+        Ok((record, bytes))
     }
 
     /// Resolves a full ID or a short ID.

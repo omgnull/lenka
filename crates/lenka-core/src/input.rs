@@ -18,7 +18,10 @@ pub const MAX_NAME_BYTES: usize = 64;
 /// text show another text than the text that it holds.
 #[must_use]
 pub fn is_direction_control(item: char) -> bool {
-    matches!(item, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        item,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 /// Tells if a value is safe as a type or stage name. These names appear in tool results outside
@@ -99,6 +102,14 @@ pub fn clip(text: &str, max_bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_text_direction_controls_count() {
+        for item in ['\u{061c}', '\u{200e}', '\u{200f}', '\u{202e}', '\u{2066}'] {
+            assert!(is_direction_control(item), "{:x}", u32::from(item));
+        }
+        assert!(!is_direction_control('a'));
+    }
 
     #[test]
     fn clip_keeps_whole_characters() {

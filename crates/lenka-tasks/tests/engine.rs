@@ -1590,6 +1590,12 @@ fn soft_links_between_projects() -> Result<()> {
             .iter()
             .any(|text| text.contains("unavailable"))
     );
+
+    // The policy of this project needs no peer, and a denied link does not block.
+    allow(&api, vec![], vec![])?;
+    let detail = api.detail(local, &[])?;
+    assert_eq!(detail.soft_links[0].state, lenka_tasks::LinkState::Broken);
+    assert!(detail.blockers.is_empty());
     Ok(())
 }
 
@@ -2565,6 +2571,136 @@ fn reach_loop_limit(service: &TaskService, agent: &Caller, id: TaskId) -> Result
         code(service.update(agent, id, text_change(6))),
         ErrorCode::LoopLimit
     );
+    Ok(())
+}
+
+#[test]
+fn an_agent_cannot_delete_or_write_entries_on_a_stopped_task() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    let entry = || NewEntry {
+        kind: EntryKind::Comment,
+        text: "A note".to_owned(),
+        replaces: None,
+        secret_policy: lenka_core::SecretPolicy::Enforce,
+    };
+    assert_eq!(code(service.delete(&agent, id)), ErrorCode::LoopLimit);
+    assert_eq!(
+        code(service.add_entry(&agent, id, entry())),
+        ErrorCode::LoopLimit
+    );
+    assert!(service.add_entry(&human, id, entry()).is_ok());
+    assert!(service.delete(&human, id).is_ok());
+    Ok(())
+}
+
+#[test]
+fn a_closed_task_refuses_an_entry() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = create(&service, &human, "T")?;
+    service.set_status(&human, id, Status::Cancelled, &ClaimRef::Implicit)?;
+    let entry = NewEntry {
+        kind: EntryKind::Comment,
+        text: "A note".to_owned(),
+        replaces: None,
+        secret_policy: lenka_core::SecretPolicy::Enforce,
+    };
+    assert!(service.add_entry(&human, id, entry).is_err());
+    Ok(())
+}
+
+/// A status change with an override ends the claim of the agent, so the agent gets a notice.
+#[test]
+fn an_override_of_the_status_gives_the_holder_a_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &human, "T")?;
+    service.claim(&agent, Some(id), None, None)?;
+    service.set_status(&human, id, Status::Todo, &ClaimRef::Override)?;
+    let key = agent.agent_key.clone();
+    let notices = lenka_core::notices::read_inbox(service.project().driver(), &key)?;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].changed, vec!["status".to_owned()]);
+    Ok(())
+}
+
+/// A lost feed also lost the claim events, so a running process reads the claim files again.
+#[test]
+fn a_reset_of_the_feed_reloads_the_claims() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (one, two) = (fx.agent("one"), fx.agent("two"));
+    let id = create(&service, &fx.human(), "T")?;
+    service.claim(&one, Some(id), None, None)?;
+    let runtime = fx.data_dir("api").join(".runtime");
+    fs::remove_file(runtime.join("claims").join(format!("{id}.toml")))
+        .map_err(|err| LenkaError::io("remove", &err))?;
+    fs::remove_file(runtime.join("feed.jsonl")).map_err(|err| LenkaError::io("remove", &err))?;
+    assert!(service.claim(&two, Some(id), None, None).is_ok());
+    Ok(())
+}
+
+/// A task with invalid files and no record is only in the invalid list. It must go with its files.
+#[test]
+fn a_removed_invalid_task_stops_blocking_in_a_running_process() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let blocker = create(&service, &human, "Blocker")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Local(blocker)],
+        ..task("Blocked")
+    };
+    let blocked = service.create(&human, new)?.id();
+    fs::write(task_file(&fx, blocker, "task.md"), "not a task\n")
+        .map_err(|err| LenkaError::io("write", &err))?;
+    let versions = task_file(&fx, blocker, "versions");
+    if versions.exists() {
+        fs::remove_dir_all(versions).map_err(|err| LenkaError::io("remove", &err))?;
+    }
+    // A new process finds the invalid files in its first scan.
+    let host = build_host(&fx.paths, &fx.clock)?;
+    let running = service_of(&host.open_by_name("api")?)?;
+    assert_eq!(running.detail(blocked, &[])?.blockers.len(), 1);
+    assert_eq!(code(running.detail(blocker, &[])), ErrorCode::InvalidFile);
+
+    let directory = task_file(&fx, blocker, "task.md");
+    let directory = directory
+        .parent()
+        .ok_or_else(|| LenkaError::not_found("no directory"))?;
+    fs::remove_dir_all(directory).map_err(|err| LenkaError::io("remove", &err))?;
+    // A lost feed starts a full scan in the running process.
+    let feed = fx.data_dir("api").join(".runtime/feed.jsonl");
+    fs::remove_file(&feed).map_err(|err| LenkaError::io("remove", &err))?;
+    assert_eq!(code(running.detail(blocker, &[])), ErrorCode::NotFound);
+    Ok(())
+}
+
+#[test]
+fn a_settings_save_cannot_change_the_id_or_write_a_future_format() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let project = service.project();
+    let mut other_id = (*project.config()).clone();
+    other_id.id = lenka_plugin_api::ProjectId::generate();
+    assert_eq!(
+        code(project.save_config(other_id.clone())),
+        ErrorCode::InvalidArgument
+    );
+    let base = project.config();
+    assert_eq!(
+        code(project.save_config_over(&base, other_id)),
+        ErrorCode::InvalidArgument
+    );
+    let mut future = (*project.config()).clone();
+    future.format_version += 1;
+    assert_eq!(code(project.save_config(future)), ErrorCode::FormatTooNew);
     Ok(())
 }
 

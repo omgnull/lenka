@@ -143,7 +143,7 @@ A drawing is an artifact with the media type `application/vnd.lenka.drawing+json
 `lenka doctor` reports damaged files, broken links, missing artifact bytes, and files that a stopped process left. Its exit code is not zero if it finds a problem. It has two options:
 
 - `--hashes` also reads all artifact bytes and compares their hash.
-- `--remove-leftovers` removes temporary files and artifact directories with no record, if they had no change for 10 minutes. A directory stays if a task links to it.
+- `--remove-leftovers` removes `.tmp-*` files and artifact directories with no record, if they had no change for 10 minutes. It removes all files with this name in the data directory. An artifact directory stays if a task links to it, or if a task has invalid files.
 
 ## Plugins
 
@@ -167,11 +167,11 @@ lenka protects against mistakes and untrusted files. It does not protect against
 
 - Task text can be a prompt injection. Tool results put task text in fields that are labeled as untrusted data, with the author beside the text. This reduces the risk, but it does not remove it.
 - The secret check finds common patterns only. Do not put secrets in tasks.
-- After the loop limit, an agent cannot claim or change the task until a person acts. To act, change the status, claim the task, or run `lenka task update <id> --version <n> --loop-until-done true`. That option lets the agent continue until the task is done.
+- After the loop limit, an agent cannot claim or change the task until a person acts. To act, change the status, claim the task if its stage permits a person, or run `lenka task update <id> --version <n> --loop-until-done true`. That option lets the agent continue until the task is done.
 - A closed task cannot change. A person can open it again with `lenka task status <id> todo`.
 - The CLI replaces control characters and text direction controls in human output, and escapes them in `--json` output. Task text can still mislead a reader in plain words, so treat it as data.
 - A type or a stage name has letters, digits, `-`, and `_` only. A task with another name in its files is invalid. Run `lenka doctor` to find it.
-- A clone file in the home directory applies only to the home directory. Run `lenka project attach` in a directory below it to connect that directory.
+- A clone file in the home directory applies only to the home directory. Run `lenka project attach <name>` in a directory below it to connect that directory.
 - The desktop app connects its start directory to a new project only if a person selects this. A Git clone starts with this option on.
 - A settings save in the desktop app keeps other tables of `lenka.toml`, but it removes comments. The save stops if another writer changed the file.
 - The desktop app adds a file on a background thread. Other writes still run on the UI thread, so a long wait for the file lock stops the UI until the lock is free.

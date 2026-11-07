@@ -1593,3 +1593,131 @@ fn a_short_id_under_eight_characters_selects_nothing() -> TestResult {
     assert_eq!(code, "invalid_argument");
     Ok(())
 }
+
+/// A task with invalid files can hold a link that a scan cannot see.
+#[test]
+fn the_removal_of_leftovers_keeps_artifact_bytes_while_a_task_is_invalid() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let dir = task_directory(&data, text(&task, "task"))?;
+    fs::write(dir.join("task.md"), "This is not a task.\n")?;
+    if dir.join("versions").exists() {
+        fs::remove_dir_all(dir.join("versions"))?;
+    }
+    let orphan = data.join("artifacts/01a1b33d-fde0-769e-a9d8-a92845a222ff/versions/000001");
+    fs::create_dir_all(&orphan)?;
+    let bytes = orphan.join("a.txt");
+    fs::write(&bytes, "bytes")?;
+    make_old(&bytes)?;
+    let temp_file = dir.join(".tmp-99-1");
+    fs::write(&temp_file, "bytes")?;
+    make_old(&temp_file)?;
+    doctor_of(&machine, &repo, &["--remove-leftovers"])?;
+    assert!(bytes.exists(), "the bytes stay");
+    assert!(!temp_file.exists(), "a temporary file still goes");
+    Ok(())
+}
+
+/// A file with bad bytes must not hide the other entries of the task.
+#[test]
+fn an_entry_file_with_bad_bytes_does_not_hide_the_other_entries() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(
+        &repo,
+        &[
+            "task", "entry", &id, "--kind", "comment", "--text", "A note.",
+        ],
+    )?;
+    let entries = task_directory(&data, &id)?.join("entries");
+    fs::write(entries.join("bad.md"), [0xff_u8, 0xfe])?;
+    let shown = machine.json(&repo, &["task", "show", &id, "--include", "entries"])?;
+    let body = shown["untrusted_data"].to_string();
+    assert!(
+        body.contains("A note.") && body.contains("bad.md"),
+        "{shown}"
+    );
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"]
+            .to_string()
+            .contains("bad.md"),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn doctor_reports_an_old_version_that_is_not_downloaded() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    fs::write(repo.join("a.txt"), "first")?;
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let short = text(&created, "artifact").to_owned();
+    fs::write(repo.join("a.txt"), "second")?;
+    machine.json(
+        &repo,
+        &[
+            "artifact",
+            "update",
+            &short,
+            "a.txt",
+            "--version",
+            "1",
+            "--reason",
+            "r",
+            "--mode",
+            "keep",
+        ],
+    )?;
+    let old = data
+        .join("artifacts")
+        .join(&full)
+        .join("versions/000001/a.txt");
+    fs::write(&old, "version https://git-lfs.github.com/spec/v1\nsize 5\n")?;
+    let value = doctor_of(&machine, &repo, &["--hashes"])?;
+    assert!(
+        value["report"]["artifact_problems"]
+            .to_string()
+            .contains("not downloaded"),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_a_symlink_in_the_data_directory() -> TestResult {
+    let (temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let data = repo.join(".git/lenka-data");
+    let target = temp.path().join("target.md");
+    fs::write(&target, "A file.\n")?;
+    let name = "01a1b33d-fde0-769e-a9d8-a92845a222ff.md";
+    std::os::unix::fs::symlink(&target, data.join("memory").join(name))?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"].to_string().contains(name),
+        "{value}"
+    );
+    Ok(())
+}
+
+/// A JSON reader must get the real path, not a path with replaced characters.
+#[test]
+fn init_with_json_keeps_the_real_path() -> TestResult {
+    let (temp, machine) = machine()?;
+    let repo = machine.repo("api")?;
+    let path = temp.path().join("a\u{202e}b");
+    let path_text = path.to_string_lossy().into_owned();
+    let value = machine.json(&repo, &["init", "--dir", &path_text, "--name", "api"])?;
+    assert_eq!(value["directory"], path_text.as_str(), "{value}");
+    Ok(())
+}

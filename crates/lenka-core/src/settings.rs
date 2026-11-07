@@ -220,15 +220,6 @@ impl ProjectConfig {
     pub fn parse(text: &str) -> Result<Self> {
         let config: Self = toml::from_str(text)
             .map_err(|err| LenkaError::invalid_file(format!("lenka.toml: {}", err.message())))?;
-        if config.format_version > FORMAT_VERSION {
-            return Err(LenkaError::new(
-                ErrorCode::FormatTooNew,
-                format!(
-                    "The data format is {}, and this lenka knows {}. Update lenka.",
-                    config.format_version, FORMAT_VERSION
-                ),
-            ));
-        }
         config.validate()?;
         Ok(config)
     }
@@ -239,6 +230,15 @@ impl ProjectConfig {
     ///
     /// Returns [`ErrorCode::InvalidFile`] if a type has no stages or a duplicate stage.
     pub fn validate(&self) -> Result<()> {
+        if self.format_version > FORMAT_VERSION {
+            return Err(LenkaError::new(
+                ErrorCode::FormatTooNew,
+                format!(
+                    "The data format is {}, and this lenka knows {}. Update lenka.",
+                    self.format_version, FORMAT_VERSION
+                ),
+            ));
+        }
         if self.format_version == 0 {
             return Err(LenkaError::invalid_file(
                 "lenka.toml has the data format 0, which is not valid.",
@@ -313,9 +313,23 @@ impl ProjectConfig {
         let old: toml::Table = old.parse().map_err(|err| invalid(&err))?;
         let mut kept = false;
         for (key, value) in old {
-            if !table.contains_key(&key) {
-                table.insert(key, value);
-                kept = true;
+            match (table.get_mut(&key), value) {
+                (None, value) => {
+                    table.insert(key, value);
+                    kept = true;
+                }
+                // A name in `types` that is gone from the new settings is a removed type.
+                (Some(toml::Value::Table(new)), toml::Value::Table(old))
+                    if key == "storage" || key == "links" =>
+                {
+                    for (inner, value) in old {
+                        if !new.contains_key(&inner) {
+                            new.insert(inner, value);
+                            kept = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         if !kept {
@@ -569,6 +583,28 @@ pub fn validate_project_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_save_keeps_unknown_keys_and_removes_a_removed_type() {
+        let mut config = ProjectConfig::new("api");
+        let old = format!("{}\n[future]\nkey = 1\n", config.to_text().expect("text"));
+        let mut table: toml::Table = toml::from_str(&old).expect("a table");
+        if let Some(toml::Value::Table(links)) = table.get_mut("links") {
+            links.insert("future_key".to_owned(), toml::Value::Integer(2));
+        }
+        let old = toml::to_string(&table).expect("text");
+        config.types.remove("bug");
+        let new: toml::Table =
+            toml::from_str(&config.to_text_over(&old).expect("text")).expect("a table");
+        assert!(new.contains_key("future"));
+        assert!(
+            new["links"]
+                .as_table()
+                .expect("links")
+                .contains_key("future_key")
+        );
+        assert!(!new["types"].as_table().expect("types").contains_key("bug"));
+    }
+
     fn config_text(change: impl Fn(&mut toml::Table)) -> String {
         let text = ProjectConfig::new("api").to_text().expect("text");
         let mut table: toml::Table = toml::from_str(&text).expect("a table");
@@ -603,6 +639,12 @@ mod tests {
             );
         }
         assert!(ProjectConfig::parse(&config_text(|_| ())).is_ok());
+        let mut future = ProjectConfig::new("api");
+        future.format_version = FORMAT_VERSION + 1;
+        assert_eq!(
+            future.validate().err().map(|error| error.code()),
+            Some(ErrorCode::FormatTooNew)
+        );
     }
 
     #[test]

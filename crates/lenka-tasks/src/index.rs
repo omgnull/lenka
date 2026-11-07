@@ -345,6 +345,8 @@ impl Index {
         if len < self.feed_offset || !same_feed {
             self.feed_offset = 0;
             self.scan(driver)?;
+            // A lost feed also lost the events of the claims, so the claim files can differ.
+            self.reload_claims(driver)?;
             return Ok(());
         }
         let bytes = driver.read_from(&feed, self.feed_offset)?;
@@ -417,9 +419,11 @@ impl Index {
                 Err(_) => self.bad_names.push(name),
             }
         }
+        // A task with invalid files can have no record, so it is only in the invalid list.
         let gone: Vec<TaskId> = self
             .order
             .iter()
+            .chain(self.invalid.keys())
             .filter(|id| !seen.contains(id))
             .copied()
             .collect();
@@ -715,7 +719,12 @@ fn parallel_chunks<T: Send + Sync, R: Send>(
             .collect();
         handles
             .into_iter()
-            .filter_map(|handle| handle.join().ok())
+            // A lost part of a scan would look like a good scan, so a panic must continue.
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
             .collect()
     })
 }
@@ -738,4 +747,17 @@ pub fn open_index(project: &Arc<Project>) -> Result<(Index, Vec<TaskId>)> {
         index.save_snapshot(project)?;
     }
     Ok((index, changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "a bug in a worker")]
+    fn a_panic_in_a_worker_does_not_look_like_a_good_scan() {
+        let items = vec![0_u8; 1024];
+        let work = |_: &[u8]| -> u8 { panic!("a bug in a worker") };
+        let _ = parallel_chunks(&items, &work);
+    }
 }

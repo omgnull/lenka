@@ -299,15 +299,13 @@ fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
         None => init::create_project(&paths, cwd, args.name.as_deref(), &location)?,
     };
     if context.json {
-        say!(
-            "{}",
-            json!({
-                "name": created.name,
-                "directory": created.directory,
-                "clone_file": created.clone_file,
-                "restored": was_restored,
-            })
-        );
+        // The JSON form keeps the real path, with its control characters escaped.
+        crate::output::print_json(&json!({
+            "name": created.name,
+            "directory": created.directory,
+            "clone_file": created.clone_file,
+            "restored": was_restored,
+        }));
         return Ok(());
     }
     if was_restored {
@@ -566,15 +564,25 @@ fn git_enable(
 #[cfg(all(feature = "git", feature = "tasks"))]
 fn versions_before_sync(
     project: &std::sync::Arc<lenka_core::Project>,
-) -> lenka_tasks::TaskVersions {
-    let versions = lenka_tasks::service_of(project).and_then(|tasks| {
-        tasks.record_all_external_edits()?;
-        tasks.task_versions()
-    });
-    versions.unwrap_or_else(|error| {
-        say_error!("Warning: lenka did not read the tasks before the sync: {error}");
-        lenka_tasks::TaskVersions::default()
-    })
+) -> Option<lenka_tasks::TaskVersions> {
+    let tasks = match lenka_tasks::service_of(project) {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            say_error!("Warning: lenka did not read the tasks before the sync: {error}");
+            return None;
+        }
+    };
+    // A failure here must not stop the read of the versions, because the notices need them.
+    if let Err(error) = tasks.record_all_external_edits() {
+        say_error!("Warning: lenka did not record the hand edits before the sync: {error}");
+    }
+    match tasks.task_versions() {
+        Ok(versions) => Some(versions),
+        Err(error) => {
+            say_error!("Warning: lenka did not read the tasks before the sync: {error}");
+            None
+        }
+    }
 }
 
 #[cfg(feature = "git")]
@@ -590,7 +598,12 @@ fn sync(context: &RunContext, host: &Host) -> anyhow::Result<ExitCode> {
         {
             let tasks = lenka_tasks::service_of(&project)?;
             tasks.reindex(&caller)?;
-            tasks.notify_merged_changes(&before)?;
+            match &before {
+                Some(before) => tasks.notify_merged_changes(before)?,
+                None => say_error!(
+                    "Warning: this merge gave no change notices, so holders of a claim must read their tasks again."
+                ),
+            }
         }
         lenka_git::mark_indexed(&project)?;
     }

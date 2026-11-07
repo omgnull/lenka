@@ -106,6 +106,11 @@ impl LinkReader {
         target: ProjectId,
         task: TaskId,
     ) -> LinkView {
+        // The policy of this project needs no peer, and a link that it denies must not block.
+        let source = project.config();
+        if !source.links.allows_link_to(target) {
+            return LinkView::empty(link, LinkState::Broken);
+        }
         let peer = self
             .peers
             .entry(target)
@@ -113,8 +118,7 @@ impl LinkReader {
         let Some((driver, config)) = peer else {
             return LinkView::empty(link, LinkState::Unavailable);
         };
-        let source = project.config();
-        if !source.links.allows_link_to(target) || !config.links.accepts_from(source.id) {
+        if !config.links.accepts_from(source.id) {
             return LinkView::empty(link, LinkState::Broken);
         }
         match read_visible(driver.as_ref(), task) {

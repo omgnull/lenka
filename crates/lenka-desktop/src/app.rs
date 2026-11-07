@@ -238,6 +238,11 @@ impl DesktopApp {
         }
         let mut waiting = Vec::new();
         for pending in std::mem::take(&mut self.pending_files) {
+            // A person must answer one question at a time, so the next file waits for the answer.
+            if self.dialog.is_some() {
+                waiting.push(pending);
+                continue;
+            }
             match pending.result.try_recv() {
                 Ok(Ok(record)) => self.link_artifact(pending.task, record.id),
                 Ok(Err(error)) => self.report(&error),
@@ -815,6 +820,13 @@ impl DesktopApp {
                     self.dialog = Some(Dialog::NewDrawing { task, name, error });
                     return;
                 }
+                if self.drawing.as_ref().is_some_and(DrawingBoard::is_dirty) {
+                    let error = Some(FormError::text(
+                        "Save or close the open drawing first. This drawing would replace it.",
+                    ));
+                    self.dialog = Some(Dialog::NewDrawing { task, name, error });
+                    return;
+                }
                 self.drawing = Some(DrawingBoard::new_unsaved(name.trim(), task));
                 self.view = View::Drawing;
             }
@@ -1186,7 +1198,11 @@ impl DesktopApp {
         if self.detail.as_ref().is_some_and(|detail| detail.id == id) {
             return;
         }
-        if self.detail.as_ref().is_some_and(DetailState::is_dirty) {
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(DetailState::has_unsaved_text)
+        {
             add_banner(
                 &mut self.banners,
                 "Save or discard your text before you select another task.".to_owned(),
@@ -1498,12 +1514,9 @@ impl DesktopApp {
             return;
         }
         let task = self.detail.as_ref().map(|detail| detail.id);
-        let loaded = session.artifacts.record(artifact).and_then(|record| {
-            session
-                .artifacts
-                .read_newest_limited(artifact, MAX_DRAWING_BYTES)
-                .map(|bytes| (record, bytes))
-        });
+        let loaded = session
+            .artifacts
+            .read_newest_limited(artifact, MAX_DRAWING_BYTES);
         match loaded {
             Ok((record, bytes)) => match DrawingBoard::open(&record, &bytes, task) {
                 Ok(board) => {
@@ -1520,6 +1533,22 @@ impl DesktopApp {
     }
 
     /// Opens a drawing, as the button of the artifact list does.
+    #[cfg(test)]
+    pub(crate) fn add_finished_file_for_test(
+        &mut self,
+        task: TaskId,
+        record: lenka_tasks::ArtifactRecord,
+    ) {
+        let (sender, result) = std::sync::mpsc::channel();
+        sender.send(Ok(record)).expect("an open channel");
+        self.pending_files.push(PendingFile { task, result });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_file_count_for_test(&self) -> usize {
+        self.pending_files.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn open_drawing_for_test(&mut self, artifact: ArtifactId) {
         self.open_drawing(artifact);
@@ -1630,12 +1659,9 @@ impl DesktopApp {
         let Some(artifact) = board.artifact else {
             return;
         };
-        let loaded = session.artifacts.record(artifact).and_then(|record| {
-            session
-                .artifacts
-                .read_newest_limited(artifact, MAX_DRAWING_BYTES)
-                .map(|bytes| (record, bytes))
-        });
+        let loaded = session
+            .artifacts
+            .read_newest_limited(artifact, MAX_DRAWING_BYTES);
         match loaded {
             Ok((record, bytes)) => {
                 if let Err(error) = board.load_version(&record, &bytes) {
@@ -1734,7 +1760,7 @@ fn sync_drawing(board: &mut DrawingBoard, session: &Session, errors: &mut Vec<Le
         .artifacts
         .read_newest_limited(artifact, MAX_DRAWING_BYTES)
     {
-        Ok(bytes) => {
+        Ok((record, bytes)) => {
             if let Err(error) = board.load_version(&record, &bytes) {
                 errors.push(LenkaError::invalid_file(format!(
                     "lenka cannot read the new version of this drawing. {error}"

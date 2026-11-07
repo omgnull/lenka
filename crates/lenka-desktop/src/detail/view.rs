@@ -884,6 +884,11 @@ impl DetailState {
             );
             if self.link_search.contains('/') && ui.button("Add link").clicked() {
                 match session.tasks.resolve_link(self.link_search.trim()) {
+                    // A parent must be in this project, and a remote value would clear it.
+                    Ok(link) if self.link_kind == LinkKind::Parent && link.local().is_none() => {
+                        self.field_error =
+                            Some("A parent must be a task in this project.".to_owned());
+                    }
                     Ok(link) => {
                         let patch = self.link_patch(link);
                         self.send(actions, patch);
@@ -904,7 +909,7 @@ impl DetailState {
                 .filter(|row| row.meta.id() != self.id)
                 .filter(|row| {
                     row.meta.front.title.to_lowercase().contains(&query)
-                        || row.meta.id().matches_short(&query)
+                        || row.meta.id().to_string().ends_with(&query)
                 })
                 .take(8)
                 .collect();

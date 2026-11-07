@@ -120,9 +120,9 @@ pub(crate) struct DetailState {
     label_input: String,
     start_input: String,
     due_input: String,
-    field_error: Option<String>,
-    link_kind: LinkKind,
-    link_search: String,
+    pub(crate) field_error: Option<String>,
+    pub(crate) link_kind: LinkKind,
+    pub(crate) link_search: String,
     artifact_path: String,
     editors: [MarkdownState; 4],
 }

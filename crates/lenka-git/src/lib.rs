@@ -869,8 +869,12 @@ pub fn restore(cwd: &Path) -> Result<Option<PathBuf>> {
         let Some(first) = tracking.first() else {
             return Ok(None);
         };
-        check_incoming_tree(&git, first, None)?;
-        git.run("branch", ["branch", "--no-track", BRANCH, first.as_str()])?;
+        let incoming = commit_of(&git, first)?;
+        check_incoming_tree(&git, &incoming, None)?;
+        git.run(
+            "branch",
+            ["branch", "--no-track", BRANCH, incoming.as_str()],
+        )?;
     }
     add_worktree(&git, &dir)?;
     if !dir.join(PROJECT_FILE).is_file() {
@@ -1028,8 +1032,20 @@ pub fn mark_indexed(project: &Project) -> Result<()> {
     git.unset_local_value(KEY_NEEDS_REINDEX)
 }
 
+/// Returns the commit ID of a ref.
+fn commit_of(git: &Git, name: &str) -> Result<String> {
+    let revision = format!("{name}^{{commit}}");
+    git.run(
+        "rev-parse",
+        ["rev-parse", "--verify", "--quiet", revision.as_str()],
+    )
+}
+
 fn merge(git: &Git, tracking: &str, report: &mut SyncReport) -> Result<()> {
     let local = read_settings(git, "HEAD")?;
+    // Another process can move the ref, so the check and the merge use one commit ID.
+    let incoming = commit_of(git, tracking)?;
+    let tracking = incoming.as_str();
     check_incoming_tree(git, tracking, Some(&local))?;
     let before = git.run("rev-parse", ["rev-parse", "HEAD"])?;
     let was_pending = report.merged;
