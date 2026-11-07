@@ -1844,23 +1844,25 @@ fn the_dialog_connects_a_plain_directory_only_if_the_person_selects_this() {
     type_into(&mut harness, "Project name", "private");
     click(&mut harness, "Create project");
     assert_eq!(open_project_name(&harness), "private");
-    assert!(lenka_core::init::find_clone_file(&start).is_none());
-    assert!(lenka_core::init::find_clone_file(&start.join("below")).is_none());
+    let paths = &fixture.paths;
+    assert!(lenka_core::init::find_clone_file(paths, &start).is_none());
+    assert!(lenka_core::init::find_clone_file(paths, &start.join("below")).is_none());
 }
 
-#[cfg(unix)]
 #[test]
-fn a_read_only_start_directory_gives_a_warning_and_the_project_opens() {
-    use std::os::unix::fs::PermissionsExt;
+fn a_failed_connection_gives_a_warning_and_the_project_opens() {
     let fixture = Arc::new(Fixture::empty());
     let mut harness = start_new_project(&fixture);
     let start = project_form(&mut harness).start_directory.clone();
     std::fs::create_dir_all(&start).expect("a directory");
-    std::fs::set_permissions(&start, std::fs::Permissions::from_mode(0o555)).expect("a mode");
+    // A file in the place of the directory of the connections stops the connection.
+    let connection = fixture.paths.plain_clone_file(&start);
+    let blocker = connection.parent().expect("a parent");
+    std::fs::create_dir_all(blocker.parent().expect("a parent")).expect("a directory");
+    std::fs::write(blocker, "").expect("a file");
     project_form(&mut harness).attach = true;
     type_into(&mut harness, "Project name", "api");
     click(&mut harness, "Create project");
-    std::fs::set_permissions(&start, std::fs::Permissions::from_mode(0o755)).expect("a mode");
     assert!(harness.state().app().dialog.is_none());
     assert_eq!(open_project_name(&harness), "api");
     let banners = &harness.state().app().banners;

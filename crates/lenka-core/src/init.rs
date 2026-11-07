@@ -11,8 +11,8 @@ use lenka_plugin_api::{Actor, Caller, ErrorCode, LenkaError, ProjectScope, Resul
 use crate::gitdir;
 use crate::notices::{agent_key, person_key};
 use crate::settings::{
-    CLONE_FILE, CloneFile, PLAIN_CLONE_FILE, PROJECT_FILE, Paths, ProjectConfig, ProjectEntry,
-    ProjectsFile, validate_project_name,
+    CLONE_FILE, CloneFile, PROJECT_FILE, Paths, ProjectConfig, ProjectEntry, ProjectsFile,
+    validate_project_name,
 };
 
 /// The name of the default data directory in the Git common directory.
@@ -62,39 +62,61 @@ pub enum Attach {
     Never,
 }
 
-/// The clone file for a directory: in the Git common directory, or next to the directory.
+/// The clone file for a directory: in the Git common directory, or in the user configuration.
 #[must_use]
-pub fn clone_file_for(dir: &Path) -> PathBuf {
+pub fn clone_file_for(paths: &Paths, dir: &Path) -> PathBuf {
     match gitdir::locate(dir) {
         Some(location) => location.common_dir.join(CLONE_FILE),
-        None => dir.join(PLAIN_CLONE_FILE),
+        None => {
+            paths.plain_clone_file(&gitdir::real_path(dir).unwrap_or_else(|_| dir.to_path_buf()))
+        }
     }
 }
 
-/// Finds an existing clone file from a directory upward.
+/// Finds an existing clone file for a directory.
+///
+/// A file in a checkout or a plain directory can come from another author, so only the Git
+/// directory and the user configuration can select the projects of the user.
 #[must_use]
-pub fn find_clone_file(start: &Path) -> Option<PathBuf> {
+pub fn find_clone_file(paths: &Paths, start: &Path) -> Option<PathBuf> {
     if let Some(location) = gitdir::locate(start) {
-        // A file in a checkout comes from the repository, and it must not select the projects of
-        // the user. A clone file in a Git clone is only in the Git directory.
         let file = location.common_dir.join(CLONE_FILE);
-        return file.is_file().then_some(file);
+        if file.is_file() {
+            return Some(file);
+        }
+        // A person can run `git init` in a plain project, and the project stays connected.
+        let plain = paths.plain_clone_file(&location.worktree);
+        return plain.is_file().then_some(plain);
+    }
+    plain_project_root(paths, start).map(|root| paths.plain_clone_file(&root))
+}
+
+/// Finds the plain directory with a connection to a project, from a directory upward.
+#[must_use]
+pub fn plain_project_root(paths: &Paths, start: &Path) -> Option<PathBuf> {
+    if gitdir::locate(start).is_some() {
+        return None;
     }
     let start = gitdir::real_path(start).ok()?;
-    find_plain_clone_file(&start, std::env::home_dir().as_deref())
+    find_plain_root(&start, std::env::home_dir().as_deref(), |dir| {
+        paths.plain_clone_file(dir).is_file()
+    })
 }
 
-/// Searches a plain directory and its parents. A file in the home directory applies only to the
-/// home directory, because all projects of a user are below it.
-fn find_plain_clone_file(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+/// Searches a plain directory and its parents. A connection of the home directory applies only to
+/// the home directory, because all projects of a user are below it.
+fn find_plain_root(
+    start: &Path,
+    home: Option<&Path>,
+    is_connected: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let home = home.and_then(|home| gitdir::real_path(home).ok());
     for dir in start.ancestors() {
         if home.as_deref() == Some(dir) && dir != start {
             return None;
         }
-        let file = dir.join(PLAIN_CLONE_FILE);
-        if file.is_file() {
-            return Some(file);
+        if is_connected(dir) {
+            return Some(dir.to_path_buf());
         }
     }
     None
@@ -243,8 +265,8 @@ fn create_locked(
     projects.save(paths)?;
     let (clone_file, attach_warning) = match attach {
         Attach::Never => (None, None),
-        Attach::Required => (Some(attach_to_clone(cwd, &name)?), None),
-        Attach::IfPossible => match attach_to_clone(cwd, &name) {
+        Attach::Required => (Some(attach_to_clone(paths, cwd, &name)?), None),
+        Attach::IfPossible => match attach_to_clone(paths, cwd, &name) {
             Ok(file) => (Some(file), None),
             Err(error) => (
                 None,
@@ -395,7 +417,7 @@ pub fn register_existing(
             },
         );
         projects.save(paths)?;
-        attach_to_clone(cwd, &name)
+        attach_to_clone(paths, cwd, &name)
     })?;
     Ok(Created {
         name,
@@ -426,11 +448,11 @@ fn attach_locked(paths: &Paths, cwd: &Path, name: &str) -> Result<PathBuf> {
             ),
         ));
     }
-    attach_to_clone(cwd, name)
+    attach_to_clone(paths, cwd, name)
 }
 
-fn attach_to_clone(cwd: &Path, name: &str) -> Result<PathBuf> {
-    let file = find_clone_file(cwd).unwrap_or_else(|| clone_file_for(cwd));
+fn attach_to_clone(paths: &Paths, cwd: &Path, name: &str) -> Result<PathBuf> {
+    let file = find_clone_file(paths, cwd).unwrap_or_else(|| clone_file_for(paths, cwd));
     let mut clone = CloneFile::load(&file)?.unwrap_or_default();
     clone.add(name);
     clone.save(&file)?;
@@ -455,13 +477,12 @@ pub struct CallerSetup {
 /// # Errors
 ///
 /// Returns an error if the clone file is not valid.
-pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
-    let clone_file = find_clone_file(cwd);
+pub fn caller_for(paths: &Paths, cwd: &Path, setup: CallerSetup) -> Result<Caller> {
+    let clone_file = find_clone_file(paths, cwd);
     // A plain directory has one identity in all of its subdirectories, as a Git worktree has.
-    let plain_root = clone_file.as_deref().and_then(Path::parent);
-    let worktree = match (gitdir::locate(cwd), plain_root) {
+    let worktree = match (gitdir::locate(cwd), plain_project_root(paths, cwd)) {
         (Some(location), _) => location.worktree,
-        (None, Some(root)) => root.to_path_buf(),
+        (None, Some(root)) => root,
         (None, None) => gitdir::real_path(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
     };
     let clone = match clone_file {
@@ -491,26 +512,74 @@ pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
 mod tests {
     use super::*;
 
+    /// The file that older versions read in a plain directory.
+    const OLD_PLAIN_CLONE_FILE: &str = ".lenka-clone.toml";
+
     #[test]
-    fn a_clone_file_in_the_home_directory_stops_at_the_home_directory() -> Result<()> {
+    fn a_connection_of_the_home_directory_stops_at_the_home_directory() -> Result<()> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
         let home = gitdir::real_path(temp.path()).map_err(|err| LenkaError::io("path", &err))?;
         let below = home.join("code/deep");
         fs::create_dir_all(&below).map_err(|err| LenkaError::io("mkdir", &err))?;
-        let file = home.join(PLAIN_CLONE_FILE);
-        fs::write(&file, "projects = []\n").map_err(|err| LenkaError::io("write", &err))?;
-        assert_eq!(find_plain_clone_file(&below, Some(home.as_path())), None);
+        let code = home.join("code");
+        let only_home = |dir: &Path| dir == home;
+        assert_eq!(find_plain_root(&below, Some(&home), only_home), None);
         assert_eq!(
-            find_plain_clone_file(&home, Some(home.as_path())),
-            Some(file.clone())
+            find_plain_root(&home, Some(&home), only_home),
+            Some(home.clone())
         );
-        assert_eq!(find_plain_clone_file(&below, None), Some(file));
-        let code_file = home.join("code").join(PLAIN_CLONE_FILE);
-        fs::write(&code_file, "projects = []\n").map_err(|err| LenkaError::io("write", &err))?;
+        assert_eq!(find_plain_root(&below, None, only_home), Some(home.clone()));
+        let home_and_code = |dir: &Path| dir == home || dir == code;
         assert_eq!(
-            find_plain_clone_file(&below, Some(home.as_path())),
-            Some(code_file)
+            find_plain_root(&below, Some(&home), home_and_code),
+            Some(code.clone())
         );
+        Ok(())
+    }
+
+    /// A tar file, a garbage `.git` file, or a `.git` symlink must not give a project to an agent.
+    #[test]
+    fn a_file_in_a_plain_directory_selects_nothing() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        fs::create_dir_all(&cwd).map_err(|err| LenkaError::io("mkdir", &err))?;
+        create_project(
+            &paths,
+            &temp.path().join("other"),
+            Some("secret"),
+            &Location::Shared,
+        )?;
+        fs::write(cwd.join(OLD_PLAIN_CLONE_FILE), "projects = [\"secret\"]\n")
+            .map_err(|err| LenkaError::io("write", &err))?;
+        let check = |paths: &Paths| -> Result<()> {
+            assert_eq!(find_clone_file(paths, &cwd), None);
+            let caller = caller_for(paths, &cwd, setup(Actor::Agent, None))?;
+            assert_eq!(caller.scope, ProjectScope::Listed(Vec::new()));
+            Ok(())
+        };
+        check(&paths)?;
+        fs::write(cwd.join(".git"), "not a Git file\n")
+            .map_err(|err| LenkaError::io("write", &err))?;
+        check(&paths)
+    }
+
+    /// `git init` in a plain project keeps the connection, and the directory itself must match.
+    #[test]
+    fn a_connection_stays_after_git_init_in_the_same_directory() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        let sub = cwd.join("sub");
+        fs::create_dir_all(&sub).map_err(|err| LenkaError::io("mkdir", &err))?;
+        create_project(&paths, &cwd, Some("api"), &Location::Shared)?;
+        for dir in [&cwd, &sub] {
+            fs::create_dir_all(dir.join(".git")).map_err(|err| LenkaError::io("mkdir", &err))?;
+            fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n")
+                .map_err(|err| LenkaError::io("write", &err))?;
+        }
+        assert!(find_clone_file(&paths, &cwd).is_some());
+        assert_eq!(find_clone_file(&paths, &sub), None);
         Ok(())
     }
 
@@ -526,12 +595,13 @@ mod tests {
     #[test]
     fn a_person_and_an_agent_in_one_directory_have_two_keys() -> Result<()> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
-        let person = caller_for(temp.path(), setup(Actor::Human, None))?;
-        let agent = caller_for(temp.path(), setup(Actor::Agent, None))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let person = caller_for(&paths, temp.path(), setup(Actor::Human, None))?;
+        let agent = caller_for(&paths, temp.path(), setup(Actor::Agent, None))?;
         assert_ne!(person.agent_key, agent.agent_key);
         // A name selects one inbox, so a person can act as a named agent.
-        let named_person = caller_for(temp.path(), setup(Actor::Human, Some("a")))?;
-        let named_agent = caller_for(temp.path(), setup(Actor::Agent, Some("a")))?;
+        let named_person = caller_for(&paths, temp.path(), setup(Actor::Human, Some("a")))?;
+        let named_agent = caller_for(&paths, temp.path(), setup(Actor::Agent, Some("a")))?;
         assert_eq!(named_person.agent_key, named_agent.agent_key);
         Ok(())
     }
@@ -544,8 +614,8 @@ mod tests {
         let sub = cwd.join("sub");
         fs::create_dir_all(&sub).map_err(|err| LenkaError::io("mkdir", &err))?;
         create_project(&paths, &cwd, Some("api"), &Location::Shared)?;
-        let root = caller_for(&cwd, setup(Actor::Agent, None))?;
-        let below = caller_for(&sub, setup(Actor::Agent, None))?;
+        let root = caller_for(&paths, &cwd, setup(Actor::Agent, None))?;
+        let below = caller_for(&paths, &sub, setup(Actor::Agent, None))?;
         assert_eq!(root.agent_key, below.agent_key);
         assert_eq!(root.worktree, below.worktree);
         Ok(())
@@ -575,7 +645,7 @@ mod tests {
         let text = fs::read_to_string(same.directory.join("lenka.toml"))
             .map_err(|err| LenkaError::io("read", &err))?;
         assert_eq!(ProjectConfig::parse(&text)?.id, same.id);
-        let clone = CloneFile::load(&clone_file_for(&cwd))?
+        let clone = CloneFile::load(&clone_file_for(&paths, &cwd))?
             .ok_or_else(|| LenkaError::not_found("clone"))?;
         assert_eq!(clone.projects.len(), 13);
         Ok(())
@@ -713,6 +783,7 @@ mod tests {
         assert_eq!(ProjectsFile::load(&paths)?.projects["api"].id, first_id);
 
         let caller = caller_for(
+            &paths,
             &cwd,
             CallerSetup {
                 actor: Actor::Agent,
@@ -738,9 +809,10 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).map_err(|err| LenkaError::io("mkdir", &err))?;
         fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n")
             .map_err(|err| LenkaError::io("write", &err))?;
-        fs::write(repo.join(PLAIN_CLONE_FILE), "projects = [\"secret\"]\n")
+        fs::write(repo.join(OLD_PLAIN_CLONE_FILE), "projects = [\"secret\"]\n")
             .map_err(|err| LenkaError::io("write", &err))?;
-        assert_eq!(find_clone_file(&repo), None);
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        assert_eq!(find_clone_file(&paths, &repo), None);
         Ok(())
     }
 
@@ -789,7 +861,9 @@ mod tests {
     #[test]
     fn an_agent_outside_a_clone_has_no_projects() -> Result<()> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
         let caller = caller_for(
+            &paths,
             temp.path(),
             CallerSetup {
                 actor: Actor::Agent,

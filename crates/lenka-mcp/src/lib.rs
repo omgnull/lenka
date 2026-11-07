@@ -99,6 +99,7 @@ impl McpServer {
 
     fn caller(&self, client: Option<&str>) -> Result<Caller> {
         caller_for(
+            self.host.paths(),
             &self.setup.cwd,
             CallerSetup {
                 actor: Actor::Agent,

@@ -167,6 +167,39 @@ async fn a_process_outside_a_clone_has_no_projects() -> TestResult {
     Ok(())
 }
 
+/// A file in a shared directory or an archive must not give projects to an agent.
+#[tokio::test]
+async fn a_clone_file_in_a_plain_directory_gives_an_agent_no_project() -> TestResult {
+    let (_temp, machine) = machine()?;
+    machine.project("private")?;
+    let plain = machine.root.join("plain");
+    fs::create_dir_all(&plain)?;
+    fs::write(
+        plain.join(".lenka-clone.toml"),
+        "projects = [\"private\"]\ndefault = \"private\"\n",
+    )?;
+    let client = connect(&machine, &plain, None, Era::Initialize).await?;
+    let error = call_error(&client, "task.list", json!({})).await?;
+    assert_eq!(error["code"], "project_not_available", "{error}");
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A person connects a plain directory, and an agent in a subdirectory then gets the project.
+#[tokio::test]
+async fn a_connection_of_a_plain_directory_reaches_an_agent() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let plain = machine.root.join("plain");
+    let below = plain.join("sub");
+    fs::create_dir_all(&below)?;
+    machine.ok(&plain, &["init", "--name", "plain"])?;
+    let client = connect(&machine, &below, None, Era::Initialize).await?;
+    let list = call_ok(&client, "task.list", json!({})).await?;
+    assert_eq!(list["count"], 0, "{list}");
+    client.cancel().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_tool_definitions_stay_within_the_token_limit() -> TestResult {
     let (_temp, machine) = machine()?;

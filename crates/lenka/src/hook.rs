@@ -109,7 +109,9 @@ fn new_notices(cwd: &Path) -> Option<ShownNotices> {
     let agent = std::env::var("LENKA_AGENT")
         .ok()
         .filter(|name| !name.is_empty());
+    let paths = Paths::from_env().ok()?;
     let caller = caller_for(
+        &paths,
         cwd,
         CallerSetup {
             actor: Actor::Agent,
@@ -125,7 +127,7 @@ fn new_notices(cwd: &Path) -> Option<ShownNotices> {
     if names.is_empty() {
         return None;
     }
-    let projects = ProjectsFile::load(&Paths::from_env().ok()?).ok()?;
+    let projects = ProjectsFile::load(&paths).ok()?;
     let mut lines = Vec::new();
     let mut markers = Vec::new();
     for name in names {
@@ -301,9 +303,11 @@ fn hook_rule() -> Value {
     })
 }
 
-fn settings_file(cwd: &Path) -> PathBuf {
-    let base = lenka_core::gitdir::locate(cwd)
-        .map_or_else(|| cwd.to_path_buf(), |location| location.worktree);
+fn settings_file(paths: &Paths, cwd: &Path) -> PathBuf {
+    let base = lenka_core::gitdir::locate(cwd).map_or_else(
+        || lenka_core::init::plain_project_root(paths, cwd).unwrap_or_else(|| cwd.to_path_buf()),
+        |location| location.worktree,
+    );
     base.join(".claude").join("settings.local.json")
 }
 
@@ -321,11 +325,11 @@ fn ask_person() -> anyhow::Result<bool> {
 }
 
 /// Shows the change, asks the person, and adds the hook to the local settings of the worktree.
-pub fn install(cwd: &Path, assume_yes: bool, json_mode: bool) -> anyhow::Result<()> {
+pub fn install(paths: &Paths, cwd: &Path, assume_yes: bool, json_mode: bool) -> anyhow::Result<()> {
     if json_mode && !assume_yes {
         bail!("`--json` cannot ask a question. Add `--yes`.");
     }
-    let file = settings_file(cwd);
+    let file = settings_file(paths, cwd);
     let base = file.ancestors().nth(2).unwrap_or(cwd);
     if has_symlink(base, &file) {
         bail!(

@@ -153,6 +153,7 @@ impl RunContext {
     /// with `--project`, but the default project comes from the clone.
     pub fn person(&self) -> anyhow::Result<Caller> {
         let mut caller = caller_for(
+            &Paths::from_env()?,
             &self.cwd,
             CallerSetup {
                 actor: Actor::Human,
@@ -287,7 +288,9 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
         Command::Project(ProjectCommand::List) => list_projects(&context).map(|()| ok),
         Command::Hook {
             command: HookCommand::Install { yes },
-        } => crate::hook::install(&context.cwd, yes, context.json).map(|()| ok),
+        } => {
+            crate::hook::install(&Paths::from_env()?, &context.cwd, yes, context.json).map(|()| ok)
+        }
         Command::Migrate => migrate(&context, &plugins()?).map(|()| ok),
         Command::Plugins => show_plugins(&context, &plugins()?).map(|()| ok),
         Command::Call { tool, args } => call(&context, &plugins()?, &tool, &args).map(|()| ok),
@@ -449,8 +452,9 @@ fn attach(context: &RunContext, name: &str) -> anyhow::Result<()> {
 }
 
 fn list_projects(context: &RunContext) -> anyhow::Result<()> {
-    let projects = ProjectsFile::load(&Paths::from_env()?)?;
-    let clone = init::find_clone_file(&context.cwd)
+    let paths = Paths::from_env()?;
+    let projects = ProjectsFile::load(&paths)?;
+    let clone = init::find_clone_file(&paths, &context.cwd)
         .map(|file| CloneFile::load(&file))
         .transpose()?
         .flatten()

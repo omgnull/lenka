@@ -396,3 +396,16 @@ fn hook_install_gives_json() -> TestResult {
     assert_eq!(value["changed"], false, "{value}");
     Ok(())
 }
+
+#[test]
+fn hook_install_in_a_subdirectory_of_a_plain_project_uses_the_project_directory() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let plain = machine.root.join("plain");
+    let below = plain.join("sub/deep");
+    fs::create_dir_all(&below)?;
+    machine.ok(&plain, &["init", "--name", "plain"])?;
+    machine.ok(&below, &["hook", "install", "--yes"])?;
+    assert!(plain.join(".claude/settings.local.json").is_file());
+    assert!(!below.join(".claude").exists());
+    Ok(())
+}

@@ -176,6 +176,7 @@ A compiled plugin runs in the lenka process with no sandbox, so `lenka plugins` 
 
 lenka protects against mistakes and untrusted files. It does not protect against a malicious local process, because an agent with a shell can edit the files directly.
 
+- Only the Git directory and the user configuration can connect a directory to a project. A file in a checkout or a plain directory cannot select a project for an agent.
 - Task text can be a prompt injection. Tool results put task text in fields that are labeled as untrusted data, with the author beside the text. This reduces the risk, but it does not remove it.
 - The secret check finds common patterns only. Do not put secrets in tasks.
 - After the loop limit, an agent cannot claim or change the task until a person acts. To act, change the status, claim the task if its stage permits a person, or run `lenka task update <id> --version <n> --loop-until-done true`. That option lets the agent continue until the task is done.

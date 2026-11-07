@@ -642,7 +642,7 @@ fn init_outside_git_with_a_directory_works() -> TestResult {
     fs::create_dir_all(&work)?;
     machine.ok(&work, &["init", "--dir", "store", "--name", "plain"])?;
     assert!(work.join("store/lenka.toml").is_file());
-    assert!(work.join(".lenka-clone.toml").is_file());
+    assert!(!work.join(".lenka-clone.toml").exists());
     assert_eq!(machine.json(&work, &["task", "list"])?["count"], 0);
     Ok(())
 }

@@ -16,9 +16,6 @@ pub const FORMAT_VERSION: u32 = 1;
 /// The name of the clone file in the Git common directory.
 pub const CLONE_FILE: &str = "lenka-clone.toml";
 
-/// The name of the clone file outside Git, in a project directory or a parent of it.
-pub const PLAIN_CLONE_FILE: &str = ".lenka-clone.toml";
-
 /// The name of the project settings file.
 pub const PROJECT_FILE: &str = "lenka.toml";
 
@@ -549,6 +546,20 @@ impl Paths {
     #[must_use]
     pub fn plugins_file(&self) -> PathBuf {
         self.config_dir.join("plugins.toml")
+    }
+
+    /// Returns the clone file of a plain directory. This file is in the user configuration, because
+    /// a file in the directory can come from another author, and it must not select projects.
+    #[must_use]
+    pub fn plain_clone_file(&self, directory: &Path) -> PathBuf {
+        use sha2::{Digest as _, Sha256};
+        let digest = Sha256::digest(directory.as_os_str().as_encoded_bytes());
+        let mut name = String::with_capacity(digest.len() * 2 + 5);
+        for byte in digest {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        name.push_str(".toml");
+        self.config_dir.join("plain-clones").join(name)
     }
 
     /// Returns the default directory of a shared project.
