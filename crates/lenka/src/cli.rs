@@ -191,16 +191,30 @@ fn init_logs() {
         Some("trace") => tracing_subscriber::filter::LevelFilter::TRACE,
         _ => tracing_subscriber::filter::LevelFilter::WARN,
     };
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    // `rmcp` logs each request with its arguments at the debug level, and these hold task text.
+    let targets = tracing_subscriber::filter::Targets::new()
+        .with_default(level)
+        .with_target(
+            "rmcp",
+            level.min(tracing_subscriber::filter::LevelFilter::INFO),
+        );
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(level)
         .with_target(false)
+        .finish()
+        .with(targets)
         .init();
 }
 
 /// Runs the command line.
 pub fn main(plugins: impl FnOnce() -> Builder) -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => return usage_error(&error),
+    };
     init_logs();
     let json_mode = cli.json;
     match run(cli, plugins) {
@@ -210,6 +224,39 @@ pub fn main(plugins: impl FnOnce() -> Builder) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reports a wrong command line. A reader of `--json` output gets one form of error.
+fn usage_error(error: &clap::Error) -> ExitCode {
+    use clap::error::ErrorKind;
+    let is_answer = matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    );
+    if !is_answer && std::env::args().any(|arg| arg == "--json") {
+        crate::output::print_json(
+            &json!({"code": "invalid_argument", "message": error.render().to_string()}),
+        );
+        return ExitCode::from(2);
+    }
+    let _ = error.print();
+    if is_answer {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    }
+}
+
+/// Refuses `--project` for a command that has no use for it, because the option would do nothing.
+fn check_project_option(cli: &Cli) -> anyhow::Result<()> {
+    let has_no_use = matches!(
+        cli.command,
+        Command::Init(_) | Command::Project(_) | Command::Plugins | Command::Hook { .. }
+    );
+    if cli.project.is_some() && has_no_use {
+        bail!("This command does not use --project. For a new project, use `lenka init --name`.");
+    }
+    Ok(())
 }
 
 fn print_error(json_mode: bool, error: &anyhow::Error) {
@@ -226,6 +273,7 @@ fn print_error(json_mode: bool, error: &anyhow::Error) {
 }
 
 fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCode> {
+    check_project_option(&cli)?;
     let plugins = || -> anyhow::Result<Host> { Ok(plugin_list().build()?) };
     let context = RunContext {
         cwd: std::env::current_dir().context("Read the current directory")?,
@@ -239,7 +287,7 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
         Command::Project(ProjectCommand::List) => list_projects(&context).map(|()| ok),
         Command::Hook {
             command: HookCommand::Install { yes },
-        } => crate::hook::install(&context.cwd, yes).map(|()| ok),
+        } => crate::hook::install(&context.cwd, yes, context.json).map(|()| ok),
         Command::Migrate => migrate(&context, &plugins()?).map(|()| ok),
         Command::Plugins => show_plugins(&context, &plugins()?).map(|()| ok),
         Command::Call { tool, args } => call(&context, &plugins()?, &tool, &args).map(|()| ok),

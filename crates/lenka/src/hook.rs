@@ -27,6 +27,13 @@ const MAX_SHOWN: usize = 20;
 /// The largest reason text in one output line.
 const MAX_REASON_CHARS: usize = 300;
 
+/// The largest input of the hook. A larger input gives a JSON error, and the hook uses the current
+/// directory.
+const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The longest wait for the input of the client.
+const INPUT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runs the hook. Only a new notice gives output.
 pub fn run() {
     let input = read_input();
@@ -37,20 +44,47 @@ pub fn run() {
     let Some(cwd) = cwd else {
         return;
     };
-    if let Some(text) = new_notices(&cwd) {
+    if let Some(shown) = new_notices(&cwd) {
         let mut stdout = std::io::stdout().lock();
-        let _ = writeln!(stdout, "{}", hook_json(&text));
+        // A notice counts as shown only after the write, so a failed write can show it again.
+        if writeln!(stdout, "{}", hook_json(&shown.text)).is_ok() {
+            shown.save_markers();
+        }
     }
 }
 
+/// The text of new notices, and the markers to store after the text reaches the client.
+struct ShownNotices {
+    text: String,
+    markers: Vec<(PathBuf, NoticeId)>,
+}
+
+impl ShownNotices {
+    fn save_markers(&self) {
+        for (marker, newest) in &self.markers {
+            if !fs::symlink_metadata(marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                let _ = fs::write(marker, newest.to_string());
+            }
+        }
+    }
+}
+
+/// Reads the input of the client. A client can keep the pipe open, and the hook must not wait for
+/// such a client, so the read runs on another thread. The hook then uses the current directory.
 fn read_input() -> Option<String> {
-    let mut stdin = std::io::stdin().lock();
-    if stdin.is_terminal() {
+    if std::io::stdin().is_terminal() {
         return None;
     }
-    let mut text = String::new();
-    stdin.read_to_string(&mut text).ok()?;
-    Some(text)
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let read = std::io::stdin()
+            .lock()
+            .take(MAX_INPUT_BYTES)
+            .read_to_string(&mut text);
+        let _ = sender.send(read.ok().map(|_| text));
+    });
+    receiver.recv_timeout(INPUT_WAIT).ok().flatten()
 }
 
 fn cwd_of(input: &str) -> Option<PathBuf> {
@@ -71,7 +105,7 @@ fn hook_json(text: &str) -> Value {
     })
 }
 
-fn new_notices(cwd: &Path) -> Option<String> {
+fn new_notices(cwd: &Path) -> Option<ShownNotices> {
     let agent = std::env::var("LENKA_AGENT")
         .ok()
         .filter(|name| !name.is_empty());
@@ -93,11 +127,14 @@ fn new_notices(cwd: &Path) -> Option<String> {
     }
     let projects = ProjectsFile::load(&Paths::from_env().ok()?).ok()?;
     let mut lines = Vec::new();
+    let mut markers = Vec::new();
     for name in names {
         let Some(entry) = projects.projects.get(name) else {
             continue;
         };
-        lines.extend(project_notices(name, &entry.directory, &caller.agent_key.0));
+        let (found, marker) = project_notices(name, &entry.directory, &caller.agent_key.0);
+        lines.extend(found);
+        markers.extend(marker);
     }
     if lines.is_empty() {
         return None;
@@ -113,17 +150,21 @@ fn new_notices(cwd: &Path) -> Option<String> {
     if total > MAX_SHOWN {
         text.push_str(&format!("{} more notices are open.\n", total - MAX_SHOWN));
     }
-    Some(text)
+    Some(ShownNotices { text, markers })
 }
 
-/// Reads the new notices of one project, and stores the newest shown ID.
-fn project_notices(name: &str, dir: &Path, key: &str) -> Vec<String> {
+/// Reads the new notices of one project. The result also holds the marker for the newest ID.
+fn project_notices(
+    name: &str,
+    dir: &Path,
+    key: &str,
+) -> (Vec<String>, Option<(PathBuf, NoticeId)>) {
     let inbox_dir = dir.join(".runtime").join("inbox");
     if has_symlink(dir, &inbox_dir) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let Some(bytes) = read_end(&inbox_dir.join(format!("{key}.jsonl"))) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let notices = parse_inbox(&bytes);
     let marker = inbox_dir.join(format!("{key}.shown"));
@@ -135,15 +176,13 @@ fn project_notices(name: &str, dir: &Path, key: &str) -> Vec<String> {
         .filter(|notice| shown.is_none_or(|id| notice.id > id))
         .collect();
     let Some(newest) = fresh.iter().map(|notice| notice.id).max() else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
-    if !fs::symlink_metadata(&marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        let _ = fs::write(&marker, newest.to_string());
-    }
-    fresh
+    let lines = fresh
         .iter()
         .map(|notice| notice_line(name, notice))
-        .collect()
+        .collect();
+    (lines, Some((marker, newest)))
 }
 
 /// Tells if a path below a base holds a symlink. lenka refuses symlinks in the data directory.
@@ -233,9 +272,11 @@ fn merge_hook(root: &mut Value) -> anyhow::Result<bool> {
         rule.get("hooks")
             .and_then(Value::as_array)
             .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item.get("command").and_then(Value::as_str) == Some(HOOK_COMMAND))
+                items.iter().any(|item| {
+                    item.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_hook_command)
+                })
             })
     });
     if exists {
@@ -243,6 +284,14 @@ fn merge_hook(root: &mut Value) -> anyhow::Result<bool> {
     }
     rules.push(hook_rule());
     Ok(true)
+}
+
+/// Tells if a command runs the lenka hook, also with a full path to the program.
+fn is_hook_command(command: &str) -> bool {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|last| last == HOOK_COMMAND)
 }
 
 fn hook_rule() -> Value {
@@ -272,14 +321,28 @@ fn ask_person() -> anyhow::Result<bool> {
 }
 
 /// Shows the change, asks the person, and adds the hook to the local settings of the worktree.
-pub fn install(cwd: &Path, assume_yes: bool) -> anyhow::Result<()> {
+pub fn install(cwd: &Path, assume_yes: bool, json_mode: bool) -> anyhow::Result<()> {
+    if json_mode && !assume_yes {
+        bail!("`--json` cannot ask a question. Add `--yes`.");
+    }
     let file = settings_file(cwd);
-    if fs::symlink_metadata(&file).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    let base = file.ancestors().nth(2).unwrap_or(cwd);
+    if has_symlink(base, &file) {
         bail!(
-            "{} is a symlink. Replace it with a file, and try again.",
+            "{} has a symlink in its path. Replace it with a file or a directory, and try again.",
             file.display()
         );
     }
+    let old_permissions = match fs::metadata(&file) {
+        Ok(meta) if meta.permissions().readonly() => {
+            bail!(
+                "{} is read-only, so lenka did not change it. Add the hook by hand.",
+                file.display()
+            );
+        }
+        Ok(meta) => Some(meta.permissions()),
+        Err(_) => None,
+    };
     let mut root = match fs::read_to_string(&file) {
         Ok(text) => serde_json::from_str(&text).with_context(|| {
             format!(
@@ -291,12 +354,18 @@ pub fn install(cwd: &Path, assume_yes: bool) -> anyhow::Result<()> {
         Err(err) => return Err(err).with_context(|| format!("Read {}", file.display())),
     };
     if !merge_hook(&mut root)? {
-        say!("{} already has the lenka hook. No change.", file.display());
+        if json_mode {
+            crate::output::print_json(&json!({"file": file, "changed": false}));
+        } else {
+            say!("{} already has the lenka hook. No change.", file.display());
+        }
         return Ok(());
     }
-    say!("This change adds a PostToolUse hook to {}:", file.display());
-    say!("{}", serde_json::to_string_pretty(&hook_rule())?);
-    say!("All other content of the file stays.");
+    if !json_mode {
+        say!("This change adds a PostToolUse hook to {}:", file.display());
+        say!("{}", serde_json::to_string_pretty(&hook_rule())?);
+        say!("All other settings keep their values. The order and the spacing can change.");
+    }
     if !assume_yes && !ask_person()? {
         say!("No change.");
         return Ok(());
@@ -307,16 +376,44 @@ pub fn install(cwd: &Path, assume_yes: bool) -> anyhow::Result<()> {
     let temp = file.with_extension(format!("tmp{}", std::process::id()));
     let mut text = serde_json::to_string_pretty(&root)?;
     text.push('\n');
-    fs::write(&temp, text).with_context(|| format!("Write {}", temp.display()))?;
+    write_private(&temp, &text).with_context(|| format!("Write {}", temp.display()))?;
+    // The settings can hold tokens, so the new file keeps the access rights of the old file.
+    if let Some(permissions) = old_permissions {
+        fs::set_permissions(&temp, permissions)
+            .with_context(|| format!("Set the access rights of {}", temp.display()))?;
+    }
     fs::rename(&temp, &file).with_context(|| format!("Replace {}", file.display()))?;
-    say!("Added the hook. Claude Code reads it at the next session.");
+    if json_mode {
+        crate::output::print_json(&json!({"file": file, "changed": true}));
+    } else {
+        say!("Added the hook. Claude Code reads it at the next session.");
+    }
     Ok(())
+}
+
+/// Writes a new file that only the owner can read, because the text can hold tokens.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(text.as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lenka_plugin_api::Timestamp;
+
+    #[test]
+    fn a_full_path_to_the_program_counts_as_the_hook() {
+        assert!(is_hook_command(HOOK_COMMAND));
+        assert!(is_hook_command(&format!("/usr/local/bin/{HOOK_COMMAND}")));
+        assert!(!is_hook_command("other hook"));
+    }
 
     #[test]
     fn merge_keeps_other_content_and_runs_once() -> anyhow::Result<()> {

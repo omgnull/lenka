@@ -346,6 +346,9 @@ fn print_rows(value: &Value) {
             .and_then(Value::as_array)
             .unwrap_or(&empty),
     );
+    if value.get("truncated").and_then(Value::as_bool) == Some(true) {
+        say!("More tasks exist. Use --limit to show more.");
+    }
 }
 
 fn print_related(value: &Value) {
@@ -612,6 +615,12 @@ fn run_typed(context: &RunContext, host: &Host, command: TaskCommand) -> anyhow:
         } => {
             let id = service.resolve(&task)?;
             let finish = if outcome == "released" {
+                if evidence.is_some() {
+                    return Err(LenkaError::invalid_argument(
+                        "A release stores no evidence. Use an entry for this text.",
+                    )
+                    .into());
+                }
                 Finish::Released
             } else {
                 Finish::Done {

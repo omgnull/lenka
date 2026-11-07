@@ -42,7 +42,18 @@ Create a project in a Git repository:
 lenka init
 ```
 
+Outside a Git repository, select a directory: `lenka init --dir <directory>`.
+
 The data goes to `<git-common-dir>/lenka-data`, so all worktrees of the clone share it, and your code branches stay clean. Use `lenka init --shared` and `lenka project attach <name>` to share one project between repositories.
+
+Optional: keep the data in Git, and share it with other clones. Add `enabled = ["git"]` to the file `plugins.toml` in the lenka configuration directory, and run:
+
+```sh
+lenka git enable
+lenka sync
+```
+
+In a fresh clone, turn on the plugin, run `git fetch`, and run `lenka init`. This call restores the data from the branch `lenka-data`.
 
 Connect an MCP client. For Claude Code:
 
@@ -150,7 +161,7 @@ A drawing is an artifact with the media type `application/vnd.lenka.drawing+json
 All features are plugins. Cargo features select lenka's own plugins:
 
 ```sh
-cargo build --release --no-default-features --features tasks,artifacts,mcp
+cargo build --release -p lenka --no-default-features --features tasks,artifacts,mcp
 ```
 
 A third-party build uses a small wrapper crate:

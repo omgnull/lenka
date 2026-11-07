@@ -620,3 +620,42 @@ async fn a_notice_of_an_unlinked_artifact_does_not_stop_a_finish() -> TestResult
     client.cancel().await?;
     Ok(())
 }
+
+/// `rmcp` logs each request at the debug level, and a request can hold task text.
+#[test]
+fn a_debug_log_holds_no_task_text() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let mut command = machine.command(&repo, &["mcp"]);
+    command
+        .env("LENKA_LOG", "trace")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    {
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            panic!("the pipes exist");
+        };
+        let mut reader = BufReader::new(stdout);
+        let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"}}});
+        let ready = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "task.create", "arguments": {"title": "A private title"}}});
+        for line in [init, ready, call] {
+            writeln!(stdin, "{line}")?;
+            stdin.flush()?;
+            if line.get("id").is_some() {
+                let mut answer = String::new();
+                reader.read_line(&mut answer)?;
+            }
+        }
+    }
+    let output = child.wait_with_output()?;
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(!log.is_empty(), "the log level is on");
+    assert!(!log.contains("A private title"), "{log}");
+    Ok(())
+}

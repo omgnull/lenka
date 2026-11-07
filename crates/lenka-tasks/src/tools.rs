@@ -42,6 +42,9 @@ pub fn plugin() -> TasksPlugin {
     TasksPlugin
 }
 
+/// The count of rows in a list with no limit in the call.
+const DEFAULT_LIST_LIMIT: usize = 50;
+
 #[derive(Debug)]
 struct TaskTools;
 
@@ -732,6 +735,11 @@ fn short_link(link: &Link) -> String {
 }
 
 fn list(service: &TaskService, caller: &Caller, args: ListArgs) -> Result<Value> {
+    let limit = if args.limit == 0 {
+        DEFAULT_LIST_LIMIT
+    } else {
+        args.limit
+    };
     let filter = ListFilter {
         statuses: args.status,
         kind: args.kind,
@@ -740,10 +748,13 @@ fn list(service: &TaskService, caller: &Caller, args: ListArgs) -> Result<Value>
         text: args.text,
         ready: args.ready,
         blocked: args.blocked,
-        limit: args.limit,
+        limit: limit.saturating_add(1),
     };
-    let rows = service.list(caller, &filter)?;
-    Ok(json!({"tasks": rows_json(&rows), "count": rows.len()}))
+    let mut rows = service.list(caller, &filter)?;
+    // One more row shows that the limit cut the list.
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    Ok(json!({"tasks": rows_json(&rows), "count": rows.len(), "truncated": truncated}))
 }
 
 fn claim(service: &TaskService, caller: &Caller, args: ClaimArgs) -> Result<Value> {
@@ -786,6 +797,11 @@ fn entry(service: &TaskService, caller: &Caller, args: EntryArgs) -> Result<Valu
 fn finish(service: &TaskService, caller: &Caller, args: FinishArgs) -> Result<Value> {
     let id = service.resolve(&args.task)?;
     let finish = match args.outcome {
+        Outcome::Released if args.evidence.is_some() => {
+            return Err(LenkaError::invalid_argument(
+                "A release stores no evidence. Use an entry for this text.",
+            ));
+        }
         Outcome::Released => Finish::Released,
         Outcome::Done => Finish::Done {
             evidence: args.evidence.unwrap_or_default(),

@@ -1841,3 +1841,97 @@ fn a_secret_in_a_source_file_name_is_refused() -> TestResult {
     assert!(message.contains("file name"), "{message}");
     Ok(())
 }
+
+#[test]
+fn a_wrong_command_line_with_json_gives_a_json_error() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let output = machine.run(&repo, &["--json", "nosuch"])?;
+    assert_eq!(output.status.code(), Some(2));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(value["code"], "invalid_argument", "{value}");
+    let plain = machine.run(&repo, &["nosuch"])?;
+    assert_eq!(plain.status.code(), Some(2));
+    assert!(plain.stdout.is_empty());
+    assert!(machine.run(&repo, &["--help"])?.status.success());
+    Ok(())
+}
+
+#[test]
+fn a_list_tells_that_the_limit_cut_it() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    for title in ["One", "Two", "Three"] {
+        machine.json(&repo, &["task", "create", title])?;
+    }
+    let cut = machine.json(&repo, &["task", "list", "--limit", "2"])?;
+    assert_eq!(cut["truncated"], true, "{cut}");
+    assert_eq!(cut["count"], 2, "{cut}");
+    let all = machine.json(&repo, &["task", "list", "--limit", "3"])?;
+    assert_eq!(all["truncated"], false, "{all}");
+    assert!(
+        machine
+            .ok(&repo, &["task", "list", "--limit", "2"])?
+            .contains("More tasks exist")
+    );
+    Ok(())
+}
+
+#[test]
+fn a_project_option_with_no_use_gives_an_error() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    assert!(
+        !machine
+            .run(&repo, &["--project", "other", "plugins"])?
+            .status
+            .success()
+    );
+    let plain = machine.repo("web")?;
+    assert!(
+        !machine
+            .run(&plain, &["--project", "web", "init"])?
+            .status
+            .success()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_release_refuses_evidence() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(&repo, &["task", "claim", &id])?;
+    let args = [
+        "task",
+        "finish",
+        &id,
+        "--outcome",
+        "released",
+        "--evidence",
+        "Text.",
+    ];
+    assert!(machine.fails(&repo, &args)?.contains("invalid_argument"));
+    Ok(())
+}
+
+/// Stdout can close while lenka writes, and this must not cause a panic.
+#[cfg(unix)]
+#[test]
+fn a_closed_output_pipe_causes_no_panic() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let mut child = machine
+        .command(&repo, &["plugins"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    drop(child.stdout.take());
+    let output = child.wait_with_output()?;
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(!message.contains("panicked"), "{message}");
+    assert_ne!(output.status.code(), Some(101));
+    Ok(())
+}

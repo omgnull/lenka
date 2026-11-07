@@ -287,3 +287,112 @@ fn a_large_old_notice_does_not_hide_a_new_notice() -> TestResult {
     assert!(output.contains("The second change."), "{output}");
     Ok(())
 }
+
+/// A client can keep the pipe open, and the hook must not wait with no limit.
+#[test]
+fn the_hook_does_not_wait_for_a_client_that_keeps_the_pipe_open() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let mut child = machine
+        .command(&repo, &["hook"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()?;
+    let _open = child.stdin.take();
+    let start = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        assert!(start.elapsed().as_secs() < 15, "the hook still runs");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// A notice that did not reach the client must come again.
+#[test]
+fn a_failed_write_of_the_hook_keeps_the_notice_for_the_next_call() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    as_agent(&machine, &repo, "a", &["task", "claim", &id])?;
+    let change = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        "1",
+        "--description",
+        "New.",
+        "--reason",
+        "A reason.",
+        "--override",
+    ];
+    machine.json(&repo, &change)?;
+
+    let input = format!("{{\"cwd\":{}}}", serde_json::to_string(&repo)?);
+    let mut child = machine
+        .command(&repo, &["hook"])
+        .env("LENKA_AGENT", "a")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    drop(child.stdout.take());
+    if let Some(mut stdin) = child.stdin.take() {
+        std::io::Write::write_all(&mut stdin, input.as_bytes())?;
+    }
+    child.wait()?;
+    let shown = run_hook(&machine, &repo, &input, Some("a"))?;
+    assert!(shown.contains("A reason."), "{shown}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_install_keeps_the_access_rights_of_the_settings() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let directory = repo.join(".claude");
+    fs::create_dir_all(&directory)?;
+    let file = directory.join("settings.local.json");
+    fs::write(&file, "{\"env\":{}}\n")?;
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640))?;
+    machine.ok(&repo, &["hook", "install", "--yes"])?;
+    assert_eq!(fs::metadata(&file)?.permissions().mode() & 0o777, 0o640);
+    assert!(fs::read_to_string(&file)?.contains("PostToolUse"));
+
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o400))?;
+    fs::write(directory.join("other"), "")?;
+    let again = machine.run(&repo, &["hook", "install", "--yes"])?;
+    assert!(!again.status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn hook_install_refuses_a_symlink_in_its_path() -> TestResult {
+    let (temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let elsewhere = temp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere)?;
+    std::os::unix::fs::symlink(&elsewhere, repo.join(".claude"))?;
+    assert!(
+        !machine
+            .run(&repo, &["hook", "install", "--yes"])?
+            .status
+            .success()
+    );
+    assert!(!elsewhere.join("settings.local.json").exists());
+    Ok(())
+}
+
+#[test]
+fn hook_install_gives_json() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let value = machine.json(&repo, &["hook", "install", "--yes"])?;
+    assert_eq!(value["changed"], true, "{value}");
+    let value = machine.json(&repo, &["hook", "install", "--yes"])?;
+    assert_eq!(value["changed"], false, "{value}");
+    Ok(())
+}
