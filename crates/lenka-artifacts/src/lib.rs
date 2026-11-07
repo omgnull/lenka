@@ -3,6 +3,7 @@
 
 //! The artifact plugin. One artifact can link to many tasks in its project.
 
+use sha2::{Digest as _, Sha256};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -251,12 +252,27 @@ impl ArtifactService {
         }
     }
 
-    fn store(&self, id: ArtifactId, version: u64, prepared: &Prepared) -> Result<StoredBytes> {
+    /// Stores the bytes. The store reads a source file again, after the wait for the lock, so the
+    /// bytes must be the bytes that the secret check saw.
+    fn store(
+        &self,
+        id: ArtifactId,
+        version: u64,
+        prepared: &Prepared,
+        checked: Option<&str>,
+    ) -> Result<StoredBytes> {
         let store = self.project.artifacts();
-        match &prepared.content {
-            Content::Path(path) => store.put_file(id, version, &prepared.file, path),
-            Content::Bytes(bytes) => store.put_bytes(id, version, &prepared.file, bytes),
+        let stored = match &prepared.content {
+            Content::Path(path) => store.put_file(id, version, &prepared.file, path)?,
+            Content::Bytes(bytes) => store.put_bytes(id, version, &prepared.file, bytes)?,
+        };
+        if checked.is_some_and(|sha256| sha256 != stored.sha256) {
+            store.delete_version(id, version)?;
+            return Err(LenkaError::invalid_argument(
+                "The source file changed during this call, so lenka did not store it. Try again.",
+            ));
         }
+        Ok(stored)
     }
 
     /// Adds an artifact.
@@ -279,7 +295,7 @@ impl ArtifactService {
                 "An artifact name is one file name, with no path and no control characters.",
             ));
         }
-        check_content(&prepared)?;
+        let checked = check_content(&prepared)?;
         let final_type = media_type.map_or_else(|| prepared.media_type.clone(), str::to_owned);
         lenka_core::input::check_short("The media type", &final_type)?;
         let checks = vec![
@@ -290,7 +306,7 @@ impl ArtifactService {
         secret::check(&checks, SecretPolicy::Enforce)?;
         let id = ArtifactId::generate();
         self.tasks.with_artifact_write(|locked, _, now| {
-            let stored = self.store(id, 1, &prepared)?;
+            let stored = self.store(id, 1, &prepared, checked.as_deref())?;
             let record = ArtifactRecord {
                 id,
                 name: final_name.clone(),
@@ -353,7 +369,7 @@ impl ArtifactService {
         }
         lenka_core::input::check_reason("The reason", reason)?;
         let prepared = self.prepare(caller, *source)?;
-        check_content(&prepared)?;
+        let checked = check_content(&prepared)?;
         let checks = vec![
             TextCheck::new("reason", reason),
             TextCheck::new("artifact file name", prepared.file.clone()),
@@ -365,7 +381,7 @@ impl ArtifactService {
             locked.check_version("The artifact", record.version, expected_version)?;
             let loop_op = routing.check_loop(&self.project, caller, id)?;
             let version = record.version + 1;
-            let stored = self.store(id, version, &prepared)?;
+            let stored = self.store(id, version, &prepared, checked.as_deref())?;
             let old = record.current().version;
             if mode == UpdateMode::Replace {
                 record.versions.retain(|item| item.version != old);
@@ -600,20 +616,50 @@ fn check_not_lfs_pointer(prepared: &Prepared) -> Result<()> {
     Ok(())
 }
 
-fn check_content(prepared: &Prepared) -> Result<()> {
+fn check_content(prepared: &Prepared) -> Result<Option<String>> {
     check_not_lfs_pointer(prepared)?;
     let location = format!("artifact {}", prepared.file);
     match &prepared.content {
         Content::Path(path) => {
-            let mut file = std::fs::File::open(path)
+            let file = std::fs::File::open(path)
                 .map_err(|err| LenkaError::io("Open the artifact source", &err))?;
-            secret::check_stream(&location, &mut file)
+            let mut reader = HashingReader {
+                inner: file,
+                hasher: Sha256::new(),
+            };
+            secret::check_stream(&location, &mut reader)?;
+            Ok(Some(digest_text(reader.hasher)))
         }
         Content::Bytes(bytes) => {
             let mut reader = bytes.as_slice();
-            secret::check_stream(&location, &mut reader)
+            secret::check_stream(&location, &mut reader)?;
+            Ok(None)
         }
     }
+}
+
+/// Gives the SHA-256 of the bytes that pass through a read.
+struct HashingReader {
+    inner: std::fs::File,
+    hasher: Sha256,
+}
+
+impl std::io::Read for HashingReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
+fn digest_text(hasher: Sha256) -> String {
+    use std::fmt::Write as _;
+    let digest = hasher.finalize();
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn missing(id: ArtifactId) -> LenkaError {

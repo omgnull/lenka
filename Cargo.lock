@@ -2009,6 +2009,7 @@ dependencies = [
  "lenka-tasks",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "toml",
  "tracing",
