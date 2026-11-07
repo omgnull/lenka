@@ -185,12 +185,27 @@ fn a_cancelled_folder_dialog_keeps_the_typed_path() {
     let mut harness = start_new_project(&fixture);
     type_into(&mut harness, "Data directory", "/typed/path");
     click(&mut harness, "Browse");
+    if let Some(pending) = &mut project_form(&mut harness).pending {
+        pending.make_old();
+    }
     pending_pick(&mut harness).finish(FolderPick::Cancelled);
     harness.run();
     let form = project_form(&mut harness);
     assert!(form.pending.is_none());
     assert_eq!(form.directory, "/typed/path");
     assert!(form.error.is_none());
+}
+
+#[test]
+fn a_folder_dialog_that_does_not_open_gives_a_message() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    click(&mut harness, "Browse");
+    pending_pick(&mut harness).finish(FolderPick::Cancelled);
+    harness.run();
+    let form = project_form(&mut harness);
+    assert!(form.pending.is_none());
+    assert!(form.error.is_some());
 }
 
 #[test]
@@ -2221,4 +2236,76 @@ fn link_text_in_the_settings_stays_after_a_return_to_the_settings() {
     click(&mut harness, "Tree");
     click(&mut harness, "Settings");
     assert_eq!(harness.state().app().settings.link_to, "edited");
+}
+
+#[test]
+fn settings_show_after_a_project_switch() {
+    let (_fixture, mut harness) = start_with_two_projects();
+    click(&mut harness, "Settings");
+    assert!(harness.state().app().settings.draft.is_some());
+    select_project(&mut harness, "small");
+    assert_eq!(open_project_name(&harness), "small");
+    assert!(harness.state().app().settings.draft.is_some());
+}
+
+#[test]
+fn a_gantt_bar_dropped_outside_the_chart_still_moves_the_dates() {
+    let fixture = Arc::new(Fixture::with_project());
+    let (_host, tasks) = fixture.other_process();
+    let start_day = lenka_plugin_api::Day::parse("2026-03-10").expect("a day");
+    let id = tasks
+        .create(
+            &fixture.person(),
+            NewTask {
+                title: "Dated task".to_owned(),
+                start: Some(start_day),
+                due: lenka_plugin_api::Day::parse("2026-03-20").ok(),
+                ..NewTask::default()
+            },
+        )
+        .expect("a task")
+        .id();
+    let mut harness = start(&fixture, SIZE, Theme::Light);
+    click(&mut harness, "Gantt");
+    let bar = harness.get_by_label("Bar of Dated task").rect();
+    drag(
+        &mut harness,
+        bar.center(),
+        bar.center() + Vec2::new(SIZE.x * 3.0, 0.0),
+    );
+    let meta = tasks
+        .refresh()
+        .and_then(|_| tasks.detail(id, &[]))
+        .expect("detail")
+        .meta;
+    assert!(meta.front.start.expect("a start").number() > start_day.number());
+}
+
+#[test]
+fn a_date_that_a_person_types_stays_after_another_change() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["A task"]);
+    open_detail(&mut harness, "A task");
+    type_into(&mut harness, "Start", "2026-0");
+    let (_host, tasks) = fixture.other_process();
+    tasks
+        .update(
+            &fixture.person(),
+            ids[0],
+            TaskPatch {
+                expected_version: 1,
+                title: Some("A new title".to_owned()),
+                ..TaskPatch::default()
+            },
+        )
+        .expect("a change");
+    wait_until(&mut harness, "the new version loads", |harness| {
+        harness
+            .state()
+            .app()
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.data.meta.state.version == 2)
+    });
+    let detail = harness.state().app().detail.as_ref().expect("a panel");
+    assert_eq!(detail.start_input_text(), "2026-0");
 }

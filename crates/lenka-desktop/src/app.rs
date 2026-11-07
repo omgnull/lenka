@@ -210,6 +210,11 @@ impl DesktopApp {
                 if self.view == View::Drawing {
                     self.view = View::Board;
                 }
+                if self.view == View::Settings
+                    && let Some(session) = &self.session
+                {
+                    self.settings.load(session);
+                }
             }
             Err(error) => self.report(&error),
         }

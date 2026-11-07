@@ -3511,3 +3511,28 @@ fn a_link_to_a_removed_task_can_be_removed_with_its_short_id() -> Result<()> {
     );
     Ok(())
 }
+
+/// A panel sends a field with only spaces, and it has no way to ask for a reason.
+#[test]
+fn only_spaces_in_an_empty_field_are_not_a_material_change() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let new = NewTask {
+        title: "A task".to_owned(),
+        ..NewTask::default()
+    };
+    let id = service.create(&human, new)?.id();
+    let meta = service.update(
+        &human,
+        id,
+        TaskPatch {
+            expected_version: 1,
+            description: Some("  ".to_owned()),
+            plan: Some(" ".to_owned()),
+            ..TaskPatch::default()
+        },
+    )?;
+    assert_eq!(meta.state.version, 2);
+    Ok(())
+}

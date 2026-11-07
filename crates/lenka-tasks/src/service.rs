@@ -3171,10 +3171,12 @@ fn changed_parts(
     new_plan: Option<&str>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
-    if old.section(DESCRIPTION).map(str::trim) != new.section(DESCRIPTION).map(str::trim) {
+    // An empty section and a missing section hold the same text.
+    let text_of = |body: &Body, name: &str| body.section(name).map_or("", str::trim).to_owned();
+    if text_of(old, DESCRIPTION) != text_of(new, DESCRIPTION) {
         changed.push("description".to_owned());
     }
-    if old.section(REQUIREMENTS).map(str::trim) != new.section(REQUIREMENTS).map(str::trim) {
+    if text_of(old, REQUIREMENTS) != text_of(new, REQUIREMENTS) {
         changed.push("requirements".to_owned());
     }
     if criteria_text_differs(old.section(ACCEPTANCE), new.section(ACCEPTANCE)) {

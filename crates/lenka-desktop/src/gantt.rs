@@ -260,12 +260,13 @@ impl GanttState {
         let clip = Rect::from_min_max(Pos2::new(chart_left, rect.top()), rect.max);
         let span = self.shown_span(position, scale);
         let bar = bar_rect(span, rect, scale);
-        if !bar.intersects(clip) {
+        let dragged = self.drag.is_some_and(|drag| drag.position == position);
+        // A bar in a drag can be outside the chart, and it must still get the end of the drag.
+        if !bar.intersects(clip) && !dragged {
             return;
         }
         let painter = ui.painter_at(clip);
         let color = palette.status(status);
-        let dragged = self.drag.is_some_and(|drag| drag.position == position);
         let border = if layout_row.conflict {
             Stroke::new(1.5, palette.danger)
         } else if dragged {

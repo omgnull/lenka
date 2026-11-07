@@ -169,12 +169,15 @@ impl DetailState {
         }
     }
 
+    /// Returns the text in the start field.
+    #[cfg(test)]
+    pub(crate) fn start_input_text(&self) -> &str {
+        &self.start_input
+    }
+
     fn fill_date_inputs(&mut self) {
-        let text = |day: Option<lenka_plugin_api::Day>| {
-            day.map_or_else(String::new, |day| day.to_string())
-        };
-        self.start_input = text(self.data.meta.front.start);
-        self.due_input = text(self.data.meta.front.due);
+        self.start_input = day_text(self.data.meta.front.start);
+        self.due_input = day_text(self.data.meta.front.due);
     }
 
     /// Reads the task again, and merges the new data with the drafts.
@@ -184,6 +187,8 @@ impl DetailState {
         let new = Draft::of(&data);
         let old_version = self.data.meta.state.version;
         let new_version = data.meta.state.version;
+        let old_front = self.data.meta.front.clone();
+        let keep_dates = !matches!(mode, Reload::Saved | Reload::Discard);
         match mode {
             Reload::Saved | Reload::Discard => {
                 self.draft = new;
@@ -220,7 +225,22 @@ impl DetailState {
         }
         self.data = data;
         self.related = None;
-        self.fill_date_inputs();
+        if keep_dates {
+            // A person can be in the middle of a date, so only a changed date replaces the text.
+            let front = &self.data.meta.front;
+            merge_field(
+                &mut self.start_input,
+                &day_text(old_front.start),
+                &day_text(front.start),
+            );
+            merge_field(
+                &mut self.due_input,
+                &day_text(old_front.due),
+                &day_text(front.due),
+            );
+        } else {
+            self.fill_date_inputs();
+        }
         self.resolve_blockers(session);
         Ok(())
     }
@@ -300,6 +320,10 @@ pub(crate) fn has_section_heading(text: &str) -> bool {
 }
 
 /// Takes a new text unless the person edited the old text.
+fn day_text(day: Option<lenka_plugin_api::Day>) -> String {
+    day.map_or_else(String::new, |day| day.to_string())
+}
+
 fn merge_field(draft: &mut String, old: &str, new: &str) {
     if draft == old {
         new.clone_into(draft);

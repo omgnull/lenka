@@ -437,9 +437,14 @@ impl Document {
                 file.format
             )));
         }
-        let document = Self {
+        let mut document = Self {
             shapes: file.shapes,
         };
+        // A person or a tool can write a box that does not match the points. The hit test and the
+        // view use the box, so the points decide.
+        for shape in &mut document.shapes {
+            shape.fit_points();
+        }
         document.validate()?;
         Ok(document)
     }
@@ -1127,6 +1132,16 @@ mod tests {
         shape.points = Some(vec![a, b]);
         shape.fit_points();
         shape
+    }
+
+    #[test]
+    fn a_line_with_a_wrong_box_can_still_be_selected() -> Result<(), DrawingError> {
+        let text = br##"{"format": 1, "shapes": [{"id": "a", "kind": "line",
+            "x": 900.0, "y": 900.0, "w": 1.0, "h": 1.0, "stroke": "#000000", "width": 2.0,
+            "points": [[10.0, 10.0], [50.0, 10.0]]}]}"##;
+        let document = Document::from_bytes(text)?;
+        assert_eq!(document.hit(30.0, 10.0, 1.0), Some(0));
+        Ok(())
     }
 
     fn sample() -> Document {

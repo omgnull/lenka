@@ -10,13 +10,17 @@ use std::fmt;
 use std::io::Read as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use egui::epaint::text::{Fonts, TextOptions};
 use egui::{FontData, FontDefinitions, FontFamily, FontId};
 
 /// The largest font file that lenka reads.
 pub(crate) const MAX_FONT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The longest wait for `fc-match`.
+const FC_MATCH_LIMIT: Duration = Duration::from_secs(2);
 
 const PROPORTIONAL_NAME: &str = "lenka-proportional";
 const MONOSPACE_NAME: &str = "lenka-monospace";
@@ -91,20 +95,40 @@ pub(crate) fn font_paths(platform: Platform) -> Candidates {
             ]),
             monospace: paths(&["/System/Library/Fonts/Menlo.ttc"]),
         },
-        Platform::Windows => Candidates {
-            proportional: paths(&[r"C:\Windows\Fonts\segoeui.ttf"]),
-            monospace: paths(&[r"C:\Windows\Fonts\consola.ttf"]),
-        },
+        Platform::Windows => windows_paths(std::env::var_os("SystemRoot").map(PathBuf::from)),
         Platform::Other => Candidates::default(),
     }
 }
 
+/// The font paths of Windows. Windows can be in a directory other than `C:\Windows`.
+fn windows_paths(root: Option<PathBuf>) -> Candidates {
+    let fonts = root
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    Candidates {
+        proportional: vec![fonts.join("segoeui.ttf")],
+        monospace: vec![fonts.join("consola.ttf")],
+    }
+}
+
+/// Runs a command, and stops the wait after a limit. The start of the app must not wait for a
+/// program that hangs. A thread keeps the wait for such a program until the app stops.
+fn output_with_limit(mut command: Command, limit: Duration) -> Option<Output> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("lenka-font-search".to_owned())
+        .spawn(move || {
+            let _ = sender.send(command.output());
+        })
+        .ok()?;
+    receiver.recv_timeout(limit).ok()?.ok()
+}
+
 /// Asks fontconfig for a font. The command has fixed arguments and no shell.
 fn fc_match(pattern: &str) -> Option<PathBuf> {
-    let output = Command::new("fc-match")
-        .args(["-f", "%{file}", pattern])
-        .output()
-        .ok()?;
+    let mut command = Command::new("fc-match");
+    command.args(["-f", "%{file}", pattern]);
+    let output = output_with_limit(command, FC_MATCH_LIMIT)?;
     if !output.status.success() {
         return None;
     }
@@ -272,6 +296,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn windows_fonts_follow_the_system_directory() {
+        let found = windows_paths(Some(PathBuf::from("D:\\WinNT")));
+        assert_eq!(
+            found.proportional,
+            vec![Path::new("D:\\WinNT").join("Fonts").join("segoeui.ttf")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_hangs_does_not_stop_the_search() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let start = std::time::Instant::now();
+        assert!(output_with_limit(command, Duration::from_millis(50)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
     fn each_platform_has_its_fixed_paths() {
         let linux = font_paths(Platform::Linux);
         for name in [
@@ -309,15 +352,10 @@ mod tests {
             mac.monospace[0],
             Path::new("/System/Library/Fonts/Menlo.ttc")
         );
-        let windows = font_paths(Platform::Windows);
-        assert_eq!(
-            windows.proportional[0],
-            Path::new(r"C:\Windows\Fonts\segoeui.ttf")
-        );
-        assert_eq!(
-            windows.monospace[0],
-            Path::new(r"C:\Windows\Fonts\consola.ttf")
-        );
+        let windows = windows_paths(None);
+        let fonts = Path::new(r"C:\Windows").join("Fonts");
+        assert_eq!(windows.proportional[0], fonts.join("segoeui.ttf"));
+        assert_eq!(windows.monospace[0], fonts.join("consola.ttf"));
         assert_eq!(font_paths(Platform::Other), Candidates::default());
     }
 

@@ -202,10 +202,11 @@ pub(crate) fn flatten_tree(
     // collapsed parent stays hidden with intent.
     let mut below_collapsed = vec![false; count];
     for (index, row) in model.rows.iter().enumerate() {
-        if collapsed.contains(&row.meta.id()) {
+        // In a cycle, a task can be below itself. One task of the cycle must stay visible.
+        if collapsed.contains(&row.meta.id()) && !below_collapsed[index] {
             let mut stack: Vec<usize> = model.children_of(index).to_vec();
             while let Some(kid) = stack.pop() {
-                if !below_collapsed[kid] {
+                if kid != index && !below_collapsed[kid] {
                     below_collapsed[kid] = true;
                     stack.extend_from_slice(model.children_of(kid));
                 }
@@ -424,5 +425,18 @@ mod tests {
         let model = BoardModel::new(vec![first, second]);
         let flat = flatten_tree(&model, &[0, 1], &HashSet::new());
         assert_eq!(flat.len(), 2);
+    }
+
+    #[test]
+    fn a_collapsed_parent_cycle_keeps_one_task_visible() {
+        let mut first = row("a", None);
+        let second = row("b", Some(first.meta.id()));
+        first.meta.front.parent = Some(second.meta.id());
+        let (first_id, second_id) = (first.meta.id(), second.meta.id());
+        let model = BoardModel::new(vec![first, second]);
+        let one: HashSet<TaskId> = HashSet::from([first_id]);
+        assert_eq!(flatten_tree(&model, &[0, 1], &one).len(), 1);
+        let both: HashSet<TaskId> = HashSet::from([first_id, second_id]);
+        assert_eq!(flatten_tree(&model, &[0, 1], &both).len(), 1);
     }
 }

@@ -494,7 +494,14 @@ fn apply_folder_pick(form: &mut NewProjectForm) {
     };
     match pending.state() {
         FolderPick::Waiting => {}
-        FolderPick::Cancelled => form.pending = None,
+        FolderPick::Cancelled => {
+            if pending.had_no_dialog() {
+                form.error = Some(FormError::text(
+                    "No folder dialog opened. Type the path. On Linux, the dialog needs a desktop portal or zenity.",
+                ));
+            }
+            form.pending = None;
+        }
         FolderPick::Selected(path) => {
             form.pending = None;
             match path.into_os_string().into_string() {

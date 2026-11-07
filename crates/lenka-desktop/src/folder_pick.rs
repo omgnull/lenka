@@ -9,6 +9,10 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+/// A person cannot close a dialog in this time, so a shorter wait means that no dialog opened.
+const NO_DIALOG_LIMIT: Duration = Duration::from_millis(400);
 
 /// The state of a folder dialog.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,13 +27,37 @@ pub(crate) enum FolderPick {
 }
 
 /// A folder dialog that can still be open. Two clones share one state.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct PendingFolder(Arc<Mutex<FolderPick>>);
+#[derive(Debug, Clone)]
+pub(crate) struct PendingFolder {
+    state: Arc<Mutex<FolderPick>>,
+    started: Instant,
+}
+
+impl Default for PendingFolder {
+    fn default() -> Self {
+        Self {
+            state: Arc::default(),
+            started: Instant::now(),
+        }
+    }
+}
 
 impl PendingFolder {
+    /// Tells if a cancel came too soon to be from a person. The OS then has no dialog, and `rfd`
+    /// gives the same result as a cancel.
+    pub(crate) fn had_no_dialog(&self) -> bool {
+        self.started.elapsed() < NO_DIALOG_LIMIT
+    }
+
+    /// Makes the dialog look older, for a test of a cancel by a person.
+    #[cfg(test)]
+    pub(crate) fn make_old(&mut self) {
+        self.started -= NO_DIALOG_LIMIT;
+    }
+
     /// Returns the current state.
     pub(crate) fn state(&self) -> FolderPick {
-        self.0
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -37,7 +65,7 @@ impl PendingFolder {
 
     /// Sets the result of the dialog.
     pub(crate) fn finish(&self, pick: FolderPick) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = pick;
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = pick;
     }
 }
 
