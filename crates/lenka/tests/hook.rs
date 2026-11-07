@@ -409,3 +409,79 @@ fn hook_install_in_a_subdirectory_of_a_plain_project_uses_the_project_directory(
     assert!(!below.join(".claude").exists());
     Ok(())
 }
+
+/// The open of a named pipe waits with no limit, and a hook must not stop its client.
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_in_the_inbox_does_not_stop_the_hook() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    as_agent(&machine, &repo, "a", &["task", "claim", &id])?;
+    let change = [
+        "task",
+        "update",
+        &id,
+        "--version",
+        "1",
+        "--description",
+        "New.",
+        "--reason",
+        "A reason.",
+        "--override",
+    ];
+    machine.json(&repo, &change)?;
+    let inbox = repo.join(".git/lenka-data/.runtime/inbox");
+    let mut made = false;
+    for item in fs::read_dir(&inbox)? {
+        let path = item?.path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            fs::remove_file(&path)?;
+            assert!(
+                std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()?
+                    .success()
+            );
+            made = true;
+        }
+    }
+    assert!(made);
+    let mut child = machine
+        .command(&repo, &["hook"])
+        .env("LENKA_AGENT", "a")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        if start.elapsed().as_secs() > 15 {
+            child.kill()?;
+            panic!("the hook still waits");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// A notice over the limit is not shown now, so it must come in the next call.
+#[test]
+fn a_notice_over_the_limit_comes_in_the_next_call() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let id = related_tasks(&machine, &repo)?;
+    for number in 1..=22 {
+        change(&machine, &repo, &id, &format!("Change number {number}."))?;
+    }
+    let first = run_hook(&machine, &repo, "{}", Some("a"))?;
+    assert!(first.contains("Change number 20."), "{first}");
+    assert!(!first.contains("Change number 21."), "{first}");
+    assert!(first.contains("2 more notices are open."), "{first}");
+    let second = run_hook(&machine, &repo, "{}", Some("a"))?;
+    assert!(!second.contains("Change number 20."), "{second}");
+    assert!(second.contains("Change number 21."), "{second}");
+    assert!(second.contains("Change number 22."), "{second}");
+    assert!(!second.contains("more notices"), "{second}");
+    Ok(())
+}

@@ -140,6 +140,9 @@ pub fn load_task(driver: &dyn StorageDriver, id: TaskId) -> Result<LoadedTask> {
     })
 }
 
+/// The type or the stage of an invalid task whose files hold another text.
+const INVALID_NAME: &str = "invalid";
+
 /// Reads the last valid record of a task with invalid current files, from its newest version.
 fn load_last_valid(driver: &dyn StorageDriver, id: TaskId) -> Option<TaskMeta> {
     let [task_path, plan_path, state_path] = task_paths(id).ok()?;
@@ -292,8 +295,16 @@ impl Index {
     fn mark_invalid(&mut self, driver: &dyn StorageDriver, id: TaskId, problem: &str) {
         // A task with no valid state still counts as an open task, so that it holds its parent and
         // the tasks that it blocks.
-        if let Some(meta) = load_last_valid(driver, id).or_else(|| load_with_open_state(driver, id))
+        if let Some(mut meta) =
+            load_last_valid(driver, id).or_else(|| load_with_open_state(driver, id))
         {
+            // These names appear outside `untrusted_data`, and this record skips the full load.
+            if !lenka_core::input::is_safe_name(&meta.front.kind) {
+                INVALID_NAME.clone_into(&mut meta.front.kind);
+            }
+            if !lenka_core::input::is_safe_name(&meta.state.stage) {
+                INVALID_NAME.clone_into(&mut meta.state.stage);
+            }
             self.insert(meta);
         }
         self.invalid.insert(id, problem.to_owned());

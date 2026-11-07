@@ -234,7 +234,7 @@ fn usage_error(error: &clap::Error) -> ExitCode {
         error.kind(),
         ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
     );
-    if !is_answer && std::env::args().any(|arg| arg == "--json") {
+    if !is_answer && std::env::args_os().any(|arg| arg == "--json") {
         crate::output::print_json(
             &json!({"code": "invalid_argument", "message": error.render().to_string()}),
         );

@@ -271,7 +271,7 @@ where
             _ => return,
         }
         let kind = early_line_kind(&line);
-        if kind != EarlyLine::Notification && writer.write_all(&line).await.is_err() {
+        if kind != EarlyLine::Drop && writer.write_all(&line).await.is_err() {
             return;
         }
         if kind == EarlyLine::SessionStart {
@@ -284,7 +284,8 @@ where
 /// What a line of the client means before the session starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EarlyLine {
-    Notification,
+    /// A notification or a response, which `rmcp` does not accept in this time.
+    Drop,
     SessionStart,
     /// `ping`, `server/discover`, or text that `rmcp` must read and answer.
     Other,
@@ -295,14 +296,32 @@ fn early_line_kind(line: &[u8]) -> EarlyLine {
         return EarlyLine::Other;
     };
     let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return EarlyLine::Other;
+        // A response to no request also stops `rmcp` before the session starts.
+        return if message.contains_key("result") || message.contains_key("error") {
+            EarlyLine::Drop
+        } else {
+            EarlyLine::Other
+        };
     };
     if !message.contains_key("id") {
-        EarlyLine::Notification
-    } else if matches!(method, "ping" | "server/discover") {
-        EarlyLine::Other
-    } else {
+        return EarlyLine::Drop;
+    }
+    // `rmcp` answers a request with wrong parameters, and the session does not start.
+    let has = |key: &str| {
+        message
+            .get("params")
+            .and_then(|params| params.get(key))
+            .is_some()
+    };
+    let starts = match method {
+        "ping" | "server/discover" => false,
+        "initialize" => has("protocolVersion") && has("capabilities") && has("clientInfo"),
+        _ => has("_meta"),
+    };
+    if starts {
         EarlyLine::SessionStart
+    } else {
+        EarlyLine::Other
     }
 }
 
@@ -314,7 +333,7 @@ mod tests {
     fn notifications_pass_after_the_session_starts() -> Result<()> {
         let text = concat!(
             "{\"method\":\"notifications/a\"}\n",
-            "{\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":{}}}\n",
             "{\"method\":\"notifications/b\"}\n",
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -324,7 +343,7 @@ mod tests {
         runtime.block_on(copy_session_input(&mut text.as_bytes(), &mut output));
         let output = String::from_utf8_lossy(&output);
         assert!(!output.contains("notifications/a"), "{output}");
-        assert!(output.contains("initialize"), "{output}");
+        assert!(output.contains("tools/list"), "{output}");
         assert!(output.contains("notifications/b"), "{output}");
         Ok(())
     }
@@ -334,7 +353,7 @@ mod tests {
         let kind = |text: &str| early_line_kind(text.as_bytes());
         assert_eq!(
             kind(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#),
-            EarlyLine::Notification
+            EarlyLine::Drop
         );
         assert_eq!(kind(r#"{"id":1,"method":"ping"}"#), EarlyLine::Other);
         assert_eq!(
@@ -342,15 +361,22 @@ mod tests {
             EarlyLine::Other
         );
         assert_eq!(
-            kind(r#"{"id":1,"method":"initialize"}"#),
+            kind(
+                r#"{"id":1,"method":"initialize","params":{"protocolVersion":"x","capabilities":{},"clientInfo":{}}}"#
+            ),
             EarlyLine::SessionStart
         );
         assert_eq!(
-            kind(r#"{"id":1,"method":"tools/list"}"#),
+            kind(r#"{"id":1,"method":"initialize","params":{}}"#),
+            EarlyLine::Other
+        );
+        assert_eq!(kind(r#"{"id":1,"method":"tools/list"}"#), EarlyLine::Other);
+        assert_eq!(
+            kind(r#"{"id":1,"method":"tools/list","params":{"_meta":{}}}"#),
             EarlyLine::SessionStart
         );
         assert_eq!(kind("not json"), EarlyLine::Other);
-        assert_eq!(kind(r#"{"id":1,"result":{}}"#), EarlyLine::Other);
+        assert_eq!(kind(r#"{"id":1,"result":{}}"#), EarlyLine::Drop);
     }
 
     #[test]

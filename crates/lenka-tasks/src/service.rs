@@ -761,10 +761,11 @@ impl TaskService {
     ) -> Result<T> {
         self.project.reload_config_if_changed();
         let mut index = lock(&self.index);
-        let now = self.now();
         let driver = self.project.driver();
         let mut pending_error = None;
         let value = self.project.write_locked(|locked| {
+            // The wait for the lock can be long, so the time of the write starts here.
+            let now = self.now();
             index.refresh(driver)?;
             let result = work(locked, &mut index, now);
             // A failed call can also have written data, as the loop limit does.
@@ -1537,7 +1538,10 @@ impl TaskService {
             if filter.ready && !self.is_ready(&index, meta, caller.actor, now, &mut reader) {
                 continue;
             }
-            if filter.blocked && !is_blocked(&index, &self.project, meta.id(), &mut reader) {
+            if filter.blocked
+                && (meta.state.status.is_closed()
+                    || !is_blocked(&index, &self.project, meta.id(), &mut reader))
+            {
                 continue;
             }
             matches.push(meta);
@@ -1561,6 +1565,10 @@ impl TaskService {
         let status_ok = matches!(meta.state.status, Status::Todo | Status::InProgress)
             && index.active_claim(id, now).is_none();
         if !status_ok || index.invalid.contains_key(&id) {
+            return false;
+        }
+        // `claim` refuses such a task for an agent, so it must not select the task.
+        if meta.state.loop_stopped && actor != Actor::Human {
             return false;
         }
         let Ok((stages, position)) = self.stage_position(meta) else {
@@ -2027,6 +2035,17 @@ impl TaskService {
                     path: loops_path(&id.to_string()),
                 });
             }
+            // With no own claim, the call ended the claim of a holder, who must learn this.
+            if active.is_none() && index.claims.contains_key(&id) {
+                ops.extend(notice_ops(
+                    index,
+                    id,
+                    Subject::Task(id.to_string()),
+                    caller,
+                    &status_change_meta(&state, caller, state.status, now),
+                    now,
+                )?);
+            }
             ops.push(Op::Remove {
                 path: claim_path(id),
             });
@@ -2096,6 +2115,10 @@ impl TaskService {
                         return Err(claim_lost());
                     }
                     state.status = self.status_after_release(&meta);
+                    // A release by a person is an act of the person, as a status change is.
+                    if caller.actor == Actor::Human {
+                        state.loop_stopped = false;
+                    }
                 }
                 Finish::Done { evidence, unchecked_reason } => {
                     if let Some(active) = &active {
@@ -2164,6 +2187,17 @@ impl TaskService {
             if index.claims.contains_key(&id) {
                 ops.push(Op::Remove { path: claim_path(id) });
                 ops.push(feed_op(&simple_event(FeedKind::Claim, id, state.version, caller, now))?);
+                // With no own claim, the call ended the claim of a holder, who must learn this.
+                if active.is_none() {
+                    ops.extend(notice_ops(
+                        index,
+                        id,
+                        Subject::Task(id.to_string()),
+                        caller,
+                        &status_change_meta(&state, caller, state.status, now),
+                        now,
+                    )?);
+                }
             }
             ops.push(feed_op(&simple_event(FeedKind::State, id, state.version, caller, now))?);
             locked.commit(&Commit {
@@ -2199,7 +2233,17 @@ impl TaskService {
                 .ok_or_else(|| task_missing(id))?;
             check_write_claim(index, id, caller, claim, now)?;
             check_not_closed(&meta)?;
-            let ops = self.pause_ops(index, id, meta.state.clone(), caller, now)?;
+            let mut ops = self.pause_ops(index, id, meta.state.clone(), caller, now)?;
+            if matches!(claim, ClaimRef::Override) && index.claims.contains_key(&id) {
+                ops.extend(notice_ops(
+                    index,
+                    id,
+                    Subject::Task(id.to_string()),
+                    caller,
+                    &status_change_meta(&meta.state, caller, Status::Paused, now),
+                    now,
+                )?);
+            }
             locked.commit(&Commit {
                 ops,
                 ..Commit::default()
@@ -2320,6 +2364,8 @@ impl TaskService {
         check_text_size("The entry", &new.text)?;
         input::check_text("The entry", &new.text)?;
         self.with_write(|locked, index, now| {
+            self.ingest_if_changed(locked, index, id, now)?;
+            check_not_invalid(index, id)?;
             let meta = index
                 .tasks
                 .get(&id)
@@ -2793,11 +2839,12 @@ impl TaskService {
         self.project.reload_config()?;
         let driver = self.project.driver();
         let mut fresh = Index::default();
-        let changed = fresh.scan(driver)?;
-        fresh.reload_claims(driver)?;
+        // The offset comes first, so a write during the scan is read again and not lost.
         fresh.feed_offset = driver
             .stat(&DocPath::new(FEED_PATH)?)?
             .map_or(0, |stat| stat.len);
+        let changed = fresh.scan(driver)?;
+        fresh.reload_claims(driver)?;
         let count = fresh.tasks.len();
         fresh.save_snapshot(&self.project)?;
         *lock(&self.index) = fresh;
@@ -3819,8 +3866,15 @@ fn read_versions(
     let dir = DocPath::new(format!("{}/versions", root_of(id)))?;
     let mut versions = Vec::new();
     for name in driver.list(&dir)? {
-        let Some(text) = read_text(driver, &format!("{dir}/{name}/meta.toml"))? else {
-            continue;
+        // One damaged record must not hide the other versions.
+        let text = match read_text(driver, &format!("{dir}/{name}/meta.toml")) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(error) if error.code() == ErrorCode::InvalidFile => {
+                tracing::warn!(task = %id.short(), version = %name, "skipped a damaged version record");
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         if let Ok(meta) = toml::from_str::<VersionMeta>(&text) {
             versions.push(meta);

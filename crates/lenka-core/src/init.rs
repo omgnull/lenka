@@ -86,7 +86,12 @@ pub fn find_clone_file(paths: &Paths, start: &Path) -> Option<PathBuf> {
         }
         // A person can run `git init` in a plain project, and the project stays connected.
         let plain = paths.plain_clone_file(&location.worktree);
-        return plain.is_file().then_some(plain);
+        if plain.is_file() {
+            return Some(plain);
+        }
+        // A linked worktree uses the connection of the main worktree.
+        let main = paths.plain_clone_file(location.common_dir.parent()?);
+        return main.is_file().then_some(main);
     }
     plain_project_root(paths, start).map(|root| paths.plain_clone_file(&root))
 }

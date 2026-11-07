@@ -236,7 +236,8 @@ fn raw_session(machine: &Machine, dir: &Path, lines: &[Value]) -> TestResult<Vec
         for line in lines {
             writeln!(stdin, "{line}")?;
             stdin.flush()?;
-            if line.get("id").is_some() {
+            // Only a request gets an answer. A response line has an ID and no method.
+            if line.get("id").is_some() && line.get("method").is_some() {
                 let mut answer = String::new();
                 reader.read_line(&mut answer)?;
                 answers.push(serde_json::from_str(&answer)?);
@@ -716,5 +717,58 @@ fn a_notification_before_the_session_does_not_stop_the_server() -> TestResult {
     )?;
     assert_eq!(answers.len(), 3, "{answers:?}");
     assert!(answers[2]["result"]["tools"].is_array(), "{answers:?}");
+    Ok(())
+}
+
+/// `rmcp` refuses these requests, so the session has not started when the notification comes.
+#[test]
+fn a_refused_request_does_not_open_the_way_for_a_notification() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let note = json!({"jsonrpc": "2.0", "method": "notifications/cancelled"});
+    let answers = raw_session(
+        &machine,
+        &repo,
+        &[
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            note.clone(),
+            json!({"jsonrpc": "2.0", "id": 9, "result": {}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "ping"}),
+        ],
+    )?;
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(answers[1].get("result").is_some(), "{answers:?}");
+    Ok(())
+}
+
+/// A person can run `git init` in a plain project, and then add a worktree.
+#[tokio::test]
+async fn a_linked_worktree_of_a_plain_project_keeps_the_connection() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let plain = machine.root.join("plain");
+    fs::create_dir_all(&plain)?;
+    machine.ok(&plain, &["init", "--name", "plain"])?;
+    machine.git(&plain, &["init", "-q"])?;
+    machine.git(
+        &plain,
+        &[
+            "-c",
+            "user.name=tester",
+            "-c",
+            "user.email=tester@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "start",
+        ],
+    )?;
+    let linked = machine.root.join("linked");
+    let linked_text = linked.to_string_lossy().into_owned();
+    machine.git(&plain, &["worktree", "add", "-q", &linked_text])?;
+    let client = connect(&machine, &linked, None, Era::Initialize).await?;
+    let list = call_ok(&client, "task.list", json!({})).await?;
+    assert_eq!(list["count"], 0, "{list}");
+    client.cancel().await?;
     Ok(())
 }

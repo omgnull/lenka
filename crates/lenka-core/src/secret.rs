@@ -84,6 +84,7 @@ const ASSIGNMENT_NAMES: &[&str] = &[
     "secret",
     "api_key",
     "apikey",
+    "accountkey",
     "api-key",
     "auth_token",
     "access_token",
@@ -256,19 +257,26 @@ fn has_private_key_block(text: &str) -> bool {
 fn has_bearer_token(text: &str) -> bool {
     text.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
-        let mut from = 0;
-        while let Some(position) = lower[from..].find("bearer ") {
-            let after = from + position + "bearer ".len();
-            from = after;
-            let len = token_len(&line.as_bytes()[after..]);
-            if len >= 20
-                && looks_random(&line.as_bytes()[after..after + len])
-                && !is_placeholder(&line[after..after + len])
-            {
-                return true;
-            }
-        }
-        false
+        // The word `basic` is common in text, so this form needs the name of the header.
+        let basic_form = lower.contains("authorization");
+        ["bearer ", "basic "]
+            .iter()
+            .filter(|word| **word == "bearer " || basic_form)
+            .any(|word| {
+                let mut from = 0;
+                while let Some(position) = lower[from..].find(word) {
+                    let after = from + position + word.len();
+                    from = after;
+                    let len = token_len(&line.as_bytes()[after..]);
+                    if len >= 20
+                        && looks_random(&line.as_bytes()[after..after + len])
+                        && !is_placeholder(&line[after..after + len])
+                    {
+                        return true;
+                    }
+                }
+                false
+            })
     })
 }
 
@@ -467,6 +475,15 @@ pub fn check(texts: &[TextCheck], policy: SecretPolicy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_basic_header_and_an_account_key_are_secrets() {
+        let value = ["dXNlcjpw", "YXNzd29y", "ZDEyMzQ1Njc4OTA"].concat();
+        assert!(find_pattern(&format!("Authorization: Basic {value}")).is_some());
+        assert!(find_pattern(&format!("AccountKey={value}")).is_some());
+        // The word `basic` is common in text, so this form needs the name of the header.
+        assert_eq!(find_pattern(&format!("The basic {value} form.")), None);
+    }
 
     #[test]
     fn a_repeated_name_stays_fast() {

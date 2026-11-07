@@ -301,8 +301,14 @@ impl Body {
         self.sections
             .iter()
             .filter(|section| has_heading(section, ACCEPTANCE))
-            .flat_map(|section| section.text.lines())
-            .filter_map(parse_criterion)
+            .flat_map(|section| {
+                section
+                    .text
+                    .split_inclusive('\n')
+                    .zip(fenced_lines(&section.text))
+            })
+            .filter(|(_, fenced)| !fenced)
+            .filter_map(|(line, _)| parse_criterion(line.trim_end_matches(['\n', '\r'])))
             .collect()
     }
 
@@ -321,8 +327,11 @@ impl Body {
                 continue;
             }
             let mut result = String::with_capacity(section.text.len());
-            for line in section.text.split_inclusive('\n') {
-                if let Some(position) = mark_position(line.trim_end_matches(['\n', '\r'])) {
+            let fenced = fenced_lines(&section.text);
+            for (line, in_fence) in section.text.split_inclusive('\n').zip(fenced) {
+                if let Some(position) =
+                    mark_position(line.trim_end_matches(['\n', '\r'])).filter(|_| !in_fence)
+                {
                     if let Some(done) = marks.get(&count) {
                         result.push_str(&line[..position]);
                         result.push(if *done { 'x' } else { ' ' });
@@ -357,31 +366,80 @@ pub struct Criterion {
 }
 
 /// Finds the place of the mark in a line of a task list, with any Markdown list marker.
+///
+/// The finish gate counts these lines, so this function accepts each form that a Markdown renderer
+/// shows as a check box: a block quote, and one to four spaces or tabs after the marker.
 fn mark_position(line: &str) -> Option<usize> {
-    let rest = line.trim_start();
-    let indent = line.len() - rest.len();
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let bytes = line.as_bytes();
+    let is_gap = |byte: &u8| matches!(byte, b' ' | b'\t');
+    let mut start = 0;
+    loop {
+        start += bytes[start..]
+            .iter()
+            .take_while(|byte| is_gap(byte))
+            .count();
+        if bytes.get(start) != Some(&b'>') {
+            break;
+        }
+        start += 1;
+    }
+    let rest = &bytes[start..];
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
     let marker = if digits > 0 {
-        matches!(rest.as_bytes().get(digits), Some(b'.' | b')')).then_some(digits + 1)?
+        matches!(rest.get(digits), Some(b'.' | b')')).then_some(digits + 1)?
     } else {
-        matches!(rest.as_bytes().first(), Some(b'-' | b'*' | b'+')).then_some(1)?
+        matches!(rest.first(), Some(b'-' | b'*' | b'+')).then_some(1)?
     };
-    let open = &rest.as_bytes()[marker..];
-    let has_mark = open.len() >= 5
-        && open[0] == b' '
-        && open[1] == b'['
-        && matches!(open[2], b' ' | b'x' | b'X')
-        && open[3] == b']'
-        && open[4] == b' ';
-    has_mark.then_some(indent + marker + 2)
+    let gap = rest[marker..]
+        .iter()
+        .take_while(|byte| is_gap(byte))
+        .count();
+    if !(1..=4).contains(&gap) {
+        return None;
+    }
+    let open = rest.get(marker + gap..)?;
+    let has_mark = open.len() >= 3
+        && open[0] == b'['
+        && matches!(open[1], b' ' | b'x' | b'X')
+        && open[2] == b']'
+        && open.get(3).is_none_or(is_gap);
+    has_mark.then_some(start + marker + gap + 1)
 }
 
 fn parse_criterion(line: &str) -> Option<Criterion> {
     let position = mark_position(line)?;
     Some(Criterion {
-        text: line[position + 3..].trim_end().to_owned(),
+        text: line.get(position + 2..).unwrap_or("").trim().to_owned(),
         done: line.as_bytes()[position] != b' ',
     })
+}
+
+/// Tells for each line of a section if it is inside a code fence. A fence with no end hides
+/// nothing, because a hand edit must not hide a criterion from the finish gate.
+fn fenced_lines(text: &str) -> Vec<bool> {
+    let mut fence: Option<&str> = None;
+    let mut result = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let marker = line.trim();
+        if let Some(open) = fence {
+            result.push(true);
+            if marker.starts_with(open) {
+                fence = None;
+            }
+        } else if marker.starts_with("```") {
+            fence = Some("```");
+            result.push(true);
+        } else if marker.starts_with("~~~") {
+            fence = Some("~~~");
+            result.push(true);
+        } else {
+            result.push(false);
+        }
+    }
+    if fence.is_some() {
+        result.fill(false);
+    }
+    result
 }
 
 /// Tells if two acceptance sections differ in more than their check marks.
@@ -416,6 +474,57 @@ pub fn new_body(description: &str, requirements: &str, acceptance: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_form_of_a_check_box_is_a_criterion() {
+        for line in [
+            "- [ ] x",
+            "-   [ ] x",
+            "-\t[ ] x",
+            "- [ ]\tx",
+            "> - [ ] x",
+            ">> * [ ] x",
+            "1.  [ ] x",
+            "  + [ ] x",
+        ] {
+            let found = parse_criterion(line).unwrap_or_else(|| panic!("no criterion: {line:?}"));
+            assert_eq!(found.text, "x", "{line:?}");
+            assert!(!found.done, "{line:?}");
+        }
+        for line in [
+            "- [x]not",
+            "-[ ] x",
+            "text [ ] x",
+            "-      [ ] code",
+            "- [y] x",
+        ] {
+            assert!(parse_criterion(line).is_none(), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_check_of_an_empty_criterion_is_not_a_text_change() {
+        assert!(!criteria_text_differs(
+            Some("- [ ] \n- [ ] B"),
+            Some("- [x] \n- [ ] B")
+        ));
+    }
+
+    #[test]
+    fn a_fenced_example_is_not_a_criterion() {
+        let text = "## Acceptance criteria\n\n- [ ] real\n```\n- [ ] example\n```\n- [ ] last\n";
+        let mut body = Body::parse(text);
+        assert_eq!(body.criteria().len(), 2);
+        assert!(body.mark_criterion(1, true));
+        assert!(body.to_text().contains("- [ ] example"));
+        assert!(body.to_text().contains("- [x] last"));
+    }
+
+    #[test]
+    fn a_fence_with_no_end_does_not_hide_a_criterion() {
+        let body = Body::parse("## Acceptance criteria\n\n```\n- [ ] hidden\n");
+        assert_eq!(body.criteria().len(), 1);
+    }
 
     #[test]
     fn a_new_section_after_text_with_no_final_newline_starts_a_line() {

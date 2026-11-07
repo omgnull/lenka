@@ -1984,3 +1984,18 @@ fn a_read_works_in_a_read_only_data_directory() -> TestResult {
     );
     Ok(())
 }
+
+/// `std::env::args` panics on such an argument.
+#[cfg(unix)]
+#[test]
+fn an_argument_that_is_not_text_causes_no_panic() -> TestResult {
+    use std::os::unix::ffi::OsStrExt;
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let output = machine
+        .command(&repo, &["--bad"])
+        .arg(std::ffi::OsStr::from_bytes(&[0xff, 0xfe]))
+        .output()?;
+    assert_eq!(output.status.code(), Some(2));
+    Ok(())
+}
