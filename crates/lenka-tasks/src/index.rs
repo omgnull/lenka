@@ -750,23 +750,34 @@ impl Index {
     /// Returns the local links of a task in both directions, without the task itself.
     #[must_use]
     pub fn neighbors(&self, id: TaskId) -> BTreeSet<TaskId> {
-        let mut result = BTreeSet::new();
-        if let Some(meta) = self.tasks.get(&id) {
-            result.extend(meta.front.parent);
-            let links = meta.front.blocked_by.iter().chain(&meta.front.relates);
-            result.extend(links.filter_map(|link: &Link| link.local()));
-            for artifact in &meta.front.artifacts {
-                if let Some(users) = self.artifact_users.get(artifact) {
-                    result.extend(users.iter().copied());
-                }
-            }
-        }
+        let mut result = self
+            .tasks
+            .get(&id)
+            .map(|meta| self.front_neighbors(&meta.front))
+            .unwrap_or_default();
         for map in [&self.children, &self.blocks, &self.related_from] {
             if let Some(items) = map.get(&id) {
                 result.extend(items.iter().copied());
             }
         }
         result.remove(&id);
+        result
+    }
+
+    /// Returns the local tasks that a front matter links to: the parent, the linked tasks, and the
+    /// other users of its artifacts. The front matter can be newer than the index.
+    #[must_use]
+    pub fn front_neighbors(&self, front: &TaskFront) -> BTreeSet<TaskId> {
+        let mut result = BTreeSet::new();
+        result.extend(front.parent);
+        let links = front.blocked_by.iter().chain(&front.relates);
+        result.extend(links.filter_map(|link: &Link| link.local()));
+        for artifact in &front.artifacts {
+            if let Some(users) = self.artifact_users.get(artifact) {
+                result.extend(users.iter().copied());
+            }
+        }
+        result.remove(&front.id);
         result
     }
 }

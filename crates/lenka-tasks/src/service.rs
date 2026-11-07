@@ -1244,9 +1244,10 @@ impl TaskService {
             ops.push(put(format!("{}/state.toml", root_of(id)), toml_text(&new_state)?));
             ops.push(feed_op(&task_event(id, version, FeedKind::Task, &version_meta))?);
             if material {
-                ops.extend(notice_ops(
+                ops.extend(notice_ops_with(
                     index,
                     id,
+                    &index.front_neighbors(&front),
                     Subject::Task(id.to_string()),
                     caller,
                     &version_meta,
@@ -2810,10 +2811,14 @@ impl TaskService {
             Some(_) => read_text(driver, &format!("{old_dir}/plan.md"))?,
             None => None,
         };
-        let old_body = old_text
-            .and_then(|text| split_front::<TaskFront>("task.md", &text).ok())
-            .map(|(_, body)| Body::parse(&body))
+        let old = old_text.and_then(|text| split_front::<TaskFront>("task.md", &text).ok());
+        // The index has the new links. The holders of the tasks that the old links named must
+        // also know.
+        let old_neighbors = old
+            .as_ref()
+            .map(|(front, _)| index.front_neighbors(front))
             .unwrap_or_default();
+        let old_body = old.map(|(_, body)| Body::parse(&body)).unwrap_or_default();
         let new_body = Body::parse(&current.body);
         let changed = changed_parts(
             &old_body,
@@ -2837,9 +2842,10 @@ impl TaskService {
         ops.push(put(format!("{root}/state.toml"), toml_text(&state)?));
         ops.push(feed_op(&task_event(id, version, FeedKind::Task, &meta))?);
         if meta.material {
-            ops.extend(notice_ops(
+            ops.extend(notice_ops_with(
                 index,
                 id,
+                &old_neighbors,
                 Subject::Task(id.to_string()),
                 &external_caller(),
                 &meta,
@@ -3336,7 +3342,22 @@ fn notice_ops(
     meta: &VersionMeta,
     now: Timestamp,
 ) -> Result<Vec<Op>> {
+    notice_ops_with(index, id, &BTreeSet::new(), subject, caller, meta, now)
+}
+
+/// Creates the notices of a change for the task, its neighbors in the index, and `also`. A change
+/// can add a link that the index does not have yet, and the holder of that task must also know.
+fn notice_ops_with(
+    index: &Index,
+    id: TaskId,
+    also: &BTreeSet<TaskId>,
+    subject: Subject,
+    caller: &Caller,
+    meta: &VersionMeta,
+    now: Timestamp,
+) -> Result<Vec<Op>> {
     let mut targets = index.neighbors(id);
+    targets.extend(also);
     targets.insert(id);
     let mut ops = Vec::new();
     for task in targets {

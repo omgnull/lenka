@@ -4385,3 +4385,48 @@ fn a_hand_edit_with_no_record_of_the_old_version_becomes_a_version() -> Result<(
     assert_eq!(service.call_notes(&other)?.unread.len(), 1);
     Ok(())
 }
+
+/// A notice goes to the holder of a task that the same change links to.
+#[test]
+fn a_link_in_the_same_change_gets_a_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, other) = (fx.agent("a"), fx.agent("b"));
+    let id = create(&service, &agent, "T")?;
+    let linked = create(&service, &agent, "N")?;
+    service.claim(&other, Some(linked), None, None)?;
+    let patch = TaskPatch {
+        relates_add: vec![Link::Local(linked)],
+        ..text_change(1)
+    };
+    service.update(&agent, id, patch)?;
+    assert_eq!(service.call_notes(&other)?.unread.len(), 1);
+    Ok(())
+}
+
+/// A notice of a hand edit goes to the holder of a task that the edit removed a link to.
+#[test]
+fn a_link_that_a_hand_edit_removes_gets_a_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, other) = (fx.agent("a"), fx.agent("b"));
+    let linked = create(&service, &agent, "N")?;
+    let new = NewTask {
+        relates: vec![Link::Local(linked)],
+        ..task("T")
+    };
+    let id = service.create(&agent, new)?.id();
+    service.claim(&other, Some(linked), None, None)?;
+    let file = task_file(&fx, id, "task.md");
+    let text = read_file(&file)?;
+    let line = format!("relates = [\"{linked}\"]");
+    assert!(text.contains(&line), "{text}");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let edited = text
+        .replace(&line, "relates = []")
+        .replace("Text.", "Edited.");
+    fs::write(&file, edited).map_err(|err| LenkaError::io("write", &err))?;
+    assert!(service.detail(id, &[])?.meta.front.relates.is_empty());
+    assert_eq!(service.call_notes(&other)?.unread.len(), 1);
+    Ok(())
+}
