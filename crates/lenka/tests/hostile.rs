@@ -453,6 +453,7 @@ async fn an_escape_sequence_in_any_field_does_not_reach_a_terminal() -> TestResu
 type Damage = (&'static str, fn(&Path) -> TestResult);
 
 fn damages() -> Vec<Damage> {
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "Only Unix adds more kinds."))]
     let mut list: Vec<Damage> = vec![
         ("removed", |path| Ok(fs::remove_file(path)?)),
         ("empty", |path| Ok(fs::write(path, "")?)),

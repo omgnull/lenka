@@ -1043,7 +1043,7 @@ fn field_text_cannot_change_the_task_structure() -> Result<()> {
     for bad in [
         "```\ncode",
         "## Requirements\nFAKE",
-        "a\n=======\nb",
+        "a\n>>>>>>> theirs\nb",
         "<<<<<<< HEAD",
     ] {
         let mut new = task("T");
@@ -2098,7 +2098,7 @@ fn a_marker_line_with_a_carriage_return_is_refused() -> Result<()> {
     let fx = fixture()?;
     let service = fx.project("api")?;
     let new = NewTask {
-        description: "one\n=======\r".to_owned(),
+        description: "one\n<<<<<<< ours\r".to_owned(),
         ..task("A task")
     };
     let error = service.create(&fx.human(), new).err();
