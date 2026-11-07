@@ -91,8 +91,10 @@ pub fn load_task(driver: &dyn StorageDriver, id: TaskId) -> Result<LoadedTask> {
         driver.stat(&state_path)?,
     ];
     let Some(text) = read_utf8(driver, &task_path)? else {
-        // A delete removes all files. A task with other files lost its main file by a mistake.
-        if stamps[2].is_some() {
+        // A delete removes the whole directory. A task with other files lost its main file by a
+        // mistake, so it is invalid and still blocks.
+        let root = DocPath::new(format!("tasks/{id}"))?;
+        if stamps[2].is_some() || !driver.list(&root)?.is_empty() {
             return Err(LenkaError::invalid_file(format!(
                 "{task_path} is missing, and other files of the task exist."
             )));

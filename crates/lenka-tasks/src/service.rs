@@ -840,22 +840,33 @@ impl TaskService {
     ///
     /// # Errors
     ///
-    /// Returns an error if the text is not a link and no link or task matches it.
+    /// Returns an error if the text is not a link and no link or task matches it, and
+    /// [`ErrorCode::AmbiguousId`] if a short ID matches more than one link.
     pub fn resolve_removed_link(&self, task: TaskId, text: &str) -> Result<Link> {
         if text.contains('/') {
             return Link::parse(text);
         }
         let index = self.read_index()?;
         let meta = index.tasks.get(&task).ok_or_else(|| task_missing(task))?;
-        let mut found = meta
+        // One task can be in both lists, so a set holds each match once.
+        let found: BTreeSet<TaskId> = meta
             .front
             .blocked_by
             .iter()
             .chain(&meta.front.relates)
             .filter_map(|link| link.local())
-            .filter(|id| id.to_string() == text || id.matches_short(text));
-        if let Some(id) = found.next() {
-            return Ok(Link::Local(id));
+            .filter(|id| id.to_string() == text || id.matches_short(text))
+            .collect();
+        let mut found = found.into_iter();
+        match (found.next(), found.next()) {
+            (Some(id), None) => return Ok(Link::Local(id)),
+            (Some(_), Some(_)) => {
+                return Err(LenkaError::new(
+                    ErrorCode::AmbiguousId,
+                    format!("The short ID {text} matches more than one link. Use the full ID."),
+                ));
+            }
+            _ => {}
         }
         drop(index);
         self.resolve_link(text)
@@ -1943,11 +1954,20 @@ impl TaskService {
         reader: &mut LinkReader,
     ) -> Result<TaskId> {
         let mut rejected = HashSet::new();
+        // A damaged task must not stop the claim of the other tasks. If no task works, the first
+        // error is the result, so that a failed disk does not look like an empty list.
+        let mut first_error = None;
         loop {
-            let id = self
-                .next_ready(index, caller.actor, now, reader, &rejected)
-                .ok_or_else(|| LenkaError::not_found("No task is ready for this actor."))?;
-            self.ingest_if_changed(locked, index, id, now)?;
+            let Some(id) = self.next_ready(index, caller.actor, now, reader, &rejected) else {
+                return Err(first_error
+                    .unwrap_or_else(|| LenkaError::not_found("No task is ready for this actor.")));
+            };
+            if let Err(error) = self.ingest_if_changed(locked, index, id, now) {
+                tracing::warn!(task = %id, error = %error, "lenka skips a task that it cannot read");
+                first_error.get_or_insert(error);
+                rejected.insert(id);
+                continue;
+            }
             let still_ready = index
                 .tasks
                 .get(&id)
@@ -2186,11 +2206,7 @@ impl TaskService {
                         ));
                     }
                     let loaded = load_task(self.project.driver(), id)?;
-                    let unchecked = Body::parse(&loaded.body)
-                        .criteria()
-                        .iter()
-                        .filter(|item| !item.done)
-                        .count();
+                    let unchecked = Body::parse(&loaded.body).unchecked_criteria();
                     let reason = unchecked_reason.as_deref().map(str::trim).unwrap_or("");
                     if unchecked > 0 && reason.is_empty() {
                         return Err(LenkaError::invalid_argument(format!(
@@ -2220,6 +2236,12 @@ impl TaskService {
                     state.loop_stopped = false;
                     state.loop_until_done = false;
                 }
+            }
+            // The end of a stop also starts a new count.
+            if meta.state.loop_stopped && !state.loop_stopped {
+                ops.push(Op::Remove {
+                    path: loops_path(&id.to_string()),
+                });
             }
             ops.push(put(format!("{}/state.toml", root_of(id)), toml_text(&state)?));
             if index.claims.contains_key(&id) {
@@ -2657,11 +2679,15 @@ impl TaskService {
             return Ok(());
         }
         self.with_write(|locked, index, now| {
+            let mut first_error = None;
             for id in &edited {
                 // A process can read during a commit of another process, so check again here.
-                self.ingest_if_changed(locked, index, *id, now)?;
+                // A damaged task must not stop the record of the other edits.
+                if let Err(error) = self.ingest_if_changed(locked, index, *id, now) {
+                    first_error.get_or_insert(error);
+                }
             }
-            Ok(())
+            first_error.map_or(Ok(()), Err)
         })
     }
 
@@ -2694,12 +2720,16 @@ impl TaskService {
         }
         self.with_write(|locked, index, now| {
             index.scan(driver)?;
+            let mut first_error = None;
             for id in index.order.clone() {
-                if edited.contains(&id) || !known.contains_key(&id) {
-                    self.ingest_if_changed(locked, index, id, now)?;
+                // A damaged task must not stop the record of the other edits.
+                if (edited.contains(&id) || !known.contains_key(&id))
+                    && let Err(error) = self.ingest_if_changed(locked, index, id, now)
+                {
+                    first_error.get_or_insert(error);
                 }
             }
-            Ok(())
+            first_error.map_or(Ok(()), Err)
         })
     }
 
@@ -2715,7 +2745,7 @@ impl TaskService {
         self.with_write(|locked, index, _| {
             // A hand edit writes no feed line, so the scan finds a stage that it changed.
             index.scan(driver)?;
-            check_types_in_use(&config, index.tasks.values())?;
+            check_types_in_use(base, &config, index.tasks.values())?;
             locked.save_config_over(base, config)
         })
     }
@@ -2866,9 +2896,9 @@ impl TaskService {
         let old_version = current.meta.state.version;
         let old_dir = format!("{root}/versions/{old_version:06}");
         // A lost record of the old version must not hide the edit. The edit is then new text.
-        let old_text = read_text(driver, &format!("{old_dir}/task.md"))?;
+        let old_text = readable(read_text(driver, &format!("{old_dir}/task.md")))?;
         let old_plan = match old_text {
-            Some(_) => read_text(driver, &format!("{old_dir}/plan.md"))?,
+            Some(_) => readable(read_text(driver, &format!("{old_dir}/plan.md")))?,
             None => None,
         };
         let old = old_text.and_then(|text| split_front::<TaskFront>("task.md", &text).ok());
@@ -3749,6 +3779,18 @@ fn read_version_meta(
 }
 
 /// Returns the newest stored version of a task. The usual case needs one file check.
+/// Treats a record with bad content as a missing record. A damaged old record must not stop the
+/// record of a new edit, and the edit then counts as new text. Other errors stay errors.
+fn readable(result: Result<Option<String>>) -> Result<Option<String>> {
+    match result {
+        Err(error) if error.code() == ErrorCode::InvalidFile => {
+            tracing::warn!(error = %error, "lenka ignores a damaged version record");
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
 fn newest_version(
     driver: &dyn lenka_plugin_api::StorageDriver,
     id: TaskId,
@@ -3763,16 +3805,22 @@ fn newest_version(
     Ok(names
         .iter()
         .filter_map(|name| name.parse::<u64>().ok())
+        // TOML holds only a signed 64-bit number, so a larger name cannot be the version.
+        .filter(|version| i64::try_from(*version).is_ok())
         .fold(known, u64::max))
 }
 
-/// Checks that settings keep each type and each stage that a task uses.
+/// Checks that new settings keep each type and each stage of `base` that a task uses.
+///
+/// Only a removal counts. A task with a type or a stage that `base` does not have, such as a
+/// broken task or a hand edit, does not stop the save, because the save does not change it.
 ///
 /// # Errors
 ///
-/// Returns [`ErrorCode::InvalidArgument`] with the count of tasks that use the first missing type
+/// Returns [`ErrorCode::InvalidArgument`] with the count of tasks that use the first removed type
 /// or stage.
 pub fn check_types_in_use<'a>(
+    base: &ProjectConfig,
     config: &ProjectConfig,
     tasks: impl IntoIterator<Item = &'a TaskMeta>,
 ) -> Result<()> {
@@ -3782,6 +3830,17 @@ pub fn check_types_in_use<'a>(
     let mut stage_uses = 0;
     for meta in tasks {
         let kind = &meta.front.kind;
+        let Some(old) = base.types.get(kind) else {
+            continue;
+        };
+        if !old
+            .stages
+            .iter()
+            .any(|stage| stage.name == meta.state.stage)
+            && config.types.contains_key(kind)
+        {
+            continue;
+        }
         match config.types.get(kind) {
             None => {
                 type_uses += 1;

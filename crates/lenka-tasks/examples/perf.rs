@@ -7,6 +7,9 @@
 //! cargo run --release -p lenka-tasks --example perf -- gen <dir> <tasks>
 //! cargo run --release -p lenka-tasks --example perf -- run <dir>   # Repeat this for a warm start.
 //! ```
+//!
+//! A run changes the data: it writes new versions, and it claims and closes 20 tasks. The changes
+//! are small against 10,000 tasks, but run `gen` again in a new directory for a clean data set.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -69,7 +69,8 @@ impl SettingsState {
             .ok_or_else(|| "The settings did not load.".to_owned())?;
         draft.links.link_to = lines_of(&self.link_to);
         draft.links.accept_from = lines_of(&self.accept_from);
-        check_config(&draft, rows)?;
+        let base = self.base.clone().unwrap_or_else(|| draft.clone());
+        check_config(&base, &draft, rows)?;
         Ok(draft)
     }
 
@@ -393,8 +394,12 @@ fn plugins_section(ui: &mut Ui, host: &Host) {
     }
 }
 
-/// Checks settings against the tasks of the project.
-pub(crate) fn check_config(config: &ProjectConfig, rows: &[BoardRow]) -> Result<(), String> {
+/// Checks settings against the tasks of the project. `base` holds the settings before the edit.
+pub(crate) fn check_config(
+    base: &ProjectConfig,
+    config: &ProjectConfig,
+    rows: &[BoardRow],
+) -> Result<(), String> {
     config.validate().map_err(|err| err.message().to_owned())?;
     for (name, def) in &config.types {
         if name.trim().is_empty() {
@@ -406,7 +411,7 @@ pub(crate) fn check_config(config: &ProjectConfig, rows: &[BoardRow]) -> Result<
     }
     // The save checks the tasks again under the write lock. This early check uses the rows on the
     // screen, so that the person sees the problem before the save.
-    lenka_tasks::check_types_in_use(config, rows.iter().map(|row| &row.meta))
+    lenka_tasks::check_types_in_use(base, config, rows.iter().map(|row| &row.meta))
         .map_err(|err| err.message().to_owned())
 }
 
@@ -457,23 +462,24 @@ mod tests {
 
     #[test]
     fn a_used_type_or_stage_cannot_go_away() {
-        let mut config = ProjectConfig::new("t");
+        let base = ProjectConfig::new("t");
+        let mut config = base.clone();
         let rows = vec![row("bug", "work")];
-        assert!(check_config(&config, &rows).is_ok());
+        assert!(check_config(&base, &config, &rows).is_ok());
         config.types.remove("epic");
         assert!(
-            check_config(&config, &rows).is_ok(),
+            check_config(&base, &config, &rows).is_ok(),
             "no task uses this type"
         );
         let mut no_bug = config.clone();
         no_bug.types.remove("bug");
-        let message = check_config(&no_bug, &rows).expect_err("a used type");
+        let message = check_config(&base, &no_bug, &rows).expect_err("a used type");
         assert!(message.contains("use the type bug"), "{message}");
         let mut renamed = config.clone();
         if let Some(def) = renamed.types.get_mut("bug") {
             def.stages[0].name = "fix".to_owned();
         }
-        let message = check_config(&renamed, &rows).expect_err("a used stage");
+        let message = check_config(&base, &renamed, &rows).expect_err("a used stage");
         assert!(message.contains("stage work"), "{message}");
     }
 
@@ -483,13 +489,13 @@ mod tests {
         if let Some(def) = config.types.get_mut("bug") {
             def.stages[0].name = " ".to_owned();
         }
-        assert!(check_config(&config, &[]).is_err());
+        assert!(check_config(&ProjectConfig::new("t"), &config, &[]).is_err());
         let mut config = ProjectConfig::new("t");
         if let Some(def) = config.types.get_mut("bug") {
             let copy = def.stages[0].clone();
             def.stages.push(copy);
         }
-        assert!(check_config(&config, &[]).is_err());
+        assert!(check_config(&ProjectConfig::new("t"), &config, &[]).is_err());
     }
 
     #[test]

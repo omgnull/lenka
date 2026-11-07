@@ -2127,6 +2127,7 @@ dependencies = [
  "lenka-driver-local",
  "lenka-plugin-api",
  "proptest",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "tempfile",

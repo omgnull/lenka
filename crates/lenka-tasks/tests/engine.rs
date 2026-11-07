@@ -2402,6 +2402,18 @@ fn each_state_write_records_a_hand_edit_first() -> Result<()> {
                     .map(|_| ())
             }),
         ),
+        (
+            "entry",
+            Box::new(|service, who, id| {
+                let entry = NewEntry {
+                    kind: EntryKind::Comment,
+                    text: "A note".to_owned(),
+                    replaces: None,
+                    secret_policy: lenka_core::SecretPolicy::Enforce,
+                };
+                service.add_entry(who, id, entry).map(|_| ())
+            }),
+        ),
     ];
     for (name, write) in writes {
         let fx = fixture()?;
@@ -3342,6 +3354,14 @@ fn a_task_with_a_claim_is_not_ready_in_any_status() -> Result<()> {
 /// A removed main file with other files left is damage, and not a delete.
 #[test]
 fn a_task_with_a_lost_main_file_is_invalid_and_still_blocks() -> Result<()> {
+    // The second case also loses the state file, and only the versions stay.
+    for lost in [&["task.md"][..], &["task.md", "state.toml"][..]] {
+        lost_main_file_still_blocks(lost)?;
+    }
+    Ok(())
+}
+
+fn lost_main_file_still_blocks(lost: &[&str]) -> Result<()> {
     let fx = fixture()?;
     let service = fx.project("api")?;
     let human = fx.human();
@@ -3351,8 +3371,10 @@ fn a_task_with_a_lost_main_file_is_invalid_and_still_blocks() -> Result<()> {
         ..task("Blocked")
     };
     let blocked = service.create(&human, new)?.id();
-    fs::remove_file(task_file(&fx, blocker, "task.md"))
-        .map_err(|err| LenkaError::io("remove", &err))?;
+    for name in lost {
+        fs::remove_file(task_file(&fx, blocker, name))
+            .map_err(|err| LenkaError::io("remove", &err))?;
+    }
     let host = build_host(&fx.paths, &fx.clock)?;
     let fresh = service_of(&host.open_by_name("api")?)?;
     let report = fresh.doctor()?;
@@ -3608,7 +3630,15 @@ fn a_release_by_a_person_ends_the_loop_stop() -> Result<()> {
     reach_loop_limit(&service, &agent, id)?;
     let change = service.finish(&human, id, &ClaimRef::Override, &Finish::Released)?;
     assert!(!change.state.loop_stopped);
-    assert!(service.claim(&agent, Some(id), None, None).is_ok());
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let patch = TaskPatch {
+        claim: ClaimRef::Handle(claim.handle),
+        ..text_change(change.state.version)
+    };
+    assert!(
+        service.update(&agent, id, patch).is_ok(),
+        "the count starts again"
+    );
     Ok(())
 }
 
@@ -4556,5 +4586,202 @@ fn a_claim_takes_the_next_task_when_a_hand_edit_closed_the_top_task() -> Result<
         service.detail(first, &[])?.meta.state.status,
         Status::Cancelled
     );
+    Ok(())
+}
+
+/// A Markdown renderer shows each of these headings, so the criteria below them must count.
+#[test]
+fn the_finish_gate_reads_each_form_of_the_criteria_heading() -> Result<()> {
+    for heading in [
+        "## Acceptance criteria ##",
+        " ## Acceptance criteria",
+        "Acceptance criteria\n---",
+    ] {
+        let fx = fixture()?;
+        let service = fx.project("api")?;
+        let (agent, human) = (fx.agent("a"), fx.human());
+        let new = NewTask {
+            acceptance: "- [ ] Must pass".to_owned(),
+            ..task("T")
+        };
+        let id = service.create(&human, new)?.id();
+        hand_edit(&fx, id, "task.md", "## Acceptance criteria", heading)?;
+        let claim = service.claim(&agent, Some(id), None, None)?;
+        service.show(&agent, id, &[])?;
+        let result = service.finish(&agent, id, &ClaimRef::Handle(claim.handle), &finish_done());
+        assert_eq!(code(result), ErrorCode::InvalidArgument, "{heading:?}");
+    }
+    Ok(())
+}
+
+/// A damaged old version record does not stop the record of a hand edit.
+#[test]
+fn a_hand_edit_over_a_damaged_version_record_becomes_a_version() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &human, "first")?;
+    fs::write(
+        task_file(&fx, id, "versions/000001/task.md"),
+        [0xff_u8, 0xfe],
+    )
+    .map_err(|err| LenkaError::io("write", &err))?;
+    hand_edit(&fx, id, "task.md", "Text.", "Edited.")?;
+    assert_eq!(service.claim(&agent, None, None, None)?.task, id);
+    assert_eq!(service.detail(id, &[])?.meta.state.version, 2);
+    Ok(())
+}
+
+/// A task that lenka cannot read does not stop the claim of the other tasks.
+#[cfg(unix)]
+#[test]
+fn a_claim_with_no_task_skips_a_task_that_lenka_cannot_read() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let mut ids = [
+        create(&service, &human, "one")?,
+        create(&service, &human, "two")?,
+    ];
+    ids.sort();
+    let (damaged, other) = (ids[0], ids[1]);
+    use std::os::unix::fs::PermissionsExt;
+    let versions = task_file(&fx, damaged, "versions");
+    let mode = |bits: u32| {
+        fs::set_permissions(&versions, fs::Permissions::from_mode(bits))
+            .map_err(|err| LenkaError::io("chmod", &err))
+    };
+    mode(0o000)?;
+    // A process with root rights reads the directory anyway, and then the test has no input.
+    if fs::read_dir(&versions).is_ok() {
+        return mode(0o755);
+    }
+    assert_eq!(service.claim(&agent, None, None, None)?.task, other);
+    // With no other task, the error of the damaged task is the result.
+    let result = service.claim(&agent, None, None, None);
+    mode(0o755)?;
+    assert_ne!(code(result), ErrorCode::NotFound);
+    Ok(())
+}
+
+/// A version directory with a name that TOML cannot store is not the newest version.
+#[test]
+fn a_version_name_above_the_toml_limit_is_ignored() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &human, "T")?;
+    let versions = task_file(&fx, id, "versions");
+    fs::create_dir_all(versions.join("000002")).map_err(|err| LenkaError::io("mkdir", &err))?;
+    fs::write(versions.join("000002/meta.toml"), "")
+        .map_err(|err| LenkaError::io("write", &err))?;
+    fs::create_dir_all(versions.join("9223372036854775808"))
+        .map_err(|err| LenkaError::io("mkdir", &err))?;
+    service.claim(&agent, Some(id), None, None)?;
+    assert!(service.detail(id, &[])?.meta.state.version < 10);
+    Ok(())
+}
+
+/// A broken task, or a task on a stage that the settings do not have, does not stop a save.
+#[test]
+fn a_task_outside_the_settings_does_not_stop_a_settings_save() -> Result<()> {
+    for (from, to) in [
+        ("status = \"todo\"", "<<<<<<< ours"),
+        ("stage = \"", "stage = \"gone"),
+    ] {
+        let fx = fixture()?;
+        let service = fx.project("api")?;
+        let id = create(&service, &fx.human(), "T")?;
+        hand_edit(&fx, id, "state.toml", from, to)?;
+        let host = build_host(&fx.paths, &fx.clock)?;
+        let fresh = service_of(&host.open_by_name("api")?)?;
+        let base = fresh.project().config();
+        fresh.save_config_over(&base, (*base).clone())?;
+        // A removal of the type of the task still counts.
+        let mut without = (*fresh.project().config()).clone();
+        without.types.remove("task");
+        let base = fresh.project().config();
+        if to.starts_with("stage") {
+            assert_eq!(
+                code(fresh.save_config_over(&base, without)),
+                ErrorCode::InvalidArgument
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A short ID that matches two links of a task must not remove the wrong one.
+#[test]
+fn a_short_id_of_two_removed_links_is_ambiguous() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let target = create(&service, &human, "Target")?;
+    let new = NewTask {
+        blocked_by: vec![Link::Local(target)],
+        ..task("Local")
+    };
+    let local = service.create(&human, new)?.id();
+    let real = target.to_string();
+    let twin = format!("00000000{}", &real[8..]);
+    hand_edit(
+        &fx,
+        local,
+        "task.md",
+        &format!("blocked_by = [\"{real}\"]"),
+        &format!("blocked_by = [\"{twin}\", \"{real}\"]"),
+    )?;
+    service.reindex(&human)?;
+    assert_eq!(
+        code(service.resolve_removed_link(local, &target.short())),
+        ErrorCode::AmbiguousId
+    );
+    assert_eq!(
+        service.resolve_removed_link(local, &real)?,
+        Link::Local(target)
+    );
+    Ok(())
+}
+
+/// A task that lenka cannot read does not stop the record of the other hand edits.
+#[cfg(unix)]
+#[test]
+fn a_damaged_task_does_not_stop_the_record_of_other_edits() -> Result<()> {
+    record_with_a_damaged_task(|service| service.record_all_external_edits())?;
+    record_with_a_damaged_task(|service| service.reindex(&caller(Actor::Human, "me")).map(|_| ()))
+}
+
+#[cfg(unix)]
+fn record_with_a_damaged_task(record: impl Fn(&TaskService) -> Result<()>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let mut ids = [
+        create(&service, &human, "one")?,
+        create(&service, &human, "two")?,
+    ];
+    ids.sort();
+    for id in ids {
+        hand_edit(&fx, id, "task.md", "Text.", "Edited.")?;
+    }
+    let versions = task_file(&fx, ids[0], "versions");
+    let mode = |bits: u32| {
+        fs::set_permissions(&versions, fs::Permissions::from_mode(bits))
+            .map_err(|err| LenkaError::io("chmod", &err))
+    };
+    mode(0o000)?;
+    if fs::read_dir(&versions).is_ok() {
+        return mode(0o755);
+    }
+    let result = record(&service);
+    mode(0o755)?;
+    assert!(
+        result.is_err(),
+        "the error of the damaged task stays visible"
+    );
+    let record = task_file(&fx, ids[1], "versions/000002/meta.toml");
+    assert!(record.is_file(), "the other edit is a version");
     Ok(())
 }

@@ -347,6 +347,18 @@ impl Body {
             .collect()
     }
 
+    /// Returns the count of acceptance criteria that are not checked, for the finish gate.
+    ///
+    /// A hand edit can write a heading in a form that [`Body::parse`] does not read, for example
+    /// `## Acceptance criteria ##` or a line of `---` below the text. A Markdown renderer shows the
+    /// same section, so a CommonMark parser also counts the open check boxes. The result is the
+    /// higher of the two counts.
+    #[must_use]
+    pub fn unchecked_criteria(&self) -> usize {
+        let own = self.criteria().iter().filter(|item| !item.done).count();
+        own.max(unchecked_in_markdown(&self.to_text()))
+    }
+
     /// Sets the mark of one criterion. An index out of range changes nothing, and gives `false`.
     pub fn mark_criterion(&mut self, index: usize, done: bool) -> bool {
         self.mark_criteria(&BTreeMap::from([(index, done)]))
@@ -398,6 +410,43 @@ pub struct Criterion {
     pub text: String,
     /// Tells if the criterion is checked.
     pub done: bool,
+}
+
+/// Counts the open check boxes below each heading named "Acceptance criteria", at any level and in
+/// any form that CommonMark accepts. The section ends at the next heading of the same or a higher
+/// level.
+fn unchecked_in_markdown(text: &str) -> usize {
+    use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+    let mut count = 0;
+    // The level of the open acceptance section.
+    let mut section: Option<HeadingLevel> = None;
+    // The level and the text of the heading that the parser reads now.
+    let mut heading: Option<(HeadingLevel, String)> = None;
+    for event in Parser::new_ext(text, Options::ENABLE_TASKLISTS) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                heading = Some((level, String::new()));
+                if section.is_some_and(|open| level <= open) {
+                    section = None;
+                }
+            }
+            Event::Text(part) | Event::Code(part) => {
+                if let Some((_, words)) = &mut heading {
+                    words.push_str(&part);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, words)) = heading.take()
+                    && words.trim().eq_ignore_ascii_case(ACCEPTANCE)
+                {
+                    section = Some(level);
+                }
+            }
+            Event::TaskListMarker(false) if section.is_some() => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Finds the place of the mark in a line of a task list, with any Markdown list marker.
@@ -840,6 +889,34 @@ Unknown heading stays.
         ] {
             assert!(check_field_text("f", bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_gate_counts_criteria_below_each_form_of_the_heading() {
+        for heading in [
+            "## Acceptance criteria",
+            "## Acceptance criteria ##",
+            " ## Acceptance criteria",
+            "##\tAcceptance criteria",
+            "# Acceptance criteria",
+            "### acceptance criteria",
+            "Acceptance criteria\n---",
+            "Acceptance criteria\n===",
+        ] {
+            let text =
+                format!("## Description\n\nText.\n\n{heading}\n\n- [ ] Must pass\n- [x] Done\n");
+            assert_eq!(Body::parse(&text).unchecked_criteria(), 1, "{heading:?}");
+        }
+    }
+
+    #[test]
+    fn the_gate_ends_the_section_at_the_next_heading() {
+        let text = "## Acceptance criteria\n\n- [x] A\n\n## Notes\n\n- [ ] Not a criterion\n";
+        assert_eq!(Body::parse(text).unchecked_criteria(), 0);
+        let text = "## Acceptance criteria\n\n- [x] A\n\n### More\n\n- [ ] B\n";
+        assert_eq!(Body::parse(text).unchecked_criteria(), 1);
+        let text = "## Acceptance criteria\n\n```\n- [ ] In a fence\n```\n";
+        assert_eq!(Body::parse(text).unchecked_criteria(), 0);
     }
 
     #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
