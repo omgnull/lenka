@@ -61,7 +61,7 @@ fn clean_for_terminal(text: &str) -> String {
 
 /// Escapes the same characters in JSON text. `serde_json` writes a character from U+007F up as it
 /// is, and these characters can only be in a JSON string, so an escape keeps the value.
-fn escape_for_terminal(json: &str) -> String {
+pub(crate) fn escape_for_terminal(json: &str) -> String {
     let mut result = String::with_capacity(json.len());
     for item in json.chars() {
         if is_unsafe_on_terminal(item) {

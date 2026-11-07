@@ -523,3 +523,82 @@ fn a_notice_over_the_limit_comes_in_the_next_call() -> TestResult {
     assert!(!second.contains("more notices"), "{second}");
     Ok(())
 }
+
+/// Gives back the inbox file of the agent `a`. The project must hold one inbox file.
+fn inbox_of_a(repo: &Path) -> TestResult<std::path::PathBuf> {
+    let inbox = repo.join(".git/lenka-data/.runtime/inbox");
+    let mut names: Vec<_> = fs::read_dir(&inbox)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    names.pop().ok_or_else(|| "no inbox file".into())
+}
+
+/// The write of the marker must not open a named pipe, because that open waits with no limit.
+#[cfg(unix)]
+#[test]
+fn a_named_pipe_at_the_marker_does_not_stop_the_hook() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let id = related_tasks(&machine, &repo)?;
+    change(&machine, &repo, &id, "A change.")?;
+    let marker = inbox_of_a(&repo)?.with_extension("shown");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&marker)
+            .status()?
+            .success()
+    );
+    let mut child = machine
+        .command(&repo, &["hook"])
+        .env("LENKA_AGENT", "a")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()?;
+    let start = std::time::Instant::now();
+    while child.try_wait()?.is_none() {
+        if start.elapsed().as_secs() > 15 {
+            child.kill()?;
+            panic!("the hook still waits");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output()?;
+    assert!(String::from_utf8_lossy(&output.stdout).contains("A change."));
+    // The new marker replaced the pipe, so the next call shows no notice.
+    assert!(fs::symlink_metadata(&marker)?.is_file());
+    assert_eq!(run_hook(&machine, &repo, "{}", Some("a"))?, "");
+    Ok(())
+}
+
+/// Only a hand edit of the inbox can bring control text, but a person can run the hook in a
+/// terminal.
+#[test]
+fn the_hook_output_escapes_control_text() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let id = related_tasks(&machine, &repo)?;
+    change(&machine, &repo, &id, "A change.")?;
+    let file = inbox_of_a(&repo)?;
+    let hostile = "A\u{1b}[31m B\u{9b}31m C\u{202e} D\u{7f}";
+    let mut rows = Vec::new();
+    for line in fs::read_to_string(&file)?.lines() {
+        let mut row: Value = serde_json::from_str(line)?;
+        row["reason"] = json!(hostile);
+        rows.push(row.to_string());
+    }
+    fs::write(&file, rows.join("\n") + "\n")?;
+    let output = run_hook(&machine, &repo, "{}", Some("a"))?;
+    for raw in ['\u{1b}', '\u{9b}', '\u{202e}', '\u{7f}'] {
+        assert!(!output.contains(raw), "{raw:?} in {output:?}");
+    }
+    let value: Value = serde_json::from_str(&output)?;
+    let context = value["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    // The escape keeps the value for the client.
+    assert!(context.contains(&json!(hostile).to_string()), "{context:?}");
+    Ok(())
+}

@@ -49,7 +49,10 @@ pub fn run() {
     if let Some(shown) = new_notices(&cwd) {
         let mut stdout = std::io::stdout().lock();
         // A notice counts as shown only after the write, so a failed write can show it again.
-        if writeln!(stdout, "{}", hook_json(&shown.text)).is_ok() {
+        // A hand edit of the inbox can bring control text, and a person can run the hook in a
+        // terminal. So the output escapes the same characters as `--json` does.
+        let text = crate::output::escape_for_terminal(&hook_json(&shown.text).to_string());
+        if writeln!(stdout, "{text}").is_ok() {
             shown.save_markers();
         }
     }
@@ -64,15 +67,41 @@ struct ShownNotices {
 impl ShownNotices {
     fn save_markers(&self) {
         for (marker, ids) in &self.markers {
-            if !fs::symlink_metadata(marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    reason = "A failed write only shows the notice again in the next call."
-                )]
-                let _ = fs::write(marker, ids);
-            }
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "A failed write only shows the notice again in the next call."
+            )]
+            let _ = replace_file(marker, ids);
         }
     }
+}
+
+/// Writes a new temporary file, and renames it over the file. A rename replaces a named pipe or a
+/// symlink and does not open it, so the write cannot wait on a pipe or go through a symlink.
+fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp{}", std::process::id()));
+    let temp = path.with_file_name(name);
+    // A stopped hook can leave its temporary file. The removal of a symlink does not touch its
+    // target.
+    match fs::remove_file(&temp) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+        _ => {}
+    }
+    let result = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        #[expect(
+            clippy::let_underscore_must_use,
+            reason = "The write already failed, and the next call tries again."
+        )]
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Reads the input of the client. A client can keep the pipe open, and the hook must not wait for
