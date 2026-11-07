@@ -805,6 +805,144 @@ fn a_sync_does_not_push_a_secret_from_a_hand_edit() -> TestResult {
     Ok(())
 }
 
+/// A memory file that a test can change by hand. A memory file has no copy in a version folder.
+struct EditedMemory {
+    file: PathBuf,
+    original: String,
+    token: String,
+}
+
+/// Adds a memory, and puts a token in its file by hand.
+fn memory_with_token(machine: &Machine, repo: &Path) -> TestResult<EditedMemory> {
+    let memory = machine.json(repo, &["memory", "add", "A note."])?;
+    let id = text(&memory, "memory").to_owned();
+    let file = fs::read_dir(repo.join(".git/lenka-data/memory"))?
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().contains(id.as_str()))
+        .ok_or("the memory file exists")?
+        .path();
+    let original = fs::read_to_string(&file)?;
+    let token = format!("{}{}", "ghp_", "a1B2".repeat(10));
+    fs::write(&file, format!("{original}\n{token}\n"))?;
+    Ok(EditedMemory {
+        file,
+        original,
+        token,
+    })
+}
+
+/// Returns the full history of the data branch on the remote, or an empty text with no branch.
+fn remote_history(machine: &Machine, remote: &Path) -> TestResult<String> {
+    if machine
+        .git(remote, &["branch", "--list", "lenka-data"])?
+        .is_empty()
+    {
+        return Ok(String::new());
+    }
+    machine.git(remote, &["log", "-p", "lenka-data"])
+}
+
+/// The push sends each local commit, so a secret that a later commit removes must stop it too.
+#[test]
+fn a_secret_in_an_earlier_local_commit_is_not_pushed() -> TestResult {
+    let pair = pair()?;
+    let (first, _second) = two_clones(&pair)?;
+    let edited = memory_with_token(&pair.first, &first)?;
+    let (passed, report) = sync_report(&pair.first, &first)?;
+    assert!(!passed, "{report}");
+    let error = report["push_error"].as_str().unwrap_or_default();
+    assert!(
+        error.starts_with("secret_detected: The file memory/"),
+        "{report}"
+    );
+    assert!(
+        !error.contains("secret_detected: secret_detected"),
+        "{report}"
+    );
+    assert!(
+        error.contains("git reset --soft origin/lenka-data"),
+        "{report}"
+    );
+
+    // The commit with the token stays, so a change of the file is not enough.
+    fs::write(&edited.file, &edited.original)?;
+    let (passed, report) = sync_report(&pair.first, &first)?;
+    assert!(!passed, "{report}");
+    assert_eq!(report["pushed"], false, "{report}");
+    let history = remote_history(&pair.first, &pair.remote)?;
+    assert!(
+        !history.contains(&edited.token),
+        "the token reached the remote"
+    );
+
+    // The steps in the message remove the commit with the token.
+    pair.first.git(
+        &first.join(".git/lenka-data"),
+        &["reset", "--soft", "origin/lenka-data"],
+    )?;
+    let (passed, report) = sync_report(&pair.first, &first)?;
+    assert!(passed, "{report}");
+    assert_eq!(report["pushed"], true, "{report}");
+    let history = remote_history(&pair.first, &pair.remote)?;
+    assert!(history.contains("A note."), "{history}");
+    assert!(
+        !history.contains(&edited.token),
+        "the token reached the remote"
+    );
+    Ok(())
+}
+
+/// The first push has no tracking ref, so the check reads all objects of the branch.
+#[test]
+fn a_secret_in_the_first_push_is_not_pushed() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let edited = memory_with_token(machine, &repo)?;
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(!passed, "{report}");
+    let error = report["push_error"].as_str().unwrap_or_default();
+    assert!(error.contains("git rebase -i --root"), "{report}");
+
+    fs::write(&edited.file, &edited.original)?;
+    let (passed, report) = sync_report(machine, &repo)?;
+    assert!(!passed, "{report}");
+    assert_eq!(report["pushed"], false, "{report}");
+    assert!(remote_history(machine, &pair.remote)?.is_empty());
+    Ok(())
+}
+
+/// The push on a finish has the same check as `lenka sync`.
+#[test]
+fn a_push_on_finish_does_not_push_a_secret() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable", "--push-on-finish"])?;
+    machine.json(&repo, &["sync"])?;
+    let edited = memory_with_token(machine, &repo)?;
+    let finish = |title: &str| -> TestResult<Value> {
+        let task = machine.json(&repo, &["task", "create", title])?;
+        let id = text(&task, "task").to_owned();
+        machine.json(&repo, &["task", "claim", &id])?;
+        machine.json(&repo, &["task", "finish", &id, "--evidence", "It works."])
+    };
+
+    let done = finish("First")?;
+    assert_eq!(done["status"], "done", "{done}");
+    assert!(done.to_string().contains("allow-secret"), "{done}");
+    fs::write(&edited.file, &edited.original)?;
+    let done = finish("Second")?;
+    assert!(done.to_string().contains("allow-secret"), "{done}");
+    let history = remote_history(machine, &pair.remote)?;
+    assert!(
+        !history.contains(&edited.token),
+        "the token reached the remote"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_failed_push_still_reports_the_merge_and_rebuilds_the_index() -> TestResult {
     let pair = pair()?;

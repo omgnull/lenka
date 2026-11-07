@@ -1015,6 +1015,81 @@ fn a_local_pointer_with_no_object_does_not_stop_a_push() -> TestResult {
     )
 }
 
+/// The branch holds only a pointer, and `git lfs push` sends the bytes. So the check reads the
+/// local Git LFS object of each pointer that the push sends.
+#[test]
+fn a_secret_in_a_git_lfs_object_is_not_pushed() -> TestResult {
+    isolated(
+        "a_secret_in_a_git_lfs_object_is_not_pushed",
+        WITH_LFS,
+        || {
+            let temp = tempfile::tempdir()?;
+            if !has_lfs(temp.path()) {
+                return Ok(());
+            }
+            let clones = two_clones(temp.path(), file_url)?;
+            let path = format!("artifacts/{}/versions/000001/x.txt", ArtifactId::generate());
+            let file = clones.first_data.join(&path);
+            fs::create_dir_all(file.parent().ok_or("no parent")?)?;
+            let token = format!("{}{}", "ghp_", "a1B2".repeat(10));
+            fs::write(&file, format!("notes\n{token}\n"))?;
+
+            let project = clones.first.project("api")?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
+            assert!(!report.pushed, "{report:?}");
+            let error = report.push_error.clone().unwrap_or_default();
+            assert!(
+                error.contains("Git LFS object of the file artifacts/"),
+                "{error}"
+            );
+            let stored = git(&clones.first_data, &["show", &format!("HEAD:{path}")])?;
+            assert!(stored.starts_with("version https://git-lfs"), "{stored}");
+
+            // The local commit keeps the pointer, so a delete of the file is not enough.
+            fs::remove_file(&file)?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
+            assert!(!report.pushed, "{report:?}");
+            let listed = git(
+                &clones.remote,
+                &["ls-tree", "-r", "--name-only", "lenka-data"],
+            )?;
+            assert!(!listed.contains(&path), "{listed}");
+            Ok(())
+        },
+    )
+}
+
+/// The push also sends the commit messages, and a person can write one by hand.
+#[test]
+fn a_secret_in_a_commit_message_is_not_pushed() -> TestResult {
+    isolated(
+        "a_secret_in_a_commit_message_is_not_pushed",
+        WITH_IDENTITY,
+        || {
+            let temp = tempfile::tempdir()?;
+            let clones = two_clones(temp.path(), plain_path)?;
+            let token = format!("{}{}", "ghp_", "a1B2".repeat(10));
+            let message = format!("A note with {token}");
+            git(
+                &clones.first_data,
+                &["commit", "-q", "--allow-empty", "-m", &message],
+            )?;
+
+            let project = clones.first.project("api")?;
+            let report = sync(&project, lenka_git::OutgoingSecrets::Refuse)?;
+            assert!(!report.pushed, "{report:?}");
+            let error = report.push_error.clone().unwrap_or_default();
+            assert!(error.contains("message of the local commit"), "{error}");
+            let history = git(&clones.remote, &["log", "lenka-data"])?;
+            assert!(!history.contains(&token), "{history}");
+
+            let report = sync(&project, lenka_git::OutgoingSecrets::Allow)?;
+            assert!(report.pushed, "{report:?}");
+            Ok(())
+        },
+    )
+}
+
 #[test]
 fn a_failed_merge_puts_the_tree_back() -> TestResult {
     isolated("a_failed_merge_puts_the_tree_back", WITH_IDENTITY, || {

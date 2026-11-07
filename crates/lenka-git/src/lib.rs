@@ -17,7 +17,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
@@ -526,9 +526,6 @@ fn uses_lfs(git: &Git) -> Result<bool> {
     Ok(git.passes(["config", "--get", "filter.lfs.clean"])? && git.passes(["lfs", "version"])?)
 }
 
-/// Sends the branch to a remote. The hooks stay off, so this function uploads Git LFS objects
-/// itself. Without them, a fresh clone cannot download the artifact bytes. A pointer with no local
-/// object does not stop the push, because `doctor` reports that artifact.
 /// Tells what a push does with a file that matches a secret pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutgoingSecrets {
@@ -539,64 +536,280 @@ pub enum OutgoingSecrets {
     Allow,
 }
 
-/// Checks the files that a push adds or changes. A write through lenka has a check, but a hand edit
-/// and a merge do not.
-fn check_outgoing(git: &Git, remote: &str, secrets: OutgoingSecrets) -> Result<()> {
-    if secrets == OutgoingSecrets::Allow {
+/// The largest blob that can be a Git LFS pointer. Git LFS uses the same limit.
+const MAX_LFS_POINTER_BYTES: u64 = 1024;
+
+/// The first line of a Git LFS pointer.
+const LFS_POINTER_START: &[u8] = b"version https://git-lfs.github.com/spec/v1\n";
+
+/// Checks the objects that a push sends, and then sends the branch.
+///
+/// The remote has `base`, so the check skips the objects of `base`. With no `base`, the check
+/// reads all objects of the branch. The push sends the commit that the check read, so a commit
+/// from another process cannot go out with no check.
+fn check_and_push(
+    git: &Git,
+    remote: &str,
+    base: Option<&str>,
+    secrets: OutgoingSecrets,
+) -> Result<()> {
+    let commit = commit_of(git, BRANCH_REF)?;
+    if secrets == OutgoingSecrets::Refuse {
+        check_outgoing(git, remote, base, &commit)?;
+    }
+    push(git, remote, &commit)
+}
+
+/// Returns the tracking ref of the data branch, if this clone has it.
+fn tracking_ref(git: &Git, remote: &str) -> Result<Option<String>> {
+    let tracking = format!("refs/remotes/{remote}/{BRANCH}");
+    Ok(git
+        .passes(["rev-parse", "--verify", "-q", tracking.as_str()])?
+        .then_some(tracking))
+}
+
+/// Checks each object that a push sends: the files, the folders, and the commit messages. A write
+/// through lenka has a check, but a hand edit and a merge do not. The push sends each local commit,
+/// so a check of the last state of the files is not enough.
+fn check_outgoing(git: &Git, remote: &str, base: Option<&str>, commit: &str) -> Result<()> {
+    let excluded = base.map(|name| format!("^{name}"));
+    let mut args = vec!["rev-list", "--objects", commit];
+    args.extend(excluded.as_deref());
+    args.push("--");
+    let listing = git.output(args)?;
+    if !listing.status.success() {
+        return Err(git_error("list the objects of the push", &listing));
+    }
+    let objects = parse_object_list(&listing.stdout);
+    if objects.is_empty() {
         return Ok(());
     }
-    let tracking = format!("refs/remotes/{remote}/{BRANCH}");
-    let listing = if git.passes(["rev-parse", "--verify", "-q", tracking.as_str()])? {
-        git.output([
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--diff-filter=d",
-            tracking.as_str(),
-            "HEAD",
-        ])?
+    let lfs_dir = if uses_lfs(git)? {
+        Some(lfs_media_dir(git)?)
     } else {
-        git.output(["ls-tree", "-r", "-z", "--name-only", "HEAD"])?
+        None
     };
-    if !listing.status.success() {
-        return Err(git_error("list the changed files", &listing));
+    check_objects(git, &objects, lfs_dir.as_deref()).map_err(|error| {
+        if error.code() != ErrorCode::SecretDetected {
+            return error;
+        }
+        LenkaError::new(
+            error.code(),
+            format!("{} {}", error.message(), secret_steps(remote, base)),
+        )
+    })
+}
+
+/// Tells a person how to stop a secret in a local commit.
+fn secret_steps(remote: &str, base: Option<&str>) -> String {
+    let rewrite = if base.is_some() {
+        format!(
+            "Remove the text, run `git reset --soft {remote}/{BRANCH}` in the data directory, and run `lenka sync` again. This puts all local changes in one new commit."
+        )
+    } else {
+        format!(
+            "Remove the text, and remove it from the local commits of the branch {BRANCH}, for example with `git rebase -i --root` in the data directory. Then run `lenka sync` again."
+        )
+    };
+    format!(
+        "lenka did not push. The local commits keep this text, so a change of the file is not enough. {rewrite} If the secret is real, rotate it. To push the text anyway, run `lenka sync --allow-secret`."
+    )
+}
+
+/// One object in the output of `git rev-list --objects`.
+#[derive(Debug)]
+struct OutgoingObject<'a> {
+    id: &'a [u8],
+    /// The path of a file or a folder. A commit has no path.
+    path: &'a [u8],
+}
+
+fn parse_object_list(listing: &[u8]) -> Vec<OutgoingObject<'_>> {
+    listing
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            let (id, path) = match line.iter().position(|byte| *byte == b' ') {
+                Some(at) => (&line[..at], &line[at + 1..]),
+                None => (line, &line[line.len()..]),
+            };
+            // A path with a line break gives a line with no object ID. The line before it has the
+            // ID of the object.
+            let valid = matches!(id.len(), 40 | 64) && id.iter().all(u8::is_ascii_hexdigit);
+            valid.then_some(OutgoingObject { id, path })
+        })
+        .collect()
+}
+
+/// Reads all objects in one `git cat-file --batch` process, and checks each of them.
+fn check_objects(git: &Git, objects: &[OutgoingObject<'_>], lfs_dir: Option<&Path>) -> Result<()> {
+    let mut child = git
+        .command()
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| git_start_error(&err))?;
+    let (Some(input), Some(output)) = (child.stdin.take(), child.stdout.take()) else {
+        unreachable!("the pipes of git cat-file are set above");
+    };
+    let result = std::thread::scope(|scope| {
+        // A separate writer keeps both pipes open, so that a full pipe cannot stop the two
+        // processes.
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            let mut input = std::io::BufWriter::new(input);
+            for object in objects {
+                input.write_all(object.id)?;
+                input.write_all(b"\n")?;
+            }
+            input.flush()
+        });
+        let result = read_objects(&mut std::io::BufReader::new(output), objects, lfs_dir);
+        if result.is_err() {
+            // The writer then gets a write error and stops.
+            child.kill().ok();
+        }
+        // A write error is not important: the reader found the error first, or read all objects.
+        writer.join().ok();
+        result
+    });
+    let status = child
+        .wait()
+        .map_err(|err| LenkaError::io("Wait for git cat-file", &err))?;
+    result?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(LenkaError::new(
+            ErrorCode::Io,
+            "git cat-file failed, so lenka did not push. Run `lenka sync` again.",
+        ))
     }
-    for name in listing.stdout.split(|byte| *byte == 0) {
-        if !name.is_empty() {
-            check_outgoing_file(git, name)?;
+}
+
+fn read_objects(
+    output: &mut impl BufRead,
+    objects: &[OutgoingObject<'_>],
+    lfs_dir: Option<&Path>,
+) -> Result<()> {
+    let ended = || {
+        LenkaError::new(
+            ErrorCode::Io,
+            "git cat-file stopped early, so lenka did not push. Run `lenka sync` again.",
+        )
+    };
+    let read_error = |err: std::io::Error| LenkaError::io("Read the output of git cat-file", &err);
+    let mut header = Vec::new();
+    for object in objects {
+        header.clear();
+        output.read_until(b'\n', &mut header).map_err(read_error)?;
+        if header.is_empty() {
+            return Err(ended());
+        }
+        let text = String::from_utf8_lossy(&header);
+        let mut fields = text.split_ascii_whitespace().skip(1);
+        let (Some(kind), Some(size)) = (fields.next(), fields.next()) else {
+            // Git writes `<id> missing` for an object that this clone does not have. The push
+            // cannot send such an object.
+            continue;
+        };
+        let size: u64 = size.parse().map_err(|_| ended())?;
+        let location = object_location(kind, object);
+        let left = {
+            let mut body = output.by_ref().take(size);
+            if lfs_dir.is_some() && kind == "blob" && size <= MAX_LFS_POINTER_BYTES {
+                let mut bytes = Vec::new();
+                body.read_to_end(&mut bytes).map_err(read_error)?;
+                lenka_core::secret::check_stream(&location, &mut bytes.as_slice())?;
+                if let (Some(dir), Some(id)) = (lfs_dir, lfs_object_id(&bytes)) {
+                    check_lfs_object(dir, id, object.path)?;
+                }
+            } else {
+                lenka_core::secret::check_stream(&location, &mut body)?;
+            }
+            body.limit()
+        };
+        let mut end = [0_u8; 1];
+        if left != 0 || output.read_exact(&mut end).is_err() || end != *b"\n" {
+            return Err(ended());
         }
     }
     Ok(())
 }
 
-fn check_outgoing_file(git: &Git, name: &[u8]) -> Result<()> {
-    let path = git.dir.join(os_path(name));
-    let shown = String::from_utf8_lossy(name).escape_default().to_string();
-    let mut file = match files::open_regular(&path, files::Links::Refuse) {
-        Ok(file) => file,
-        // A later write can remove the file, and a symlink has no bytes to check.
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(err) => return Err(LenkaError::io("Read a file for the secret check", &err)),
-    };
-    lenka_core::secret::check_stream(&shown, &mut file).map_err(|error| {
-        LenkaError::new(
-            error.code(),
+/// Names an object for a person.
+fn object_location(kind: &str, object: &OutgoingObject<'_>) -> String {
+    let path = String::from_utf8_lossy(object.path)
+        .escape_default()
+        .to_string();
+    match kind {
+        "blob" => format!("file {path} in a local commit"),
+        "tree" if path.is_empty() => "top folder of a local commit".to_owned(),
+        "tree" => format!("folder {path} in a local commit"),
+        "commit" => {
+            let id = String::from_utf8_lossy(object.id);
             format!(
-                "{error} lenka did not push. Remove this text, and rotate the secret, because the local commits keep it. To push the file anyway, run `lenka sync --allow-secret`."
-            ),
-        )
-    })
+                "message of the local commit {}",
+                id.get(..12).unwrap_or(&id)
+            )
+        }
+        _ => format!("object {}", String::from_utf8_lossy(object.id)),
+    }
 }
 
-fn push(git: &Git, remote: &str) -> Result<()> {
+/// Returns the object ID in a Git LFS pointer.
+fn lfs_object_id(blob: &[u8]) -> Option<&str> {
+    let rest = std::str::from_utf8(blob.strip_prefix(LFS_POINTER_START)?).ok()?;
+    let id = rest
+        .lines()
+        .find_map(|line| line.strip_prefix("oid sha256:"))?;
+    let valid = id.len() == 64
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    valid.then_some(id)
+}
+
+/// Checks the bytes of a Git LFS object, because `git lfs push` sends them with the pointer.
+fn check_lfs_object(dir: &Path, id: &str, path: &[u8]) -> Result<()> {
+    let file = dir.join(&id[..2]).join(&id[2..4]).join(id);
+    let location = format!(
+        "Git LFS object of the file {} in a local commit",
+        String::from_utf8_lossy(path).escape_default()
+    );
+    match files::open_regular(&file, files::Links::Refuse) {
+        Ok(mut bytes) => lenka_core::secret::check_stream(&location, &mut bytes),
+        // The push sends no object that this clone does not have.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(LenkaError::io(
+            "Read a Git LFS object for the secret check",
+            &err,
+        )),
+    }
+}
+
+/// Returns the directory of the local Git LFS objects.
+fn lfs_media_dir(git: &Git) -> Result<PathBuf> {
+    let output = git.output(["lfs", "env"])?;
+    check_output("lfs env", &output)?;
+    output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .find_map(|line| line.strip_prefix(b"LocalMediaDir="))
+        .map(|dir| PathBuf::from(os_path(dir.trim_ascii_end())))
+        .filter(|dir| dir.is_absolute())
+        .ok_or_else(|| {
+            LenkaError::new(
+                ErrorCode::Io,
+                "lenka cannot find the Git LFS objects of this clone, so it cannot check them for secrets. lenka did not push.",
+            )
+        })
+}
+
+/// Sends a commit to the data branch of a remote. The hooks stay off, so this function uploads Git
+/// LFS objects itself. Without them, a fresh clone cannot download the artifact bytes. A pointer
+/// with no local object does not stop the push, because `doctor` reports that artifact.
+fn push(git: &Git, remote: &str, commit: &str) -> Result<()> {
     if uses_lfs(git)? {
         git.run_network(
             "lfs push",
@@ -606,11 +819,11 @@ fn push(git: &Git, remote: &str) -> Result<()> {
                 "lfs",
                 "push",
                 remote,
-                BRANCH,
+                commit,
             ],
         )?;
     }
-    let refspec = format!("{BRANCH_REF}:{BRANCH_REF}");
+    let refspec = format!("{commit}:{BRANCH_REF}");
     git.run_network("push", &["push", "-q", remote, refspec.as_str()])
 }
 
@@ -1299,7 +1512,7 @@ pub fn sync(project: &Project, secrets: OutgoingSecrets) -> Result<SyncReport> {
 
     let tracking = format!("refs/remotes/{remote}/{BRANCH}");
     let listing = git.output(["ls-remote", "--exit-code", "--heads", remote, BRANCH_REF])?;
-    match listing.status.code() {
+    let base = match listing.status.code() {
         Some(0) => {
             let refspec = format!("+{BRANCH_REF}:{tracking}");
             git.run(
@@ -1318,12 +1531,14 @@ pub fn sync(project: &Project, secrets: OutgoingSecrets) -> Result<SyncReport> {
             if report.merged {
                 report.lfs_warning = download_lfs(&git, Some(remote))?;
             }
+            Some(tracking.as_str())
         }
-        // The remote has no data branch yet, so this push creates it.
-        Some(2) => {}
+        // The remote has no data branch yet, so this push creates it and sends all objects. An
+        // old tracking ref does not tell what the remote has.
+        Some(2) => None,
         _ => return Err(git_error("ls-remote", &listing)),
-    }
-    match check_outgoing(&git, remote, secrets).and_then(|()| push(&git, remote)) {
+    };
+    match check_and_push(&git, remote, base, secrets) {
         Ok(()) => report.pushed = true,
         Err(error) => report.push_error = Some(error.to_string()),
     }
@@ -1483,8 +1698,15 @@ impl GitHook {
         let git = open_data_repo(project, Prompt::Denied)?;
         commit_locked(project, &git, message)?;
         if finished && settings.push_on_finish && has_remote(&git, &settings.remote)? {
-            check_outgoing(&git, &settings.remote, OutgoingSecrets::Refuse)?;
-            push(&git, &settings.remote)?;
+            // The hook does not fetch, so the tracking ref can be old. Then the check reads more
+            // objects than the push sends.
+            let base = tracking_ref(&git, &settings.remote)?;
+            check_and_push(
+                &git,
+                &settings.remote,
+                base.as_deref(),
+                OutgoingSecrets::Refuse,
+            )?;
         }
         Ok(())
     }
@@ -1542,6 +1764,43 @@ mod tests {
         assert!(validate_remote_name("my-remote.1").is_ok());
         for bad in ["", "--upload-pack=x", "-x", "a b", "a/b", "a;b"] {
             assert!(validate_remote_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_line_break_in_a_path_does_not_hide_an_object() {
+        let blob = "b".repeat(40);
+        let listing = format!(
+            "{}\n{} \n{blob} memory/a\n{} b\n",
+            "c".repeat(40),
+            "d".repeat(64),
+            "e".repeat(39)
+        );
+        let objects = parse_object_list(listing.as_bytes());
+        let ids: Vec<&[u8]> = objects.iter().map(|object| object.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "c".repeat(40).as_bytes(),
+                "d".repeat(64).as_bytes(),
+                blob.as_bytes()
+            ]
+        );
+        assert_eq!(objects[2].path, b"memory/a");
+    }
+
+    #[test]
+    fn a_git_lfs_pointer_gives_its_object_id() {
+        let id = "0a".repeat(32);
+        let pointer =
+            format!("version https://git-lfs.github.com/spec/v1\noid sha256:{id}\nsize 12\n");
+        assert_eq!(lfs_object_id(pointer.as_bytes()), Some(id.as_str()));
+        for bad in [
+            format!("oid sha256:{id}\n"),
+            pointer.replace(&id, &"0A".repeat(32)),
+            pointer.replace(&id, "../../../../etc/passwd"),
+        ] {
+            assert_eq!(lfs_object_id(bad.as_bytes()), None, "{bad}");
         }
     }
 }
