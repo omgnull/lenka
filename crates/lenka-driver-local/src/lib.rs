@@ -43,6 +43,9 @@ pub fn plugin() -> LocalDriverPlugin {
 /// The path of the journal in the data directory.
 const JOURNAL_PATH: &str = ".runtime/pending.json";
 
+/// The path of the write lock in the data directory.
+const LOCK_PATH: &str = ".runtime/lock";
+
 /// The largest document that the driver reads.
 pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -113,16 +116,37 @@ impl LocalDriver {
 }
 
 impl LocalDriver {
+    /// Opens the lock file. A path that is not a regular file fails before the open, because the
+    /// open of a named pipe waits with no limit, and the wait limit of the lock starts only later.
     fn open_lock_file(&self) -> Result<File> {
-        let runtime = self.root.join(".runtime");
-        fs::create_dir_all(&runtime)
-            .map_err(|err| LenkaError::io("Create the runtime directory", &err))?;
-        OpenOptions::new()
+        let lock = DocPath::new(LOCK_PATH)?;
+        self.check_no_symlink(&lock)?;
+        let path = self.file_of(&lock);
+        if let Some(runtime) = path.parent() {
+            fs::create_dir_all(runtime)
+                .map_err(|err| LenkaError::io("Create the runtime directory", &err))?;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => return Err(lock_not_regular()),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(LenkaError::io("Read the metadata of the lock file", &err)),
+        }
+        // Another process can put a named pipe at the path after the check. Only a person or a
+        // tool outside lenka can do this, and the check after the open finds the other kinds.
+        let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(runtime.join("lock"))
-            .map_err(|err| LenkaError::io("Open the lock file", &err))
+            .open(&path)
+            .map_err(|err| LenkaError::io("Open the lock file", &err))?;
+        let meta = file
+            .metadata()
+            .map_err(|err| LenkaError::io("Read the metadata of the lock file", &err))?;
+        if !meta.is_file() {
+            return Err(lock_not_regular());
+        }
+        Ok(file)
     }
 
     /// Opens a document. A path that is not a regular file fails, because the open of a named pipe
@@ -138,6 +162,12 @@ impl LocalDriver {
             Err(err) => Err(LenkaError::io("Open a document", &err)),
         }
     }
+}
+
+fn lock_not_regular() -> LenkaError {
+    LenkaError::invalid_file(format!(
+        "The path {LOCK_PATH} is not a regular file, so lenka cannot take the write lock. Remove that path."
+    ))
 }
 
 /// Returns the limit of the wait for the write lock. `LENKA_LOCK_WAIT_MS` can change it.
@@ -647,6 +677,61 @@ mod tests {
             driver.journal_read().err().map(|e| e.code()),
             Some(ErrorCode::InvalidFile)
         );
+        Ok(())
+    }
+
+    /// Starts a write in another thread, and gives back its error code and message. The test fails
+    /// if the start does not end in a short time.
+    fn begin_error(driver: LocalDriver) -> Option<(ErrorCode, String)> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = begin_with_limit(&driver, Duration::from_millis(50))
+                .err()
+                .map(|err| (err.code(), err.to_string()));
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "A send fails only if the test stopped its wait."
+            )]
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => panic!("the start of a write waits on the lock file"),
+        }
+    }
+
+    /// The open of a named pipe waits with no limit, before the wait limit of the lock starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_that_is_not_regular_gives_an_error_and_no_wait() -> Result<()> {
+        type Make = fn(&Path) -> std::io::Result<()>;
+        let kinds: [(&str, Make); 3] = [
+            ("a named pipe", |path| {
+                let made = std::process::Command::new("mkfifo").arg(path).status()?;
+                assert!(made.success());
+                Ok(())
+            }),
+            ("a directory", |path| fs::create_dir(path)),
+            ("a symlink", |path| {
+                let outside = path.with_file_name("outside");
+                fs::write(&outside, "")?;
+                std::os::unix::fs::symlink(outside, path)
+            }),
+        ];
+        for (name, make) in kinds {
+            let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+            let lock = temp.path().join(LOCK_PATH);
+            if let Some(parent) = lock.parent() {
+                fs::create_dir_all(parent).map_err(|err| LenkaError::io("test", &err))?;
+            }
+            make(&lock).map_err(|err| LenkaError::io("test", &err))?;
+            let error = begin_error(LocalDriver::open(temp.path())?);
+            let Some((code, message)) = error else {
+                panic!("{name}: the write started");
+            };
+            assert_eq!(code, ErrorCode::InvalidFile, "{name}: {message}");
+            assert!(message.contains(LOCK_PATH), "{name}: {message}");
+        }
         Ok(())
     }
 
