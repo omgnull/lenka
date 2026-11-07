@@ -19,6 +19,6 @@ pub use service::{
     ArtifactRouting, ArtifactView, BlockerView, BoardRow, CallNotes, CheckItem, ClaimRef,
     DoctorDepth, DoctorReport, Finish, Leftovers, ListFilter, NewEntry, NewTask, RelatedView,
     StateChange, TaskDetail, TaskPatch, TaskRow, TaskService, TaskVersions, artifact_view,
-    is_safe_file_name, read_artifact, service_of,
+    check_types_in_use, is_safe_file_name, read_artifact, service_of,
 };
 pub use tools::{TasksPlugin, change_json, detail_json, plugin, task_ref, with_notes};

@@ -404,41 +404,10 @@ pub(crate) fn check_config(config: &ProjectConfig, rows: &[BoardRow]) -> Result<
             return Err(format!("The type {name} has a stage with no name."));
         }
     }
-    let mut missing_type = None;
-    let mut missing_stage = None;
-    let mut type_uses = 0;
-    let mut stage_uses = 0;
-    for row in rows {
-        let front = &row.meta.front;
-        match config.types.get(&front.kind) {
-            None => {
-                type_uses += 1;
-                missing_type.get_or_insert_with(|| front.kind.clone());
-            }
-            Some(def) => {
-                if !def
-                    .stages
-                    .iter()
-                    .any(|stage| stage.name == row.meta.state.stage)
-                {
-                    stage_uses += 1;
-                    missing_stage
-                        .get_or_insert_with(|| (front.kind.clone(), row.meta.state.stage.clone()));
-                }
-            }
-        }
-    }
-    if let Some(kind) = missing_type {
-        return Err(format!(
-            "{type_uses} tasks use the type {kind}, and the new settings do not have it. Change those tasks first."
-        ));
-    }
-    if let Some((kind, stage)) = missing_stage {
-        return Err(format!(
-            "{stage_uses} tasks are on the stage {stage} of the type {kind}, and the new settings do not have it. Move those tasks first."
-        ));
-    }
-    Ok(())
+    // The save checks the tasks again under the write lock. This early check uses the rows on the
+    // screen, so that the person sees the problem before the save.
+    lenka_tasks::check_types_in_use(config, rows.iter().map(|row| &row.meta))
+        .map_err(|err| err.message().to_owned())
 }
 
 #[cfg(test)]

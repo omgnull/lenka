@@ -91,6 +91,40 @@ impl Locked<'_> {
     pub fn flush_journal(&mut self) -> Result<()> {
         self.txn.journal_flush()
     }
+
+    /// Saves settings that a person edited from `base`, under this lock. A caller can check its
+    /// data under the same lock first, as [`Project::save_config_over`] cannot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Project::save_config_over`].
+    pub fn save_config_over(&mut self, base: &ProjectConfig, config: ProjectConfig) -> Result<()> {
+        config.validate()?;
+        check_same_id(base, &config)?;
+        let path = DocPath::new(PROJECT_FILE)?;
+        let bytes = self
+            .project
+            .driver
+            .read(&path)?
+            .ok_or_else(|| LenkaError::not_found("The project directory has no lenka.toml."))?;
+        let old = String::from_utf8(bytes)
+            .map_err(|_| LenkaError::invalid_file("lenka.toml is not valid UTF-8."))?;
+        if ProjectConfig::parse(&old)? != *base {
+            return Err(LenkaError::new(
+                ErrorCode::StaleVersion,
+                "Another writer changed lenka.toml after these settings loaded.",
+            ));
+        }
+        self.commit(&Commit {
+            ops: vec![Op::Put {
+                path: PROJECT_FILE.to_owned(),
+                text: config.to_text_over(&old)?,
+            }],
+            ..Commit::default()
+        })?;
+        *lock(&self.project.config) = Arc::new(config);
+        Ok(())
+    }
 }
 
 /// An open project.
@@ -296,32 +330,7 @@ impl Project {
     /// Returns [`ErrorCode::StaleVersion`] if the file differs from `base`, or an error if the
     /// settings are not valid or the write fails.
     pub fn save_config_over(&self, base: &ProjectConfig, config: ProjectConfig) -> Result<()> {
-        config.validate()?;
-        check_same_id(base, &config)?;
-        self.write_locked(|locked| {
-            let path = DocPath::new(PROJECT_FILE)?;
-            let bytes = self
-                .driver
-                .read(&path)?
-                .ok_or_else(|| LenkaError::not_found("The project directory has no lenka.toml."))?;
-            let old = String::from_utf8(bytes)
-                .map_err(|_| LenkaError::invalid_file("lenka.toml is not valid UTF-8."))?;
-            if ProjectConfig::parse(&old)? != *base {
-                return Err(LenkaError::new(
-                    ErrorCode::StaleVersion,
-                    "Another writer changed lenka.toml after these settings loaded.",
-                ));
-            }
-            locked.commit(&Commit {
-                ops: vec![Op::Put {
-                    path: PROJECT_FILE.to_owned(),
-                    text: config.to_text_over(&old)?,
-                }],
-                ..Commit::default()
-            })
-        })?;
-        *lock(&self.config) = Arc::new(config);
-        Ok(())
+        self.write_locked(|locked| locked.save_config_over(base, config))
     }
 
     /// Saves new settings through the journal.

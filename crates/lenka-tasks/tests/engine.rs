@@ -4431,6 +4431,38 @@ fn a_link_that_a_hand_edit_removes_gets_a_notice() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_settings_save_keeps_a_stage_that_a_task_moved_to_after_the_load() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    two_stages(&service)?;
+    let id = create(&service, &human, "T")?;
+    // The person loads the settings, and removes the stage `review` while no task uses it.
+    let base = service.project().config();
+    let mut draft = (*base).clone();
+    if let Some(def) = draft.types.get_mut("task") {
+        def.stages.retain(|stage| stage.name != "review");
+    }
+    // Another process moves the task to `review` before the save.
+    let (_host, other) = {
+        let host = build_host(&fx.paths, &fx.clock)?;
+        let other = service_of(&host.open_by_name("api")?)?;
+        (host, other)
+    };
+    other.advance(&human, id, &ClaimRef::Implicit, "Step one works.", None)?;
+
+    let Err(error) = service.save_config_over(&base, draft) else {
+        return Err(LenkaError::invalid_argument("The save must fail."));
+    };
+    assert_eq!(error.code(), ErrorCode::InvalidArgument);
+    assert!(error.message().contains("stage review"), "{error:?}");
+    let text = fs::read_to_string(fx.data_dir("api").join("lenka.toml"))
+        .map_err(|err| LenkaError::io("read", &err))?;
+    assert!(text.contains("review"), "{text}");
+    Ok(())
+}
+
 /// An event hook that does nothing. With a hook, a finish records all hand edits first.
 #[derive(Debug)]
 struct NoHook;

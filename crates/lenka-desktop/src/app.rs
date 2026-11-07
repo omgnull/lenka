@@ -1706,7 +1706,7 @@ impl DesktopApp {
             return;
         };
         match self.settings.validated(&session.model.rows) {
-            Ok(config) => match session.project.save_config_over(&base, config.clone()) {
+            Ok(config) => match session.tasks.save_config_over(&base, config.clone()) {
                 Ok(()) => {
                     self.settings.mark_saved(config);
                     self.visible_key.0 = 0;

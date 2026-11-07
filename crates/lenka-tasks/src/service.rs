@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use lenka_core::input;
 use lenka_core::notices::{self, FEED_PATH};
 use lenka_core::{
-    Commit, FeedEvent, FeedKind, Locked, Notice, Op, Project, ProjectEvent, SecretPolicy, Stage,
-    Subject, TextCheck,
+    Commit, FeedEvent, FeedKind, Locked, Notice, Op, Project, ProjectConfig, ProjectEvent,
+    SecretPolicy, Stage, Subject, TextCheck,
 };
 use lenka_plugin_api::{
     Actor, ArtifactId, Caller, Day, DocPath, EntryId, ErrorCode, LenkaError, NoticeId, Result,
@@ -2703,6 +2703,23 @@ impl TaskService {
         })
     }
 
+    /// Saves settings that a person edited from `base`. Under the write lock, the save reads the
+    /// tasks again, and it refuses to remove a type or a stage that a task uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidArgument`] if a task uses a removed type or stage, and the
+    /// errors of [`Project::save_config_over`].
+    pub fn save_config_over(&self, base: &ProjectConfig, config: ProjectConfig) -> Result<()> {
+        let driver = self.project.driver();
+        self.with_write(|locked, index, _| {
+            // A hand edit writes no feed line, so the scan finds a stage that it changed.
+            index.scan(driver)?;
+            check_types_in_use(&config, index.tasks.values())?;
+            locked.save_config_over(base, config)
+        })
+    }
+
     /// Returns the version of each task.
     ///
     /// # Errors
@@ -3747,6 +3764,52 @@ fn newest_version(
         .iter()
         .filter_map(|name| name.parse::<u64>().ok())
         .fold(known, u64::max))
+}
+
+/// Checks that settings keep each type and each stage that a task uses.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::InvalidArgument`] with the count of tasks that use the first missing type
+/// or stage.
+pub fn check_types_in_use<'a>(
+    config: &ProjectConfig,
+    tasks: impl IntoIterator<Item = &'a TaskMeta>,
+) -> Result<()> {
+    let mut missing_type = None;
+    let mut missing_stage = None;
+    let mut type_uses = 0;
+    let mut stage_uses = 0;
+    for meta in tasks {
+        let kind = &meta.front.kind;
+        match config.types.get(kind) {
+            None => {
+                type_uses += 1;
+                missing_type.get_or_insert_with(|| kind.clone());
+            }
+            Some(def)
+                if !def
+                    .stages
+                    .iter()
+                    .any(|stage| stage.name == meta.state.stage) =>
+            {
+                stage_uses += 1;
+                missing_stage.get_or_insert_with(|| (kind.clone(), meta.state.stage.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(kind) = missing_type {
+        return Err(LenkaError::invalid_argument(format!(
+            "{type_uses} tasks use the type {kind}, and the new settings do not have it. Change those tasks first."
+        )));
+    }
+    if let Some((kind, stage)) = missing_stage {
+        return Err(LenkaError::invalid_argument(format!(
+            "{stage_uses} tasks are on the stage {stage} of the type {kind}, and the new settings do not have it. Move those tasks first."
+        )));
+    }
+    Ok(())
 }
 
 fn stamps_differ(driver: &dyn lenka_plugin_api::StorageDriver, meta: &TaskMeta) -> bool {
