@@ -122,8 +122,54 @@ pub fn split_front<T: DeserializeOwned>(what: &str, text: &str) -> Result<(T, St
 ///
 /// Returns [`lenka_plugin_api::ErrorCode::InvalidFile`] if the value cannot be formatted.
 pub fn join_front<T: Serialize>(front: &T, body: &str) -> Result<String> {
-    let toml = toml::to_string(front)
-        .map_err(|err| LenkaError::invalid_file(format!("Front matter: {err}")))?;
+    let toml = to_toml(front)?;
+    Ok(format!("{FENCE}\n{toml}{FENCE}\n{body}"))
+}
+
+fn to_toml<T: Serialize>(value: &T) -> Result<String> {
+    toml::to_string(value).map_err(|err| LenkaError::invalid_file(format!("Front matter: {err}")))
+}
+
+/// Joins front matter and a new body into a document, and keeps the parts of a hand edit.
+///
+/// `old_text` is the current document, and `old_front` is its front matter as lenka reads it. If
+/// the front matter does not change, the result keeps its original text with comments and unknown
+/// keys. Otherwise, the result keeps the unknown keys, but not the comments.
+///
+/// # Errors
+///
+/// Returns [`lenka_plugin_api::ErrorCode::InvalidFile`] if the value cannot be formatted.
+pub fn rejoin_front<T>(old_text: &str, old_front: &T, front: &T, body: &str) -> Result<String>
+where
+    T: Serialize + DeserializeOwned + PartialEq,
+{
+    let Ok((table, old_body)) = split_front::<toml::Table>("task.md", old_text) else {
+        return join_front(front, body);
+    };
+    if front == old_front {
+        let head = &old_text[..old_text.len() - old_body.len()];
+        return Ok(format!("{head}{body}"));
+    }
+    let as_table = |value: &T| {
+        toml::Table::try_from(value)
+            .map_err(|err| LenkaError::invalid_file(format!("Front matter: {err}")))
+    };
+    let (known, new) = (as_table(old_front)?, as_table(front)?);
+    // A key that lenka knows, but that a hand edit wrote with its default value, also stays.
+    let unknown: toml::Table = table
+        .into_iter()
+        .filter(|(key, _)| !known.contains_key(key) && !new.contains_key(key))
+        .collect();
+    if unknown.is_empty() {
+        return join_front(front, body);
+    }
+    let toml = format!("{}{}", to_toml(front)?, to_toml(&unknown)?);
+    // The front matter has no tables, so the unknown keys can follow it. Check this rule.
+    if toml::from_str::<T>(&toml).ok().as_ref() != Some(front) {
+        return Err(LenkaError::invalid_file(
+            "Front matter: the unknown keys of a hand edit do not fit after the known keys.",
+        ));
+    }
     Ok(format!("{FENCE}\n{toml}{FENCE}\n{body}"))
 }
 
@@ -780,6 +826,38 @@ Unknown heading stays.
         ] {
             assert!(check_field_text("f", bad).is_err(), "{bad}");
         }
+    }
+
+    #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
+    struct Front {
+        title: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        flag: bool,
+    }
+
+    #[test]
+    fn a_new_front_matter_keeps_the_parts_of_a_hand_edit() -> Result<()> {
+        let old_text =
+            "+++\r\n# Note.\r\ntitle = \"A\"\r\nflag = false\r\nowner = 1\r\n+++\r\nBody\r\n";
+        let old: Front = split_front("f", old_text)?.0;
+        let same = rejoin_front(old_text, &old, &old, "New\n")?;
+        assert_eq!(same, old_text.replace("Body\r\n", "New\n"));
+
+        let new = Front {
+            title: "B".to_owned(),
+            flag: true,
+        };
+        let text = rejoin_front(old_text, &old, &new, "New\n")?;
+        let (table, body) = split_front::<toml::Table>("f", &text)?;
+        assert_eq!(body, "New\n");
+        assert_eq!(table.get("owner"), Some(&toml::Value::Integer(1)), "{text}");
+        assert_eq!(
+            table.get("flag"),
+            Some(&toml::Value::Boolean(true)),
+            "{text}"
+        );
+        assert_eq!(split_front::<Front>("f", &text)?.0, new);
+        Ok(())
     }
 
     #[test]

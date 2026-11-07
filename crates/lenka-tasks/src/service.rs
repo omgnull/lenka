@@ -22,7 +22,7 @@ use crate::index::{Index, LoadedTask, load_task, open_index};
 use crate::links::{LinkReader, LinkState, LinkView, check_new_link};
 use crate::markdown::{
     ACCEPTANCE, Body, Criterion, DESCRIPTION, MAX_TEXT_BYTES, REQUIREMENTS, criteria_text_differs,
-    join_front, new_body, split_front,
+    join_front, new_body, rejoin_front, split_front,
 };
 use crate::model::{
     ArtifactRecord, ArtifactVersion, Claim, Entry, EntryKind, Link, Priority, State, Status,
@@ -1094,7 +1094,9 @@ impl TaskService {
             check_write_claim(index, id, caller, &patch.claim, now)?;
 
             let loaded = load_task(self.project.driver(), id)?;
-            let (mut front, old_body_text, old_plan) = (loaded.meta.front, loaded.body, loaded.plan);
+            let old_front = loaded.meta.front;
+            let mut front = old_front.clone();
+            let (old_body_text, old_plan) = (loaded.body, loaded.plan);
             let old_body = Body::parse(&old_body_text);
             let mut body = old_body.clone();
             let mut plan = old_plan.clone();
@@ -1207,7 +1209,10 @@ impl TaskService {
 
             let version = meta.state.version + 1;
             new_state.version = version;
-            let task_text = join_front(&front, &body_text)?;
+            // A hand edit can add comments and unknown keys to the front matter, and they stay.
+            let old_text = read_text(self.project.driver(), &format!("{}/task.md", root_of(id)))?
+                .ok_or_else(|| task_missing(id))?;
+            let task_text = rejoin_front(&old_text, &old_front, &front, &body_text)?;
             check_text_size("The task", &task_text)?;
             let version_meta = VersionMeta {
                 version,

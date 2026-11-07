@@ -4325,3 +4325,42 @@ fn a_patch_cannot_make_a_task_over_the_size_limit() -> Result<()> {
     assert_eq!(service.detail(id, &[])?.meta.state.version, 1);
     Ok(())
 }
+
+fn read_file(path: &Path) -> Result<String> {
+    fs::read_to_string(path).map_err(|err| LenkaError::io("read", &err))
+}
+
+/// A write of `task.md` keeps the comments and the unknown keys of a hand edit.
+#[test]
+fn a_write_keeps_the_front_matter_of_a_hand_edit() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let id = described(&service, &human, "T")?;
+    let note = "# A note by a person.\n";
+    let extra = "owner = \"team\"\n";
+    hand_edit(
+        &fx,
+        id,
+        "task.md",
+        "title = \"T\"\n",
+        &format!("{note}title = \"T\"\n{extra}"),
+    )?;
+    let file = task_file(&fx, id, "task.md");
+    let version = service.detail(id, &[])?.meta.state.version;
+    service.update(&human, id, text_change(version))?;
+    let text = read_file(&file)?;
+    assert!(text.contains(note) && text.contains(extra), "{text}");
+    assert!(text.contains(&format!("Text {version}")), "{text}");
+
+    let patch = TaskPatch {
+        title: Some("New title".to_owned()),
+        ..text_change(version + 1)
+    };
+    assert_eq!(service.update(&human, id, patch)?.front.title, "New title");
+    let text = read_file(&file)?;
+    assert!(text.contains(extra), "{text}");
+    service.reindex(&human)?;
+    assert_eq!(service.detail(id, &[])?.meta.front.title, "New title");
+    Ok(())
+}
