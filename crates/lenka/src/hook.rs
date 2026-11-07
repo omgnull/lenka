@@ -4,6 +4,7 @@
 //! The client hook. It reads the inbox of this worktree with no index and no plugin list, and it
 //! starts no other process. A failure gives no output, because a hook must not stop the client.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -57,18 +58,18 @@ pub fn run() {
 /// The text of new notices, and the markers to store after the text reaches the client.
 struct ShownNotices {
     text: String,
-    markers: Vec<(PathBuf, NoticeId)>,
+    markers: Vec<(PathBuf, String)>,
 }
 
 impl ShownNotices {
     fn save_markers(&self) {
-        for (marker, newest) in &self.markers {
+        for (marker, ids) in &self.markers {
             if !fs::symlink_metadata(marker).is_ok_and(|meta| meta.file_type().is_symlink()) {
                 #[expect(
                     clippy::let_underscore_must_use,
                     reason = "A failed write only shows the notice again in the next call."
                 )]
-                let _ = fs::write(marker, newest.to_string());
+                let _ = fs::write(marker, ids);
             }
         }
     }
@@ -173,13 +174,15 @@ struct ProjectNotices {
     lines: Vec<String>,
     /// The number of new notices that the hook does not show now.
     hidden: usize,
-    /// The marker file, and the ID of the last notice in `lines`.
-    marker: Option<(PathBuf, NoticeId)>,
+    /// The marker file, and its new text: the IDs of all shown notices that the inbox still holds.
+    marker: Option<(PathBuf, String)>,
 }
 
 /// Reads the new notices of one project, and keeps the oldest of them that fit in `room`.
 ///
-/// The marker stops at the last shown notice, so that the next call shows the others.
+/// The marker holds the ID of each shown notice. Two processes can write notices in one
+/// millisecond, and a later notice can then have a lower ID. So the hook does not compare IDs, and
+/// it shows the notices in the order of the inbox file.
 fn project_notices(name: &str, dir: &Path, key: &str, room: usize) -> ProjectNotices {
     let inbox_dir = dir.join(".runtime").join("inbox");
     if has_symlink(dir, &inbox_dir) {
@@ -190,23 +193,44 @@ fn project_notices(name: &str, dir: &Path, key: &str, room: usize) -> ProjectNot
     };
     let notices = parse_inbox(&bytes);
     let marker = inbox_dir.join(format!("{key}.shown"));
-    let shown = read_limited(&marker)
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| NoticeId::parse(text.trim()).ok());
+    let shown: HashSet<NoticeId> = read_limited(&marker)
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter_map(|line| NoticeId::parse(line.trim()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut fresh: Vec<&Notice> = notices
         .iter()
-        .filter(|notice| shown.is_none_or(|id| notice.id > id))
+        .filter(|notice| !shown.contains(&notice.id))
         .collect();
-    fresh.sort_by_key(|notice| notice.id);
     let hidden = fresh.len().saturating_sub(room);
     fresh.truncate(room);
+    if fresh.is_empty() {
+        return ProjectNotices {
+            hidden,
+            ..ProjectNotices::default()
+        };
+    }
+    // The marker keeps only the IDs that the inbox holds, so it cannot grow with no limit.
+    let now_shown: HashSet<NoticeId> = fresh.iter().map(|notice| notice.id).collect();
+    let mut kept = HashSet::new();
+    let mut ids = String::new();
+    for notice in &notices {
+        let is_shown = shown.contains(&notice.id) || now_shown.contains(&notice.id);
+        if is_shown && kept.insert(notice.id) {
+            ids.push_str(&notice.id.to_string());
+            ids.push('\n');
+        }
+    }
     ProjectNotices {
         lines: fresh
             .iter()
             .map(|notice| notice_line(name, notice))
             .collect(),
         hidden,
-        marker: fresh.last().map(|notice| (marker, notice.id)),
+        marker: Some((marker, ids)),
     }
 }
 

@@ -469,6 +469,40 @@ fn a_named_pipe_in_the_inbox_does_not_stop_the_hook() -> TestResult {
     Ok(())
 }
 
+/// Two processes can write notices in one millisecond, and a later notice can then have a lower ID.
+#[test]
+fn a_later_notice_with_a_lower_id_is_shown() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let id = related_tasks(&machine, &repo)?;
+    change(&machine, &repo, &id, "A change.")?;
+    let first = run_hook(&machine, &repo, "{}", Some("a"))?;
+    assert!(first.contains("A change."), "{first}");
+
+    let inbox = repo.join(".git/lenka-data/.runtime/inbox");
+    let Some(file) = fs::read_dir(&inbox)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+    else {
+        panic!("the inbox file exists");
+    };
+    let text = fs::read_to_string(&file)?;
+    let Some(line) = text.lines().next() else {
+        panic!("the inbox has a notice");
+    };
+    let mut later: Value = serde_json::from_str(line)?;
+    later["id"] = json!("00000000-0000-7000-8000-000000000001");
+    later["reason"] = json!("A later write.");
+    fs::write(&file, format!("{text}{later}\n"))?;
+
+    let second = run_hook(&machine, &repo, "{}", Some("a"))?;
+    assert!(second.contains("A later write."), "{second}");
+    assert!(!second.contains("A change."), "{second}");
+    assert_eq!(run_hook(&machine, &repo, "{}", Some("a"))?, "");
+    Ok(())
+}
+
 /// A notice over the limit is not shown now, so it must come in the next call.
 #[test]
 fn a_notice_over_the_limit_comes_in_the_next_call() -> TestResult {
