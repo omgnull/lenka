@@ -19,6 +19,9 @@ pub const ACCEPTANCE: &str = "Acceptance criteria";
 
 const FENCE: &str = "+++";
 
+/// The characters that a section can have at its ends. A file from Windows has `\r\n` line ends.
+const LINE_ENDS: [char; 2] = ['\n', '\r'];
+
 /// The largest task text that lenka accepts.
 pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
@@ -234,7 +237,7 @@ impl Body {
         self.sections
             .iter()
             .find(|section| has_heading(section, heading))
-            .map(|section| section.text.trim_matches(['\n', '\r']))
+            .map(|section| section.text.trim_matches(LINE_ENDS))
     }
 
     /// Returns the headings and the texts of the sections that are not one of the fixed three.
@@ -252,7 +255,7 @@ impl Body {
                 }
                 Some((
                     heading.to_owned(),
-                    section.text.trim_matches('\n').to_owned(),
+                    section.text.trim_matches(LINE_ENDS).to_owned(),
                 ))
             })
             .collect()
@@ -261,7 +264,7 @@ impl Body {
     /// Replaces the text of a fixed section, and adds the section in the fixed order if needed.
     /// An empty text removes the section.
     pub fn set_section(&mut self, heading: &str, text: &str) {
-        let trimmed = text.trim_matches('\n');
+        let trimmed = text.trim_matches(LINE_ENDS);
         let position = self
             .sections
             .iter()
@@ -275,6 +278,10 @@ impl Body {
         let stored = format!("{trimmed}\n\n");
         if let Some(position) = position {
             let section = &mut self.sections[position];
+            // The same text keeps its bytes, also its line ends.
+            if section.text.trim_matches(LINE_ENDS) == trimmed {
+                return;
+            }
             if !section.heading_line.ends_with('\n') {
                 section.heading_line.push('\n');
             }
@@ -663,8 +670,15 @@ mod tests {
 
     #[test]
     fn a_section_has_no_line_end_characters_at_its_ends() {
-        let body = Body::parse("## Description\r\nLine\r\n\r\n");
+        let text = "## Description\r\nLine\r\n\r\n## Notes\r\nNote\r\n\r\n";
+        let mut body = Body::parse(text);
         assert_eq!(body.section(DESCRIPTION), Some("Line"));
+        let others = body.other_sections();
+        assert_eq!(others, [("Notes".to_owned(), "Note".to_owned())]);
+        body.set_section(DESCRIPTION, "Line");
+        assert_eq!(body.to_text(), text);
+        body.set_section(DESCRIPTION, "New");
+        assert_eq!(body.section(DESCRIPTION), Some("New"));
     }
 
     const SAMPLE: &str = "\
