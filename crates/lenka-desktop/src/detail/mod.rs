@@ -62,6 +62,8 @@ pub(crate) enum Problem {
     Secret {
         message: String,
         patch: Box<TaskPatch>,
+        /// The text that the check read. A person accepts only this text.
+        checked: Draft,
     },
     /// Another error.
     Error(String),
@@ -226,6 +228,11 @@ impl DetailState {
     /// Tells if a draft differs from the loaded task.
     pub(crate) fn is_dirty(&self) -> bool {
         self.draft != Draft::of(&self.data)
+    }
+
+    /// Tells if a close of the panel would lose text of the person.
+    pub(crate) fn has_unsaved_text(&self) -> bool {
+        self.is_dirty() || !self.entry_text.trim().is_empty()
     }
 
     /// Tells if the task has a newer version than the base of the drafts.

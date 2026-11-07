@@ -243,6 +243,31 @@ impl ProjectConfig {
         toml::to_string_pretty(self)
             .map_err(|err| LenkaError::invalid_file(format!("lenka.toml: {err}")))
     }
+
+    /// Formats the settings, and keeps the tables of an old file that this type does not know.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidFile`] if the settings cannot be formatted or the old text is
+    /// not valid TOML.
+    pub fn to_text_over(&self, old: &str) -> Result<String> {
+        let invalid =
+            |err: &dyn std::fmt::Display| LenkaError::invalid_file(format!("lenka.toml: {err}"));
+        let text = self.to_text()?;
+        let mut table: toml::Table = text.parse().map_err(|err| invalid(&err))?;
+        let old: toml::Table = old.parse().map_err(|err| invalid(&err))?;
+        let mut kept = false;
+        for (key, value) in old {
+            if !table.contains_key(&key) {
+                table.insert(key, value);
+                kept = true;
+            }
+        }
+        if !kept {
+            return Ok(text);
+        }
+        toml::to_string_pretty(&table).map_err(|err| invalid(&err))
+    }
 }
 
 /// One project in the user project list.

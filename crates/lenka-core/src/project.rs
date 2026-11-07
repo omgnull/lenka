@@ -184,6 +184,43 @@ impl Project {
         }
     }
 
+    /// Saves settings that a person edited from `base`.
+    ///
+    /// A change of the file after the load of `base` stops the save, because the save would
+    /// overwrite this change. Tables that this version does not know stay in the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::StaleVersion`] if the file differs from `base`, or an error if the
+    /// settings are not valid or the write fails.
+    pub fn save_config_over(&self, base: &ProjectConfig, config: ProjectConfig) -> Result<()> {
+        config.validate()?;
+        self.write_locked(|locked| {
+            let path = DocPath::new(PROJECT_FILE)?;
+            let bytes = self
+                .driver
+                .read(&path)?
+                .ok_or_else(|| LenkaError::not_found("The project directory has no lenka.toml."))?;
+            let old = String::from_utf8(bytes)
+                .map_err(|_| LenkaError::invalid_file("lenka.toml is not valid UTF-8."))?;
+            if ProjectConfig::parse(&old)? != *base {
+                return Err(LenkaError::new(
+                    ErrorCode::StaleVersion,
+                    "Another writer changed lenka.toml after these settings loaded.",
+                ));
+            }
+            locked.commit(&Commit {
+                ops: vec![Op::Put {
+                    path: PROJECT_FILE.to_owned(),
+                    text: config.to_text_over(&old)?,
+                }],
+                ..Commit::default()
+            })
+        })?;
+        *lock(&self.config) = Arc::new(config);
+        Ok(())
+    }
+
     /// Saves new settings through the journal.
     ///
     /// # Errors

@@ -58,6 +58,10 @@ pub(crate) enum View {
 pub(crate) enum Action {
     Select(TaskId),
     CloseDetail,
+    /// Opens another project at the end of the frame, because the views of a frame use the rows
+    /// of one project.
+    OpenProject(String),
+    ReloadSettings,
     /// A drop on a board column, or a choice in the status field.
     MoveTo {
         id: TaskId,

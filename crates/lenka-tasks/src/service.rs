@@ -1902,6 +1902,8 @@ impl TaskService {
             state.stage = stages[next].name.clone();
             state.unblocked = unblocked;
             state.status = Status::InProgress;
+            // A stage change by a person is an action that the loop limit waits for.
+            state.loop_stopped = state.loop_stopped && caller.actor != Actor::Human;
             let entry = Entry {
                 id: EntryId::generate(),
                 kind: EntryKind::Evidence,
@@ -1916,6 +1918,11 @@ impl TaskService {
                 format!("{}/state.toml", root_of(id)),
                 toml_text(&state)?,
             ));
+            if meta.state.loop_stopped && !state.loop_stopped {
+                ops.push(Op::Remove {
+                    path: loops_path(&id.to_string()),
+                });
+            }
             ops.push(Op::Remove {
                 path: claim_path(id),
             });

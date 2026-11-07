@@ -56,13 +56,16 @@ impl Fixture {
 
     /// Builds a host on the paths. Two hosts act as two processes.
     pub(crate) fn host(&self) -> Host {
+        self.host_builder().build().expect("a host")
+    }
+
+    /// Returns a builder with the plugins of a host, so that a test can add a plugin.
+    pub(crate) fn host_builder(&self) -> Builder {
         Builder::new()
             .plugin(lenka_driver_local::plugin())
             .plugin(lenka_artifact_fs::plugin())
             .plugin(lenka_tasks::plugin())
             .paths(self.paths.clone())
-            .build()
-            .expect("a host")
     }
 
     fn caller(&self, actor: Actor, label: &str, directory: &str) -> Caller {
@@ -133,8 +136,30 @@ pub(crate) fn start_with(
     theme: Theme,
     change: impl FnOnce(&mut egui_kittest::HarnessBuilder<TestApp>),
 ) -> Harness<'static, TestApp> {
+    start_full(fixture, fixture.host(), size, theme, change)
+}
+
+/// Starts the real UI on a host with other plugins.
+pub(crate) fn start_on_host(
+    fixture: &Arc<Fixture>,
+    host: Host,
+    size: Vec2,
+    theme: Theme,
+) -> Harness<'static, TestApp> {
+    start_full(fixture, host, size, theme, |builder| {
+        *builder = std::mem::take(builder).allow_missing_glyphs();
+    })
+}
+
+fn start_full(
+    fixture: &Arc<Fixture>,
+    host: Host,
+    size: Vec2,
+    theme: Theme,
+    change: impl FnOnce(&mut egui_kittest::HarnessBuilder<TestApp>),
+) -> Harness<'static, TestApp> {
     let state = TestApp {
-        start: Some((fixture.host(), fixture.person())),
+        start: Some((host, fixture.person())),
         app: None,
         _keep: Arc::clone(fixture),
     };

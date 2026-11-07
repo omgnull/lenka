@@ -43,8 +43,23 @@ pub struct Created {
     pub name: String,
     /// The data directory.
     pub directory: PathBuf,
-    /// The clone file that lists the project.
-    pub clone_file: PathBuf,
+    /// The clone file that lists the project, if the caller asked for one.
+    pub clone_file: Option<PathBuf>,
+    /// The reason that the project has no clone file, after [`Attach::IfPossible`].
+    pub attach_warning: Option<String>,
+}
+
+/// Tells if a new project connects to the directory of the caller.
+///
+/// An agent in a connected directory, or in a directory below it, uses the project by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attach {
+    /// Connect the directory. A failure is an error.
+    Required,
+    /// Connect the directory. A failure gives a warning, and the project stays.
+    IfPossible,
+    /// Do not connect the directory.
+    Never,
 }
 
 /// The clone file for a directory: in the Git common directory, or next to the directory.
@@ -66,10 +81,44 @@ pub fn find_clone_file(start: &Path) -> Option<PathBuf> {
         return file.is_file().then_some(file);
     }
     let start = gitdir::real_path(start).ok()?;
-    start
-        .ancestors()
-        .map(|dir| dir.join(PLAIN_CLONE_FILE))
-        .find(|file| file.is_file())
+    find_plain_clone_file(&start, std::env::home_dir().as_deref())
+}
+
+/// Searches a plain directory and its parents. A file in the home directory applies only to the
+/// home directory, because all projects of a user are below it.
+fn find_plain_clone_file(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home.and_then(|home| gitdir::real_path(home).ok());
+    for dir in start.ancestors() {
+        if home.as_deref() == Some(dir) && dir != start {
+            return None;
+        }
+        let file = dir.join(PLAIN_CLONE_FILE);
+        if file.is_file() {
+            return Some(file);
+        }
+    }
+    None
+}
+
+/// Tells if a directory is in a Git clone.
+#[must_use]
+pub fn in_git_clone(dir: &Path) -> bool {
+    gitdir::locate(dir).is_some()
+}
+
+/// Returns the storage driver of the project in a directory. A directory with no project gives
+/// `None`.
+///
+/// # Errors
+///
+/// Returns an error if the settings file cannot be read or is not valid.
+pub fn project_driver_in(directory: &Path) -> Result<Option<String>> {
+    let file = directory.join(PROJECT_FILE);
+    if !file.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&file).map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
+    Ok(Some(ProjectConfig::parse(&text)?.storage.driver))
 }
 
 /// Returns the default project name of a directory: the name of the Git worktree or the directory.
@@ -121,6 +170,21 @@ pub fn create_project(
     name: Option<&str>,
     location: &Location,
 ) -> Result<Created> {
+    create_project_with(paths, cwd, name, location, Attach::Required)
+}
+
+/// Creates a project, with a choice about the connection to the current directory.
+///
+/// # Errors
+///
+/// Returns an error if the name is taken, the directory already holds a project, or a write fails.
+pub fn create_project_with(
+    paths: &Paths,
+    cwd: &Path,
+    name: Option<&str>,
+    location: &Location,
+    attach: Attach,
+) -> Result<Created> {
     let name = name.map_or_else(|| default_name(cwd), str::to_owned);
     validate_project_name(&name)?;
     let directory = match location {
@@ -136,7 +200,7 @@ pub fn create_project(
         && entry.directory != directory
     {
         return Err(LenkaError::invalid_argument(format!(
-            "The project name {name} is already in use at another directory. Select another name with --name."
+            "The project name {name} is already in use at another directory. Select another name."
         )));
     }
     let settings_file = directory.join(PROJECT_FILE);
@@ -163,11 +227,26 @@ pub fn create_project(
         },
     );
     projects.save(paths)?;
-    let clone_file = attach_to_clone(cwd, &name)?;
+    let (clone_file, attach_warning) = match attach {
+        Attach::Never => (None, None),
+        Attach::Required => (Some(attach_to_clone(cwd, &name)?), None),
+        Attach::IfPossible => match attach_to_clone(cwd, &name) {
+            Ok(file) => (Some(file), None),
+            Err(error) => (
+                None,
+                Some(format!(
+                    "lenka created the project, but cannot connect {} to it. {}",
+                    cwd.display(),
+                    error.message()
+                )),
+            ),
+        },
+    };
     Ok(Created {
         name,
         directory,
         clone_file,
+        attach_warning,
     })
 }
 
@@ -233,7 +312,8 @@ pub fn register_existing(
     Ok(Created {
         name,
         directory: directory.to_path_buf(),
-        clone_file,
+        clone_file: Some(clone_file),
+        attach_warning: None,
     })
 }
 
@@ -318,6 +398,29 @@ pub fn caller_for(cwd: &Path, setup: CallerSetup) -> Result<Caller> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clone_file_in_the_home_directory_stops_at_the_home_directory() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let home = gitdir::real_path(temp.path()).map_err(|err| LenkaError::io("path", &err))?;
+        let below = home.join("code/deep");
+        fs::create_dir_all(&below).map_err(|err| LenkaError::io("mkdir", &err))?;
+        let file = home.join(PLAIN_CLONE_FILE);
+        fs::write(&file, "projects = []\n").map_err(|err| LenkaError::io("write", &err))?;
+        assert_eq!(find_plain_clone_file(&below, Some(home.as_path())), None);
+        assert_eq!(
+            find_plain_clone_file(&home, Some(home.as_path())),
+            Some(file.clone())
+        );
+        assert_eq!(find_plain_clone_file(&below, None), Some(file));
+        let code_file = home.join("code").join(PLAIN_CLONE_FILE);
+        fs::write(&code_file, "projects = []\n").map_err(|err| LenkaError::io("write", &err))?;
+        assert_eq!(
+            find_plain_clone_file(&below, Some(home.as_path())),
+            Some(code_file)
+        );
+        Ok(())
+    }
 
     fn setup(actor: Actor, agent: Option<&str>) -> CallerSetup {
         CallerSetup {

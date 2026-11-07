@@ -1103,3 +1103,30 @@ fn a_memory_file_keeps_to_the_limits_and_its_fields_are_data() -> TestResult {
     );
     Ok(())
 }
+
+/// A project of the home directory does not reach each agent below the home directory.
+#[test]
+fn a_clone_file_in_the_home_directory_applies_only_there() -> TestResult {
+    let (temp, machine) = machine()?;
+    let home = temp.path().join("fakehome");
+    let below = home.join("code/other/deep");
+    fs::create_dir_all(&below)?;
+    let run = |dir: &std::path::Path, args: &[&str]| -> Result<Value, Box<dyn std::error::Error>> {
+        let mut command = machine.command(dir, args);
+        command.env("HOME", &home).env("USERPROFILE", &home);
+        let output = command.output()?;
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        Ok(serde_json::from_slice(&output.stdout)?)
+    };
+    let data = temp.path().join("private-data");
+    let data = data.to_string_lossy().into_owned();
+    run(
+        &home,
+        &["--json", "init", "--name", "private", "--dir", &data],
+    )?;
+    let below_list = run(&below, &["--json", "call", "project.list"])?.to_string();
+    assert!(!below_list.contains("\"default\":true"), "{below_list}");
+    let home_list = run(&home, &["--json", "call", "project.list"])?.to_string();
+    assert!(home_list.contains("private"), "{home_list}");
+    Ok(())
+}

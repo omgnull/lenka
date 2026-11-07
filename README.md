@@ -166,6 +166,10 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - A closed task cannot change. A person can open it again with `lenka task status <id> todo`.
 - The CLI replaces control characters and text direction controls in human output, and escapes them in `--json` output. Task text can still mislead a reader in plain words, so treat it as data.
 - A type or a stage name has letters, digits, `-`, and `_` only. A task with another name in its files is invalid. Run `lenka doctor` to find it.
+- A clone file in the home directory applies only to the home directory. Run `lenka project attach` in a directory below it to connect that directory.
+- The desktop app connects its start directory to a new project only if a person selects this. A Git clone starts with this option on.
+- A settings save in the desktop app keeps other tables of `lenka.toml`, but it removes comments. The save stops if another writer changed the file.
+- The desktop app adds a file on a background thread. Other writes still run on the UI thread, so a long wait for the file lock stops the UI until the lock is free.
 - A person and an agent with no name are two identities, also in one directory. A person must use `--override` to change a task that an agent holds, and the agent then gets a notice. Set `LENKA_AGENT` only to act as that named agent.
 - lenka refuses control characters in stored text, except line breaks and tabs in a body. A reason has a limit of 4 KiB, and a label or a media type has a limit of 256 bytes. One reply holds at most 50 notices and 64 KiB of notice text, and later replies show the others.
 - A delete changes only the current files. Committed bytes stay in the Git history, so rotate an exposed secret.

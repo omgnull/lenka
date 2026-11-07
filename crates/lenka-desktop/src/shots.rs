@@ -435,8 +435,10 @@ fn shoot_theme(fixture: &Arc<Fixture>, sample: &Sample, dir: &Path, theme: Theme
     harness.state_mut().app_mut().dialog = None;
     harness.run_ok();
 
-    harness.state_mut().app_mut().dialog =
-        Some(Dialog::NewProject(NewProjectForm::new(&fixture.host())));
+    harness.state_mut().app_mut().dialog = Some(Dialog::NewProject(NewProjectForm::new(
+        &fixture.host(),
+        &fixture.root,
+    )));
     harness.run_ok();
     save(&mut harness, dir, &format!("new-project-{suffix}"));
     harness.state_mut().app_mut().dialog = None;

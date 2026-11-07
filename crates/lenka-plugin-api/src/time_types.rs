@@ -5,7 +5,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
-use time::macros::format_description;
+use time::macros::{date, format_description};
 use time::{Date, OffsetDateTime, UtcOffset};
 
 use crate::error::{LenkaError, Result};
@@ -93,6 +93,11 @@ impl From<Timestamp> for String {
 #[serde(try_from = "String", into = "String")]
 pub struct Day(Date);
 
+/// The day number of the first day that the text form can show.
+const FIRST_DAY_NUMBER: i32 = date!(0000 - 01 - 01).to_julian_day();
+/// The day number of the last day that the text form can show.
+const LAST_DAY_NUMBER: i32 = date!(9999 - 12 - 31).to_julian_day();
+
 impl Day {
     /// Parses the `YYYY-MM-DD` form.
     ///
@@ -100,9 +105,13 @@ impl Day {
     ///
     /// Returns [`crate::ErrorCode::InvalidArgument`] if the text is not valid.
     pub fn parse(text: &str) -> Result<Self> {
+        // Only the years 0 to 9999 have four digits, and each saved day must parse again.
         Date::parse(text, format_description!("[year]-[month]-[day]"))
+            .ok()
+            .filter(|date| date.year() >= 0)
             .map(Self)
-            .map_err(|_| LenkaError::invalid_argument("A date must have the form YYYY-MM-DD."))
+            .filter(|day| day.to_string() == text)
+            .ok_or_else(|| LenkaError::invalid_argument("A date must have the form YYYY-MM-DD."))
     }
 
     /// Returns today in UTC.
@@ -117,9 +126,11 @@ impl Day {
         self.0.to_julian_day()
     }
 
-    /// Creates a day from a day number. An out-of-range number gives the Unix epoch day.
+    /// Creates a day from a day number. A number outside the years 0 to 9999 gives the nearest
+    /// day in these years.
     #[must_use]
     pub fn from_number(number: i32) -> Self {
+        let number = number.clamp(FIRST_DAY_NUMBER, LAST_DAY_NUMBER);
         Self(Date::from_julian_day(number).unwrap_or(OffsetDateTime::UNIX_EPOCH.date()))
     }
 
@@ -182,6 +193,30 @@ mod tests {
     fn timestamp_round_trip() {
         let value = Timestamp::from_unix_ms(1_793_000_000_123);
         assert_eq!(Timestamp::parse(&value.to_string()).ok(), Some(value));
+    }
+
+    #[test]
+    fn each_valid_day_can_be_read_again() {
+        for bad in [
+            "-0001-01-01",
+            "-0999-12-31",
+            "-1000-01-01",
+            "-001-01-01",
+            "+0001-01-01",
+        ] {
+            assert!(Day::parse(bad).is_err(), "{bad}");
+        }
+        for good in ["0000-01-01", "0001-02-03", "9999-12-31"] {
+            let day = Day::parse(good).expect("a valid day");
+            assert_eq!(day.to_string(), good);
+            assert_eq!(Day::from_number(day.number()), day);
+        }
+    }
+
+    #[test]
+    fn a_day_number_outside_the_years_gives_the_nearest_day() {
+        assert_eq!(Day::from_number(i32::MAX).to_string(), "9999-12-31");
+        assert_eq!(Day::from_number(i32::MIN).to_string(), "0000-01-01");
     }
 
     #[test]

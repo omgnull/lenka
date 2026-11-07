@@ -155,11 +155,14 @@ fn browse_fills_the_path_and_the_project_uses_it() {
         "Select a directory in the folder dialog."
     ));
 
+    // A good selection ends the error of an earlier path.
+    project_form(&mut harness).error = Some(crate::dialogs::FormError::text("An old error."));
     let selected = fixture.root.join("chosen");
     pending.finish(FolderPick::Selected(selected.clone()));
     harness.run();
     let form = project_form(&mut harness);
     assert!(form.pending.is_none());
+    assert!(form.error.is_none());
     assert_eq!(form.directory, selected.display().to_string());
 
     click(&mut harness, "Create project");
@@ -1213,6 +1216,18 @@ fn a_file_path_becomes_an_artifact_of_the_task() {
     click(&mut harness, "Artifacts");
     type_into(&mut harness, "File path", &path.display().to_string());
     click(&mut harness, "Add file");
+    wait_until(&mut harness, "the file is linked", |harness| {
+        let session = harness.state().app().session.as_ref().expect("a session");
+        !session
+            .tasks
+            .detail(ids[0], &[])
+            .expect("detail")
+            .meta
+            .front
+            .artifacts
+            .is_empty()
+    });
+    harness.run();
     let (_host, tasks) = fixture.other_process();
     let detail = tasks.detail(ids[0], &[]).expect("detail");
     assert_eq!(detail.meta.front.artifacts.len(), 1);
@@ -1396,4 +1411,644 @@ fn the_secret_policy_of_a_comment_needs_a_person() {
         tasks.add_entry(&fixture.agent(), ids[0], new).is_err(),
         "an agent cannot use the override"
     );
+}
+
+/// Starts the UI on a project with three tasks, with a second project with one task.
+fn start_with_two_projects() -> (Arc<Fixture>, Harness<'static, TestApp>) {
+    let fixture = Arc::new(Fixture::with_project());
+    let (_host, tasks) = fixture.other_process();
+    let person = fixture.person();
+    for title in ["First", "Second", "Third"] {
+        tasks.create(&person, new_task(title)).expect("a task");
+    }
+    let created = lenka_core::init::create_project(
+        &fixture.paths,
+        &fixture.root.join("small-work"),
+        Some("small"),
+        &lenka_core::init::Location::Shared,
+    )
+    .expect("a project");
+    assert_eq!(created.name, "small");
+    let host = fixture.host();
+    let project = host.open_by_name("small").expect("the project");
+    lenka_tasks::service_of(&project)
+        .expect("tasks")
+        .create(&person, new_task("Only"))
+        .expect("a task");
+    let harness = start(&fixture, SIZE, Theme::Light);
+    (fixture, harness)
+}
+
+fn select_project(harness: &mut Harness<'_, TestApp>, name: &str) {
+    click(harness, "Project");
+    click(harness, name);
+}
+
+fn open_project_name(harness: &Harness<'_, TestApp>) -> String {
+    let session = harness.state().app().session.as_ref().expect("a session");
+    session.name.clone()
+}
+
+#[test]
+fn a_switch_to_a_smaller_project_does_not_panic_in_any_view() {
+    let (_fixture, mut harness) = start_with_two_projects();
+    assert_eq!(open_project_name(&harness), crate::test_support::PROJECT);
+    for view in [View::Board, View::Tree, View::Gantt] {
+        harness.state_mut().app_mut().view = view;
+        harness.run();
+        select_project(&mut harness, "small");
+        assert_eq!(open_project_name(&harness), "small");
+        select_project(&mut harness, crate::test_support::PROJECT);
+        assert_eq!(open_project_name(&harness), crate::test_support::PROJECT);
+    }
+}
+
+#[test]
+fn a_project_switch_asks_before_it_loses_text() {
+    let (_fixture, mut harness) = start_with_two_projects();
+    open_detail(&mut harness, "First");
+    type_into(&mut harness, "Description", " Unsaved.");
+    select_project(&mut harness, "small");
+    assert_eq!(open_project_name(&harness), crate::test_support::PROJECT);
+    click(&mut harness, "Cancel");
+    let detail = harness.state().app().detail.as_ref().expect("the panel");
+    assert!(detail.draft.description.contains("Unsaved."));
+    select_project(&mut harness, "small");
+    click(&mut harness, "Discard and continue");
+    assert_eq!(open_project_name(&harness), "small");
+}
+
+#[test]
+fn a_close_of_the_panel_asks_before_it_loses_text() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    open_detail(&mut harness, "Write the parser");
+    type_into(&mut harness, "Description", " Unsaved.");
+    click(&mut harness, "Close");
+    assert!(harness.state().app().detail.is_some());
+    click(&mut harness, "Discard and continue");
+    assert!(harness.state().app().detail.is_none());
+}
+
+#[test]
+fn a_close_of_the_window_asks_before_it_loses_text() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    let close_request = |harness: &mut Harness<'_, TestApp>| {
+        harness
+            .input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+    };
+    close_request(&mut harness);
+    harness.step();
+    assert!(
+        harness.state().app().dialog.is_none(),
+        "no text, no question"
+    );
+
+    open_detail(&mut harness, "Write the parser");
+    type_into(&mut harness, "Description", " Unsaved.");
+    close_request(&mut harness);
+    harness.step();
+    let cancelled = harness
+        .output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .is_some_and(|output| {
+            output
+                .commands
+                .contains(&egui::ViewportCommand::CancelClose)
+        });
+    assert!(cancelled);
+    harness.run();
+    assert!(matches!(
+        harness.state().app().dialog,
+        Some(Dialog::Unsaved(crate::dialogs::AfterUnsaved::CloseWindow))
+    ));
+}
+
+#[test]
+fn a_task_that_another_writer_deletes_keeps_the_text_on_the_screen() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser", "Other"]);
+    open_detail(&mut harness, "Write the parser");
+    type_into(&mut harness, "Description", " Unsaved.");
+    let (_host, tasks) = fixture.other_process();
+    tasks.delete(&fixture.person(), ids[0]).expect("a delete");
+    wait_until(&mut harness, "the task leaves the board", |harness| {
+        harness.query_by_label("Other").is_some()
+            && harness.query_by_label("Write the parser").is_none()
+    });
+    harness.run();
+    let detail = harness
+        .state()
+        .app()
+        .detail
+        .as_ref()
+        .expect("the panel stays");
+    assert!(detail.draft.description.contains("Unsaved."));
+    assert!(
+        harness
+            .query_by_label_contains("deleted this task")
+            .is_some()
+    );
+
+    // With no text, the panel closes.
+    let (fixture2, mut harness2, ids2) = start_with_tasks(&["Clean", "Other"]);
+    open_detail(&mut harness2, "Clean");
+    let (_host, tasks) = fixture2.other_process();
+    tasks.delete(&fixture2.person(), ids2[0]).expect("a delete");
+    wait_until(&mut harness2, "the panel closes", |harness| {
+        harness.state().app().detail.is_none()
+    });
+}
+
+#[test]
+fn a_project_that_cannot_open_keeps_the_open_project() {
+    let (fixture, mut harness) = start_with_two_projects();
+    let directory = fixture.paths.shared_project_dir("small");
+    std::fs::remove_dir_all(&directory).expect("a remove");
+    open_detail(&mut harness, "First");
+    select_project(&mut harness, "small");
+    assert_eq!(open_project_name(&harness), crate::test_support::PROJECT);
+    assert!(harness.state().app().detail.is_some());
+    assert!(!harness.state().app().banners.is_empty());
+}
+
+#[test]
+fn save_with_this_value_saves_only_the_text_that_the_check_read() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_detail(&mut harness, "Write the parser");
+    let secret = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    let saved = |fixture: &Fixture| {
+        let (_host, tasks) = fixture.other_process();
+        tasks.detail(ids[0], &[]).expect("detail").description
+    };
+    type_into(&mut harness, "Description", &format!(" {secret}"));
+    click(&mut harness, "Save");
+    type_into(&mut harness, "Reason", "Add a value");
+    click(&mut harness, "Save with reason");
+    assert!(has_label(&harness, "Save with this value"));
+
+    // The person removes the value, and then selects the old choice.
+    harness
+        .state_mut()
+        .app_mut()
+        .detail
+        .as_mut()
+        .expect("the panel")
+        .draft
+        .description = "A clean text.".to_owned();
+    harness.run();
+    click(&mut harness, "Save with this value");
+    if harness.state().app().dialog.is_some() {
+        type_into(&mut harness, "Reason", "A clean text");
+        click(&mut harness, "Save with reason");
+    }
+    assert!(
+        saved(&fixture).contains("A clean text."),
+        "{}",
+        saved(&fixture)
+    );
+    assert!(!saved(&fixture).contains(secret));
+
+    // A new value needs a new choice.
+    type_into(&mut harness, "Description", &format!(" {secret}"));
+    click(&mut harness, "Save");
+    type_into(&mut harness, "Reason", "Add a value");
+    click(&mut harness, "Save with reason");
+    let detail = harness
+        .state_mut()
+        .app_mut()
+        .detail
+        .as_mut()
+        .expect("the panel");
+    detail.draft.description.push_str(" More.");
+    harness.run();
+    click(&mut harness, "Save with this value");
+    if harness.state().app().dialog.is_some() {
+        type_into(&mut harness, "Reason", "Add more");
+        click(&mut harness, "Save with reason");
+    }
+    assert!(!saved(&fixture).contains(secret), "the check runs again");
+    assert!(has_label(&harness, "Save with this value"));
+}
+
+#[test]
+fn a_failed_link_removes_the_new_artifact() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let path = fixture.root.join("notes.txt");
+    std::fs::write(&path, "Some notes").expect("a file");
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Artifacts");
+    type_into(&mut harness, "File path", &path.display().to_string());
+    // A closed task refuses the link.
+    let (host, tasks) = fixture.other_process();
+    tasks
+        .set_status(
+            &fixture.person(),
+            ids[0],
+            Status::Cancelled,
+            &ClaimRef::Implicit,
+        )
+        .expect("a status");
+    click(&mut harness, "Add file");
+    wait_until(&mut harness, "the banner shows", |harness| {
+        harness
+            .state()
+            .app()
+            .banners
+            .iter()
+            .any(|text| text.contains("removed the new artifact"))
+    });
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let list = artifacts_of(&project)
+        .expect("artifacts")
+        .list()
+        .expect("a list");
+    assert!(list.is_empty(), "{list:?}");
+}
+
+#[test]
+fn a_cancelled_override_removes_the_new_artifact() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let path = fixture.root.join("notes.txt");
+    std::fs::write(&path, "Some notes").expect("a file");
+    let (host, tasks) = fixture.other_process();
+    tasks
+        .claim(&fixture.agent(), Some(ids[0]), None, None)
+        .expect("a claim");
+    wait_until(&mut harness, "the claim shows", |harness| {
+        let session = harness.state().app().session.as_ref().expect("a session");
+        session
+            .model
+            .row(ids[0])
+            .is_some_and(|row| row.claimed_by.is_some())
+    });
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Artifacts");
+    type_into(&mut harness, "File path", &path.display().to_string());
+    click(&mut harness, "Add file");
+    wait_until(&mut harness, "the question shows", |harness| {
+        matches!(harness.state().app().dialog, Some(Dialog::Confirm { .. }))
+    });
+    harness.run();
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let store = artifacts_of(&project).expect("artifacts");
+    assert_eq!(store.list().expect("a list").len(), 1);
+    click(&mut harness, "Cancel");
+    assert!(store.list().expect("a list").is_empty());
+}
+
+#[test]
+fn a_failed_link_of_a_new_drawing_keeps_the_drawing_unsaved() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    open_new_drawing(&mut harness);
+    draw_rectangle(&mut harness);
+    let (_host, tasks) = fixture.other_process();
+    tasks
+        .set_status(
+            &fixture.person(),
+            ids[0],
+            Status::Cancelled,
+            &ClaimRef::Implicit,
+        )
+        .expect("a status");
+    click(&mut harness, "Save drawing");
+    let board = harness.state().app().drawing.as_ref().expect("the board");
+    assert!(board.artifact.is_none());
+    assert!(board.is_dirty());
+    assert_eq!(shapes_of(&harness).len(), 1);
+}
+
+#[test]
+fn a_refused_stage_completion_changes_nothing() {
+    let fixture = Arc::new(Fixture::with_project());
+    let (host, tasks) = fixture.other_process();
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    let mut config = (*project.config()).clone();
+    let stage = |name: &str| Stage {
+        name: name.to_owned(),
+        actor: Actor::Any,
+        unblocks: false,
+    };
+    config.types.insert(
+        "task".to_owned(),
+        TypeDef {
+            stages: vec![stage("build"), stage("review")],
+        },
+    );
+    project.save_config(config).expect("settings");
+    let id = tasks
+        .create(&fixture.person(), new_task("Write the parser"))
+        .expect("a task")
+        .id();
+    tasks
+        .set_status(&fixture.person(), id, Status::Backlog, &ClaimRef::Implicit)
+        .expect("a status");
+    let mut harness = start(&fixture, SIZE, Theme::Light);
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Complete stage");
+    let secret = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    type_into(&mut harness, "Evidence", secret);
+    click(&mut harness, "Complete the stage");
+    assert!(harness.state().app().dialog.is_some(), "the form stays");
+    assert_eq!(status_of(&fixture, id), Status::Backlog);
+    let (_other_host, other) = fixture.other_process();
+    assert!(other.detail(id, &[]).expect("detail").claim.is_none());
+}
+
+#[test]
+fn a_settings_save_stops_after_another_change_and_keeps_other_tables() {
+    let (fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    click(&mut harness, "Settings");
+    click(&mut harness, "Agents can use the delete tools");
+    let file = fixture
+        .paths
+        .shared_project_dir(crate::test_support::PROJECT)
+        .join("lenka.toml");
+    let old = std::fs::read_to_string(&file).expect("the file");
+    let edited = old.replace("agent_delete = true", "agent_delete = false");
+    assert_ne!(edited, old);
+    std::fs::write(&file, format!("{edited}\n[custom]\nkey = \"value\"\n")).expect("a write");
+    click(&mut harness, "Save settings");
+    assert!(
+        harness
+            .query_by_label_contains("Another writer changed lenka.toml")
+            .is_some(),
+        "the save stops"
+    );
+    let text = std::fs::read_to_string(&file).expect("the file");
+    assert!(text.contains("[custom]"), "{text}");
+
+    click(&mut harness, "Load the file and lose my changes");
+    assert!(harness.query_by_label_contains("Another writer").is_none());
+    click(&mut harness, "Agents can use the delete tools");
+    click(&mut harness, "Save settings");
+    assert!(has_label(&harness, "Saved"), "a new load can save");
+    let text = std::fs::read_to_string(&file).expect("the file");
+    assert!(text.contains("[custom]"), "another table stays: {text}");
+    assert!(text.contains("key = \"value\""), "{text}");
+}
+
+#[test]
+fn the_dialog_connects_a_plain_directory_only_if_the_person_selects_this() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    assert!(
+        !project_form(&mut harness).attach,
+        "a plain directory starts with no connection"
+    );
+    let start = project_form(&mut harness).start_directory.clone();
+    type_into(&mut harness, "Project name", "private");
+    click(&mut harness, "Create project");
+    assert_eq!(open_project_name(&harness), "private");
+    assert!(lenka_core::init::find_clone_file(&start).is_none());
+    assert!(lenka_core::init::find_clone_file(&start.join("below")).is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_start_directory_gives_a_warning_and_the_project_opens() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    let start = project_form(&mut harness).start_directory.clone();
+    std::fs::create_dir_all(&start).expect("a directory");
+    std::fs::set_permissions(&start, std::fs::Permissions::from_mode(0o555)).expect("a mode");
+    project_form(&mut harness).attach = true;
+    type_into(&mut harness, "Project name", "api");
+    click(&mut harness, "Create project");
+    std::fs::set_permissions(&start, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+    assert!(harness.state().app().dialog.is_none());
+    assert_eq!(open_project_name(&harness), "api");
+    let banners = &harness.state().app().banners;
+    assert!(
+        banners.iter().any(|text| text.contains("cannot connect")),
+        "{banners:?}"
+    );
+}
+
+#[test]
+fn the_dialog_keeps_a_path_as_it_is_and_clears_an_old_error() {
+    let fixture = Arc::new(Fixture::empty());
+    let mut harness = start_new_project(&fixture);
+    type_into(&mut harness, "Project name", "api");
+    type_into(&mut harness, "Data directory", "relative");
+    click(&mut harness, "Create project");
+    assert!(project_form(&mut harness).error.is_some());
+    type_into(&mut harness, "Data directory", "x");
+    assert!(
+        project_form(&mut harness).error.is_none(),
+        "an edit clears the error"
+    );
+
+    let folder = fixture.root.join("chosen ");
+    std::fs::create_dir_all(&folder).expect("a folder");
+    project_form(&mut harness).directory = folder.display().to_string();
+    click(&mut harness, "Create project");
+    assert_eq!(open_project_name(&harness), "api");
+    assert!(
+        folder.join("lenka.toml").is_file(),
+        "the selected folder has the project"
+    );
+    assert!(!fixture.root.join("chosen").exists());
+}
+
+#[test]
+fn a_folder_with_another_driver_keeps_the_open_project_and_the_list() {
+    let (fixture, mut harness, _ids) = start_with_tasks(&["Write the parser"]);
+    let folder = fixture.root.join("foreign");
+    std::fs::create_dir_all(&folder).expect("a folder");
+    let mut config = lenka_core::ProjectConfig::new("foreign");
+    config.storage.driver = "s3".to_owned();
+    std::fs::write(folder.join("lenka.toml"), config.to_text().expect("text")).expect("a write");
+    click(&mut harness, "Project");
+    click(&mut harness, "New project");
+    type_into(&mut harness, "Project name", "foreign");
+    project_form(&mut harness).directory = folder.display().to_string();
+    click(&mut harness, "Create project");
+    let message = project_form(&mut harness)
+        .error
+        .clone()
+        .expect("an error")
+        .message;
+    assert!(message.contains("another driver"), "{message}");
+    assert_eq!(open_project_name(&harness), crate::test_support::PROJECT);
+    let list = ProjectsFile::load(&fixture.paths).expect("the list");
+    assert!(!list.projects.contains_key("foreign"));
+}
+
+#[test]
+fn a_person_sees_a_loop_stop_and_can_let_agents_continue() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let (_host, tasks) = fixture.other_process();
+    let agent = fixture.agent();
+    let id = ids[0];
+    let mut stopped = false;
+    for _ in 0..12 {
+        let version = tasks.detail(id, &[]).expect("detail").meta.state.version;
+        let patch = TaskPatch {
+            expected_version: version,
+            description: Some(format!("Text {version}")),
+            reason: Some("A retry".to_owned()),
+            ..TaskPatch::default()
+        };
+        if tasks.update(&agent, id, patch).is_err() {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "the agent reaches the limit");
+    let label = "Let agents repeat this task until it is done";
+    wait_until(&mut harness, "the task shows as paused", |harness| {
+        let session = harness.state().app().session.as_ref().expect("a session");
+        session
+            .model
+            .row(id)
+            .is_some_and(|row| row.meta.state.loop_stopped)
+    });
+    open_detail(&mut harness, "Write the parser");
+    assert!(
+        harness
+            .query_by_label_contains("loop limit stopped agents")
+            .is_some()
+    );
+    click(&mut harness, label);
+    let (_other_host, other) = fixture.other_process();
+    let state = other.detail(id, &[]).expect("detail").meta.state;
+    assert!(state.loop_until_done);
+    assert!(!state.loop_stopped);
+    assert!(other.claim(&agent, Some(id), None, None).is_ok());
+}
+
+/// A plugin that fails after each event, as a failed Git push does.
+#[derive(Debug)]
+struct FailingHook;
+
+impl lenka_core::EventHook for FailingHook {
+    fn on_event(
+        &self,
+        _project: &lenka_core::Project,
+        _event: &lenka_core::ProjectEvent,
+    ) -> lenka_plugin_api::Result<()> {
+        Err(lenka_plugin_api::LenkaError::invalid_argument(
+            "The push failed.",
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct FailingPlugin;
+
+impl lenka_core::Plugin for FailingPlugin {
+    fn info(&self) -> lenka_core::PluginInfo {
+        lenka_core::PluginInfo {
+            name: "failing",
+            description: "A plugin that fails after each event.",
+            sensitive: false,
+        }
+    }
+
+    fn register(&self, registry: &mut lenka_core::Registry) {
+        registry.hook(Arc::new(FailingHook));
+    }
+}
+
+#[test]
+fn a_warning_of_a_plugin_shows_as_a_banner() {
+    let fixture = Arc::new(Fixture::with_project());
+    let (_host, tasks) = fixture.other_process();
+    tasks
+        .create(&fixture.person(), new_task("Write the parser"))
+        .expect("a task");
+    let host = fixture
+        .host_builder()
+        .plugin(FailingPlugin)
+        .build()
+        .expect("a host");
+    let mut harness = crate::test_support::start_on_host(&fixture, host, SIZE, Theme::Light);
+    move_card(&mut harness, "Write the parser", "Done");
+    type_into(&mut harness, "Evidence", "cargo test passed");
+    click(&mut harness, "Finish task");
+    assert!(harness.state().app().dialog.is_none());
+    let banners = &harness.state().app().banners;
+    assert!(
+        banners.iter().any(|text| text.contains("The push failed.")),
+        "{banners:?}"
+    );
+}
+
+/// The list of rows can be older than the task when a file ends its slow copy.
+#[test]
+fn a_link_uses_the_newest_version_of_the_task() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let path = fixture.root.join("notes.txt");
+    std::fs::write(&path, "Some notes").expect("a file");
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Artifacts");
+    type_into(&mut harness, "File path", &path.display().to_string());
+    let session = harness.state().app().session.as_ref().expect("a session");
+    let tasks = Arc::clone(&session.tasks);
+    let patch = TaskPatch {
+        expected_version: tasks
+            .detail(ids[0], &[])
+            .expect("detail")
+            .meta
+            .state
+            .version,
+        description: Some("Another text.".to_owned()),
+        reason: Some("A change".to_owned()),
+        ..TaskPatch::default()
+    };
+    tasks
+        .update(&fixture.agent(), ids[0], patch)
+        .expect("an update");
+    click(&mut harness, "Add file");
+    wait_until(&mut harness, "the file is linked", |harness| {
+        let session = harness.state().app().session.as_ref().expect("a session");
+        !session
+            .tasks
+            .detail(ids[0], &[])
+            .expect("detail")
+            .meta
+            .front
+            .artifacts
+            .is_empty()
+    });
+}
+
+/// Another process holds the write lock, so the add of the file waits. The frames must continue.
+#[test]
+fn a_slow_file_does_not_stop_the_ui() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["Write the parser"]);
+    let path = fixture.root.join("slow.txt");
+    std::fs::write(&path, "text").expect("a file");
+    open_detail(&mut harness, "Write the parser");
+    click(&mut harness, "Artifacts");
+    type_into(&mut harness, "File path", &path.display().to_string());
+    let host = fixture.host();
+    let project = host
+        .open_by_name(crate::test_support::PROJECT)
+        .expect("project");
+    project
+        .write_locked(|_locked| {
+            click(&mut harness, "Add file");
+            assert!(has_label(&harness, "Adding a file"), "the frames continue");
+            Ok(())
+        })
+        .expect("the lock");
+    wait_until(&mut harness, "the file is done", |harness| {
+        !has_label(harness, "Adding a file")
+    });
+    let (_host, tasks) = fixture.other_process();
+    let detail = tasks.detail(ids[0], &[]).expect("detail");
+    assert_eq!(detail.meta.front.artifacts.len(), 1);
 }

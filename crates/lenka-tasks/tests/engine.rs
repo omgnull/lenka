@@ -2569,6 +2569,32 @@ fn reach_loop_limit(service: &TaskService, agent: &Caller, id: TaskId) -> Result
 }
 
 #[test]
+fn a_stage_completion_by_a_person_ends_the_loop_stop() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let mut config = (*service.project().config()).clone();
+    if let Some(def) = config.types.get_mut("task") {
+        let mut next = def.stages[0].clone();
+        next.name = "review".to_owned();
+        def.stages.push(next);
+    }
+    service.project().save_config(config)?;
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    service.advance(
+        &human,
+        id,
+        &ClaimRef::Implicit,
+        "A person checked it.",
+        None,
+    )?;
+    assert!(!service.detail(id, &[])?.meta.state.loop_stopped);
+    assert!(service.claim(&agent, Some(id), None, None).is_ok());
+    Ok(())
+}
+
+#[test]
 fn an_agent_cannot_claim_a_task_at_the_loop_limit_until_a_person_acts() -> Result<()> {
     let fx = fixture()?;
     let service = fx.project("api")?;

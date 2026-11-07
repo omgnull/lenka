@@ -3,9 +3,11 @@
 
 //! The modal dialogs. Each dialog holds its form, and the app runs its result.
 
+use std::path::{Path, PathBuf};
+
 use egui::{Button, ComboBox, RichText, ScrollArea, TextEdit, Ui};
 use lenka_core::{Host, Paths};
-use lenka_plugin_api::{Day, ErrorCode, LenkaError, TaskId};
+use lenka_plugin_api::{ArtifactId, Day, ErrorCode, LenkaError, TaskId};
 use lenka_tasks::{Priority, Status, TaskPatch};
 
 use crate::actions::TaskOp;
@@ -79,13 +81,17 @@ pub(crate) struct NewProjectForm {
     pub directory: String,
     /// The native folder dialog, while it is open.
     pub pending: Option<PendingFolder>,
+    /// The directory in which the app started.
+    pub start_directory: PathBuf,
+    /// Tells if agents in the start directory use the new project by default.
+    pub attach: bool,
     paths: Paths,
     pub error: Option<FormError>,
 }
 
 impl NewProjectForm {
     /// Creates an empty form. The local driver is the first selection.
-    pub(crate) fn new(host: &Host) -> Self {
+    pub(crate) fn new(host: &Host, start_directory: &Path) -> Self {
         let drivers = host.driver_names();
         let driver = drivers
             .iter()
@@ -99,6 +105,9 @@ impl NewProjectForm {
             driver,
             directory: String::new(),
             pending: None,
+            start_directory: start_directory.to_path_buf(),
+            // A Git clone is one project. A plain directory can hold many unrelated directories.
+            attach: lenka_core::init::in_git_clone(start_directory),
             paths: host.paths().clone(),
             error: None,
         }
@@ -177,6 +186,14 @@ impl DatesForm {
     }
 }
 
+/// The step that waits for a person to throw away unsaved work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AfterUnsaved {
+    CloseDetail,
+    OpenProject(String),
+    CloseWindow,
+}
+
 /// A modal dialog.
 #[derive(Debug, Clone)]
 pub(crate) enum Dialog {
@@ -190,7 +207,11 @@ pub(crate) enum Dialog {
     Confirm {
         message: String,
         op: TaskOp,
+        /// A new artifact that the change links. A stop of the change removes the artifact.
+        created: Option<ArtifactId>,
     },
+    /// Asks a person to throw away unsaved work before a next step.
+    Unsaved(AfterUnsaved),
     Delete {
         id: TaskId,
         title: String,
@@ -277,6 +298,11 @@ impl Dialog {
                     "Only a person can do this. lenka records your name on the change.",
                 );
                 buttons(ui, "Override and continue", None)
+            }
+            Self::Unsaved(_) => {
+                heading(ui, "Discard the unsaved work?");
+                ui.label("You have text, a drawing, or settings that lenka did not save, or a file that lenka still adds.");
+                buttons(ui, "Discard and continue", None)
             }
             Self::Delete { title, error, .. } => {
                 heading(ui, "Delete this task?");
@@ -410,6 +436,14 @@ fn show_new_project(ui: &mut Ui, form: &mut NewProjectForm) -> Outcome {
     ui.add_space(2.0);
     if form.driver == LOCAL_DRIVER {
         show_local_driver_fields(ui, form);
+        ui.checkbox(
+            &mut form.attach,
+            format!("Connect {} to this project", form.start_directory.display()),
+        );
+        caption(
+            ui,
+            "Agents in this directory and in directories below it use the project by default.",
+        );
     } else {
         ui.label("The desktop app can create a project only with the local driver.");
     }
@@ -422,12 +456,16 @@ fn show_local_driver_fields(ui: &mut Ui, form: &mut NewProjectForm) {
     apply_folder_pick(form);
     let label = caption(ui, "Data directory");
     ui.horizontal(|ui| {
-        ui.add(
-            TextEdit::singleline(&mut form.directory)
-                .hint_text("An absolute path, or empty for the default")
-                .desired_width(ui.available_width() - 80.0),
-        )
-        .labelled_by(label.id);
+        let field = ui
+            .add(
+                TextEdit::singleline(&mut form.directory)
+                    .hint_text("An absolute path, or empty for the default")
+                    .desired_width(ui.available_width() - 80.0),
+            )
+            .labelled_by(label.id);
+        if field.changed() {
+            form.error = None;
+        }
         let browse = ui.add_enabled(form.pending.is_none(), Button::new("Browse"));
         if browse.clicked() {
             form.pending = Some(folder_pick::start(ui.ctx(), &form.directory));
@@ -460,7 +498,10 @@ fn apply_folder_pick(form: &mut NewProjectForm) {
         FolderPick::Selected(path) => {
             form.pending = None;
             match path.into_os_string().into_string() {
-                Ok(text) => form.directory = text,
+                Ok(text) => {
+                    form.directory = text;
+                    form.error = None;
+                }
                 Err(_) => {
                     form.error = Some(FormError::text(
                         "The path of this directory is not valid text. Select another directory.",

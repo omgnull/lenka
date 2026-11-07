@@ -4,12 +4,14 @@
 //! The app state, the top bar, the filters, and the code that runs the requests of the views.
 
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use egui::{
-    Button, CentralPanel, ComboBox, Context, Id, Modal, Panel, RichText, Stroke, TextEdit, Ui, Vec2,
+    Button, CentralPanel, ComboBox, Context, Id, Modal, Panel, RichText, Stroke, TextEdit, Ui,
+    Vec2, ViewportCommand,
 };
 use lenka_artifacts::{DRAWING_MEDIA_TYPE, NewVersion, Source, UpdateMode};
-use lenka_core::init::{Location, create_project};
+use lenka_core::init::{Attach, Location, create_project_with, project_driver_in};
 use lenka_core::{Host, SecretPolicy};
 use lenka_plugin_api::{ArtifactId, Caller, ErrorCode, LenkaError, Result, TaskId};
 use lenka_tasks::{ClaimRef, Finish, NewEntry, NewTask, Priority, Status, TaskPatch};
@@ -19,8 +21,8 @@ use crate::board::BoardState;
 use crate::data::{TaskFilter, apply_filter};
 use crate::detail::{DetailState, Problem, Reload, Tab, has_section_heading, stage_place};
 use crate::dialogs::{
-    DatesForm, Dialog, EvidenceForm, FormError, LOCAL_DRIVER, NewProjectForm, NewTaskForm, Outcome,
-    ReasonForm, ReturnForm,
+    AfterUnsaved, DatesForm, Dialog, EvidenceForm, FormError, LOCAL_DRIVER, NewProjectForm,
+    NewTaskForm, Outcome, ReasonForm, ReturnForm,
 };
 use crate::drawing::canvas::{DrawingBoard, DrawingEvent, file_name_of};
 use crate::drawing::model::MAX_BYTES;
@@ -60,6 +62,31 @@ pub(crate) struct DesktopApp {
     pub dialog: Option<Dialog>,
     pub banners: Vec<String>,
     actions: Vec<Action>,
+    /// Files that a background thread adds, so that a large file does not stop the UI.
+    pending_files: Vec<PendingFile>,
+    /// Tells if the person accepted a close of the window with unsaved work.
+    allow_close: bool,
+}
+
+/// A file that a background thread adds as an artifact of a task.
+#[derive(Debug)]
+struct PendingFile {
+    task: TaskId,
+    result: Receiver<Result<lenka_tasks::ArtifactRecord>>,
+}
+
+/// The largest count of banners. The oldest banner goes first.
+const MAX_BANNERS: usize = 8;
+
+/// Adds a banner, unless the same banner is open.
+fn add_banner(banners: &mut Vec<String>, text: String) {
+    if banners.contains(&text) {
+        return;
+    }
+    if banners.len() >= MAX_BANNERS {
+        banners.remove(0);
+    }
+    banners.push(text);
 }
 
 /// The largest drawing file that the app reads.
@@ -91,6 +118,8 @@ impl DesktopApp {
             dialog: None,
             banners: Vec::new(),
             actions: Vec::new(),
+            pending_files: Vec::new(),
+            allow_close: false,
         };
         app.load_project_list();
         let first = project
@@ -110,16 +139,65 @@ impl DesktopApp {
     }
 
     pub(crate) fn report(&mut self, error: &LenkaError) {
-        self.banners
-            .push(format!("{} ({})", error.message(), error.code().as_str()));
+        add_banner(
+            &mut self.banners,
+            format!("{} ({})", error.message(), error.code().as_str()),
+        );
     }
 
+    /// Tells if a next step would lose the work of the person.
+    fn has_unsaved_work(&self) -> bool {
+        self.detail
+            .as_ref()
+            .is_some_and(DetailState::has_unsaved_text)
+            || self.drawing.as_ref().is_some_and(DrawingBoard::is_dirty)
+            || self.settings.is_dirty()
+            || !self.pending_files.is_empty()
+    }
+
+    /// Opens another project, after a question if the person has unsaved work.
+    fn request_project(&mut self, name: String) {
+        if self.has_unsaved_work() {
+            self.dialog = Some(Dialog::Unsaved(AfterUnsaved::OpenProject(name)));
+        } else {
+            self.actions.push(Action::OpenProject(name));
+        }
+    }
+
+    /// Stops a close of the window, and asks the person, if the close would lose work.
+    fn guard_window_close(&mut self, ctx: &Context) {
+        if self.allow_close
+            || !ctx.input(|input| input.viewport().close_requested())
+            || !self.has_unsaved_work()
+        {
+            return;
+        }
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        if self.dialog.is_none() {
+            self.dialog = Some(Dialog::Unsaved(AfterUnsaved::CloseWindow));
+        }
+    }
+
+    fn after_discard(&mut self, next: AfterUnsaved) {
+        match next {
+            AfterUnsaved::CloseDetail => self.detail = None,
+            AfterUnsaved::OpenProject(name) => {
+                self.pending_files.clear();
+                self.actions.push(Action::OpenProject(name));
+            }
+            AfterUnsaved::CloseWindow => {
+                self.allow_close = true;
+                self.ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// Opens a project. The open project stays if the new project cannot open.
     fn open_project(&mut self, name: &str) {
-        // Stop the thread of the old project before the new project opens.
-        self.session = None;
         match Session::open(&self.host, name, &self.ctx) {
             Ok(session) => {
                 self.session = Some(session);
+                self.visible.clear();
                 self.detail = None;
                 self.drawing = None;
                 self.settings.reset();
@@ -144,11 +222,33 @@ impl DesktopApp {
             return;
         };
         if let Some(message) = session.take_error() {
-            self.banners.push(message);
+            add_banner(&mut self.banners, message);
         }
         if session.has_news() {
             self.reload_all(Reload::External);
         }
+        self.finish_added_files();
+    }
+
+    /// Links the files that a background thread added. A link can open a dialog, so it waits
+    /// until the person closes the open dialog.
+    fn finish_added_files(&mut self) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let mut waiting = Vec::new();
+        for pending in std::mem::take(&mut self.pending_files) {
+            match pending.result.try_recv() {
+                Ok(Ok(record)) => self.link_artifact(pending.task, record.id),
+                Ok(Err(error)) => self.report(&error),
+                Err(TryRecvError::Empty) => waiting.push(pending),
+                Err(TryRecvError::Disconnected) => add_banner(
+                    &mut self.banners,
+                    "lenka stopped while it added a file.".to_owned(),
+                ),
+            }
+        }
+        self.pending_files.append(&mut waiting);
     }
 
     fn reload_all(&mut self, mode: Reload) {
@@ -171,7 +271,16 @@ impl DesktopApp {
             }
         }
         if gone {
-            self.detail = None;
+            // The text of a person stays on the screen, so that the person can copy it.
+            match &mut self.detail {
+                Some(detail) if detail.has_unsaved_text() => {
+                    detail.problem = Some(Problem::Error(
+                        "Another writer deleted this task, so lenka cannot save your text. Copy it, and then close the panel."
+                            .to_owned(),
+                    ));
+                }
+                _ => self.detail = None,
+            }
         }
         if mode == Reload::External
             && let Some(board) = &mut self.drawing
@@ -202,6 +311,7 @@ impl DesktopApp {
 
     /// Draws one frame.
     pub(crate) fn show(&mut self, ui: &mut Ui) {
+        self.guard_window_close(ui.ctx());
         self.poll();
         self.update_visible();
         self.dropped_files(ui.ctx());
@@ -397,13 +507,19 @@ impl DesktopApp {
                 }
                 ui.separator();
                 if ui.selectable_label(false, "New project").clicked() {
-                    self.dialog = Some(Dialog::NewProject(NewProjectForm::new(&self.host)));
+                    self.dialog = Some(Dialog::NewProject(NewProjectForm::new(
+                        &self.host,
+                        &self.caller.worktree,
+                    )));
                 }
             })
             .response
             .widget_info(|| combo_info("Project"));
         if let Some(name) = chosen {
-            self.open_project(&name);
+            self.request_project(name);
+        }
+        if !self.pending_files.is_empty() {
+            ui.label(RichText::new("Adding a file").small());
         }
     }
 
@@ -445,7 +561,7 @@ impl DesktopApp {
             ui.label(RichText::new("Create a project to store tasks, plans, and artifacts for your agents and for you.").color(palette.text_muted));
             ui.add_space(14.0);
             if primary_button(ui, "Create a project").clicked() {
-                self.dialog = Some(Dialog::NewProject(NewProjectForm::new(&self.host)));
+                self.dialog = Some(Dialog::NewProject(NewProjectForm::new(&self.host, &self.caller.worktree)));
             }
             ui.add_space(8.0);
             ui.label(RichText::new("You can also run `lenka init` in a repository.").small().color(palette.text_muted));
@@ -531,7 +647,8 @@ impl DesktopApp {
             return;
         }
         let Some(id) = self.detail.as_ref().map(|detail| detail.id) else {
-            self.banners.push(
+            add_banner(
+                &mut self.banners,
                 "Select a task first. A dropped file becomes an artifact of the selected task."
                     .to_owned(),
             );
@@ -605,7 +722,15 @@ impl DesktopApp {
                     self.dialog = Some(dialog);
                 }
             }
-            Outcome::Cancel => {}
+            Outcome::Cancel => {
+                if let Dialog::Confirm {
+                    created: Some(artifact),
+                    ..
+                } = dialog
+                {
+                    self.remove_new_artifact(artifact);
+                }
+            }
             Outcome::Submit => self.submit_dialog(dialog, SecretPolicy::Enforce),
             Outcome::SubmitWithSecret => self.submit_dialog(dialog, SecretPolicy::PersonOverride),
         }
@@ -665,7 +790,14 @@ impl DesktopApp {
                     self.dialog = Some(Dialog::Dates(form));
                 }
             }
-            Dialog::Confirm { op, .. } => self.run_with_override(&op),
+            Dialog::Confirm { op, created, .. } => {
+                if !self.run_with_override(&op)
+                    && let Some(artifact) = created
+                {
+                    self.remove_new_artifact(artifact);
+                }
+            }
+            Dialog::Unsaved(next) => self.after_discard(next),
             Dialog::Delete { id, title, .. } => self.delete_task(id, title),
             Dialog::NewDrawing { task, name, error } => {
                 if name.trim().is_empty() {
@@ -770,25 +902,40 @@ impl DesktopApp {
                 "The desktop app can create a project only with the local driver.",
             ));
         }
-        let directory = form.directory.trim();
-        let location = if directory.is_empty() {
+        // A path can have a space at its end, so only an empty field selects the default.
+        let location = if form.directory.trim().is_empty() {
             Location::Shared
         } else {
-            let path = PathBuf::from(directory);
+            let path = PathBuf::from(&form.directory);
             if !path.is_absolute() {
                 return Err(FormError::text(
                     "The data directory must be an absolute path. Use Browse to select a directory.",
                 ));
             }
+            let driver = project_driver_in(&path).map_err(|error| FormError::of(&error))?;
+            if driver.is_some_and(|driver| driver != LOCAL_DRIVER) {
+                return Err(FormError::text(
+                    "This directory holds a project with another driver. Select another directory.",
+                ));
+            }
             Location::Directory(path)
         };
-        let created = create_project(
+        let attach = if form.attach {
+            Attach::IfPossible
+        } else {
+            Attach::Never
+        };
+        let created = create_project_with(
             self.host.paths(),
             &self.caller.worktree,
             Some(name),
             &location,
+            attach,
         )
         .map_err(|error| FormError::of(&error))?;
+        if let Some(warning) = created.attach_warning {
+            add_banner(&mut self.banners, warning);
+        }
         self.load_project_list();
         self.open_project(&created.name);
         Ok(())
@@ -831,16 +978,17 @@ impl DesktopApp {
 
     // ---- Task operations ----
 
-    fn run_op(&self, op: &TaskOp, claim: &ClaimRef) -> Result<()> {
+    /// Runs an operation, and returns the warnings of the plugins, such as a failed Git push.
+    fn run_op(&self, op: &TaskOp, claim: &ClaimRef) -> Result<Vec<String>> {
         let Some(session) = &self.session else {
             return Err(LenkaError::invalid_argument("No project is open."));
         };
         let tasks = &session.tasks;
         let caller = &self.caller;
         match op {
-            TaskOp::SetStatus { id, status } => {
-                tasks.set_status(caller, *id, *status, claim).map(|_| ())
-            }
+            TaskOp::SetStatus { id, status } => tasks
+                .set_status(caller, *id, *status, claim)
+                .map(|_| Vec::new()),
             TaskOp::Finish {
                 id,
                 evidence,
@@ -850,7 +998,9 @@ impl DesktopApp {
                     evidence: evidence.clone(),
                     unchecked_reason: unchecked_reason.clone(),
                 };
-                tasks.finish(caller, *id, claim, &finish).map(|_| ())
+                tasks
+                    .finish(caller, *id, claim, &finish)
+                    .map(|change| change.warnings)
             }
             TaskOp::CompleteStage { id, evidence } => {
                 if evidence.trim().is_empty() {
@@ -858,30 +1008,19 @@ impl DesktopApp {
                         "A stage completion needs evidence, such as a command and its result.",
                     ));
                 }
-                if *claim == ClaimRef::Override {
-                    return tasks
-                        .advance(caller, *id, claim, evidence, None)
-                        .map(|_| ());
-                }
-                let held = tasks.claim(caller, Some(*id), None, None)?;
-                let handle = ClaimRef::Handle(held.handle);
-                match tasks.advance(caller, *id, &handle, evidence, None) {
-                    Ok(_) => Ok(()),
-                    Err(error) => {
-                        // Give the claim back, so that a failed stage completion holds nothing.
-                        let _ignored = tasks.finish(caller, *id, &handle, &Finish::Released);
-                        Err(error)
-                    }
-                }
+                // A claim would change the status, and a refused completion must change nothing.
+                tasks
+                    .advance(caller, *id, claim, evidence, None)
+                    .map(|change| change.warnings)
             }
             TaskOp::ReturnStage { id, stage, reason } => tasks
                 .advance(caller, *id, claim, reason, Some(stage))
-                .map(|_| ()),
-            TaskOp::Pause { id } => tasks.pause(caller, *id, claim).map(|_| ()),
+                .map(|change| change.warnings),
+            TaskOp::Pause { id } => tasks.pause(caller, *id, claim).map(|_| Vec::new()),
             TaskOp::Update { id, patch, .. } => {
                 let mut patch = patch.as_ref().clone();
                 patch.claim = claim.clone();
-                tasks.update(caller, *id, patch).map(|_| ())
+                tasks.update(caller, *id, patch).map(|_| Vec::new())
             }
         }
     }
@@ -891,18 +1030,23 @@ impl DesktopApp {
     pub(crate) fn submit(&mut self, op: TaskOp) -> Result<()> {
         if let Some(holder) = self.other_holder(&op) {
             let message = format!("{holder} holds a claim on this task.");
-            self.dialog = Some(Dialog::Confirm { message, op });
+            self.dialog = Some(Dialog::Confirm {
+                message,
+                op,
+                created: None,
+            });
             return Ok(());
         }
         match self.run_op(&op, &ClaimRef::Implicit) {
-            Ok(()) => {
-                self.after_op(&op);
+            Ok(warnings) => {
+                self.after_op(&op, warnings);
                 Ok(())
             }
             Err(error) if can_override(&error, &op) => {
                 self.dialog = Some(Dialog::Confirm {
                     message: error.message().to_owned(),
                     op,
+                    created: None,
                 });
                 Ok(())
             }
@@ -925,9 +1069,13 @@ impl DesktopApp {
             .filter(|holder| *holder != self.caller.label)
     }
 
-    fn run_with_override(&mut self, op: &TaskOp) {
+    /// Runs an operation with an override, and tells if it worked.
+    fn run_with_override(&mut self, op: &TaskOp) -> bool {
         match self.run_op(op, &ClaimRef::Override) {
-            Ok(()) => self.after_op(op),
+            Ok(warnings) => {
+                self.after_op(op, warnings);
+                true
+            }
             Err(error) => {
                 if let TaskOp::Update {
                     from_draft: true,
@@ -939,11 +1087,15 @@ impl DesktopApp {
                 } else {
                     self.report(&error);
                 }
+                false
             }
         }
     }
 
-    fn after_op(&mut self, op: &TaskOp) {
+    fn after_op(&mut self, op: &TaskOp, warnings: Vec<String>) {
+        for warning in warnings {
+            add_banner(&mut self.banners, warning);
+        }
         let from_draft = matches!(
             op,
             TaskOp::Update {
@@ -983,7 +1135,19 @@ impl DesktopApp {
     fn run_action(&mut self, action: Action) {
         match action {
             Action::Select(id) => self.select(id),
-            Action::CloseDetail => self.detail = None,
+            Action::CloseDetail => {
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(DetailState::has_unsaved_text)
+                {
+                    self.dialog = Some(Dialog::Unsaved(AfterUnsaved::CloseDetail));
+                } else {
+                    self.detail = None;
+                }
+            }
+            Action::OpenProject(name) => self.open_project(&name),
+            Action::ReloadSettings => self.reload_settings(),
             Action::MoveTo { id, status } => {
                 if status == Status::Done {
                     self.open_finish(id);
@@ -1023,8 +1187,10 @@ impl DesktopApp {
             return;
         }
         if self.detail.as_ref().is_some_and(DetailState::is_dirty) {
-            self.banners
-                .push("Save or discard your text before you select another task.".to_owned());
+            add_banner(
+                &mut self.banners,
+                "Save or discard your text before you select another task.".to_owned(),
+            );
             return;
         }
         let tab = self
@@ -1091,7 +1257,8 @@ impl DesktopApp {
         };
         let config = session.project.config();
         let Some(place) = stage_place(&config, &row.meta.front.kind, &row.meta.state.stage) else {
-            self.banners.push(
+            add_banner(
+                &mut self.banners,
                 "The task is on a stage that its type does not have. Fix the settings first."
                     .to_owned(),
             );
@@ -1173,9 +1340,14 @@ impl DesktopApp {
         let Some(detail) = &mut self.detail else {
             return;
         };
-        let Some(Problem::Secret { patch, .. }) = detail.problem.take() else {
+        let Some(Problem::Secret { patch, checked, .. }) = detail.problem.take() else {
             return;
         };
+        // The choice of the person applies only to the text that the check read.
+        if detail.draft != checked {
+            self.save_draft();
+            return;
+        }
         let id = detail.id;
         let mut patch = patch;
         patch.secret_policy = SecretPolicy::PersonOverride;
@@ -1196,16 +1368,16 @@ impl DesktopApp {
     }
 
     fn note_draft_problem(&mut self, error: &LenkaError, patch: &TaskPatch) {
-        let problem = match error.code() {
-            ErrorCode::StaleVersion => Problem::Stale(error.message().to_owned()),
-            ErrorCode::SecretDetected => Problem::Secret {
-                message: error.message().to_owned(),
-                patch: Box::new(patch.clone()),
-            },
-            _ => Problem::Error(format!("{} ({})", error.message(), error.code().as_str())),
-        };
         if let Some(detail) = &mut self.detail {
-            detail.problem = Some(problem);
+            detail.problem = Some(match error.code() {
+                ErrorCode::StaleVersion => Problem::Stale(error.message().to_owned()),
+                ErrorCode::SecretDetected => Problem::Secret {
+                    message: error.message().to_owned(),
+                    patch: Box::new(patch.clone()),
+                    checked: detail.draft.clone(),
+                },
+                _ => Problem::Error(format!("{} ({})", error.message(), error.code().as_str())),
+            });
         }
     }
 
@@ -1241,37 +1413,75 @@ impl DesktopApp {
         }
     }
 
+    /// Adds a file on a background thread, because a large file takes seconds to read and copy.
     fn add_file(&mut self, id: TaskId, path: &str) {
         let Some(session) = &self.session else {
             return;
         };
-        let source = Source::File(std::path::Path::new(path));
-        let result = session.artifacts.create(&self.caller, source, None, None);
-        match result {
-            Ok(record) => self.link_artifact(id, record.id),
-            Err(error) => self.report(&error),
-        }
+        let (sender, result) = mpsc::channel();
+        let artifacts = std::sync::Arc::clone(&session.artifacts);
+        let caller = self.caller.clone();
+        let path = PathBuf::from(path);
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let source = Source::File(&path);
+            let _closed = sender.send(artifacts.create(&caller, source, None, None));
+            ctx.request_repaint();
+        });
+        self.pending_files.push(PendingFile { task: id, result });
     }
 
-    fn link_artifact(&mut self, id: TaskId, artifact: ArtifactId) {
+    fn link_op(&self, id: TaskId, artifact: ArtifactId) -> Result<TaskOp> {
         let Some(session) = &self.session else {
-            return;
+            return Err(LenkaError::invalid_argument("No project is open."));
         };
-        let version = session
-            .model
-            .row(id)
-            .map_or(0, |row| row.meta.state.version);
+        // A slow save can end after another change of the task, so the list of rows can be old.
+        let version = session.tasks.detail(id, &[])?.meta.state.version;
         let patch = TaskPatch {
             expected_version: version,
             artifacts_add: vec![artifact],
             ..TaskPatch::default()
         };
-        if let Err(error) = self.submit(TaskOp::Update {
+        Ok(TaskOp::Update {
             id,
             patch: Box::new(patch),
             from_draft: false,
-        }) {
-            self.report(&error);
+        })
+    }
+
+    /// Links a new artifact to a task. No view can link the artifact later, so a failed link
+    /// removes it.
+    fn link_artifact(&mut self, id: TaskId, artifact: ArtifactId) {
+        let result = self.link_op(id, artifact).and_then(|op| self.submit(op));
+        match result {
+            Ok(()) => {
+                if let Some(Dialog::Confirm { created, .. }) = &mut self.dialog {
+                    *created = Some(artifact);
+                }
+            }
+            Err(error) => {
+                self.report(&error);
+                self.remove_new_artifact(artifact);
+            }
+        }
+    }
+
+    fn remove_new_artifact(&mut self, artifact: ArtifactId) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        match session.artifacts.delete(&self.caller, artifact) {
+            Ok(()) => add_banner(
+                &mut self.banners,
+                "lenka removed the new artifact, because the task did not link it.".to_owned(),
+            ),
+            Err(error) => self.report(&error),
+        }
+        if let Some(board) = &mut self.drawing
+            && board.artifact == Some(artifact)
+        {
+            board.artifact = None;
+            board.version = 0;
         }
     }
 
@@ -1280,8 +1490,10 @@ impl DesktopApp {
             return;
         };
         if self.drawing.as_ref().is_some_and(DrawingBoard::is_dirty) {
-            self.banners
-                .push("Save or close the open drawing first.".to_owned());
+            add_banner(
+                &mut self.banners,
+                "Save or close the open drawing first.".to_owned(),
+            );
             self.view = View::Drawing;
             return;
         }
@@ -1298,9 +1510,10 @@ impl DesktopApp {
                     self.drawing = Some(board);
                     self.view = View::Drawing;
                 }
-                Err(error) => self
-                    .banners
-                    .push(format!("lenka cannot open this drawing. {error}")),
+                Err(error) => add_banner(
+                    &mut self.banners,
+                    format!("lenka cannot open this drawing. {error}"),
+                ),
             },
             Err(error) => self.report(&error),
         }
@@ -1426,9 +1639,10 @@ impl DesktopApp {
         match loaded {
             Ok((record, bytes)) => {
                 if let Err(error) = board.load_version(&record, &bytes) {
-                    self.banners.push(format!(
-                        "lenka cannot read the new version of this drawing. {error}"
-                    ));
+                    add_banner(
+                        &mut self.banners,
+                        format!("lenka cannot read the new version of this drawing. {error}"),
+                    );
                 }
             }
             Err(error) => self.report(&error),
@@ -1457,16 +1671,34 @@ impl DesktopApp {
         let Some(session) = &mut self.session else {
             return;
         };
+        let Some(base) = self.settings.base().cloned() else {
+            return;
+        };
         match self.settings.validated(&session.model.rows) {
-            Ok(config) => match session.project.save_config(config.clone()) {
+            Ok(config) => match session.project.save_config_over(&base, config.clone()) {
                 Ok(()) => {
                     self.settings.mark_saved(config);
                     self.visible_key.0 = 0;
                 }
-                Err(error) => self.settings.error = Some(error.message().to_owned()),
+                Err(error) => {
+                    self.settings.conflict = error.code() == ErrorCode::StaleVersion;
+                    self.settings.error = Some(error.message().to_owned());
+                }
             },
             Err(message) => self.settings.error = Some(message),
         }
+    }
+
+    fn reload_settings(&mut self) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if let Err(error) = session.project.reload_config() {
+            self.settings.error = Some(error.message().to_owned());
+            return;
+        }
+        self.settings.reset();
+        self.settings.load(session);
     }
 
     fn run_doctor(&mut self) {
@@ -1587,5 +1819,26 @@ impl eframe::App for DesktopApp {
             // The snapshot only makes the next start faster, so an error here has no effect.
             let _ignored = session.tasks.save_snapshot();
         }
+    }
+}
+
+#[cfg(test)]
+mod banner_tests {
+    use super::{MAX_BANNERS, add_banner};
+
+    #[test]
+    fn banners_have_no_duplicates_and_a_limit() {
+        let mut banners = Vec::new();
+        add_banner(&mut banners, "one".to_owned());
+        add_banner(&mut banners, "one".to_owned());
+        assert_eq!(banners, ["one"]);
+        for number in 0..MAX_BANNERS {
+            add_banner(&mut banners, number.to_string());
+        }
+        assert_eq!(banners.len(), MAX_BANNERS);
+        assert!(
+            !banners.contains(&"one".to_owned()),
+            "the oldest goes first"
+        );
     }
 }

@@ -24,6 +24,8 @@ pub(crate) struct SettingsState {
     new_type: String,
     pub error: Option<String>,
     pub saved: bool,
+    /// Tells if another writer changed the file after the draft loaded.
+    pub conflict: bool,
     pub doctor: Option<DoctorReport>,
 }
 
@@ -39,6 +41,20 @@ impl SettingsState {
         self.accept_from = current.links.accept_from.join("\n");
         self.draft = Some(current.clone());
         self.base = Some(current);
+    }
+
+    /// Returns the settings that the draft started from.
+    pub(crate) fn base(&self) -> Option<&ProjectConfig> {
+        self.base.as_ref()
+    }
+
+    /// Tells if the draft holds changes that are not saved.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.draft != self.base
+            || self.base.as_ref().is_some_and(|base| {
+                lines_of(&self.link_to) != base.links.link_to
+                    || lines_of(&self.accept_from) != base.links.accept_from
+            })
     }
 
     /// Forgets the state of another project.
@@ -63,6 +79,7 @@ impl SettingsState {
         self.draft = Some(saved.clone());
         self.base = Some(saved);
         self.error = None;
+        self.conflict = false;
         self.saved = true;
     }
 
@@ -94,11 +111,7 @@ impl SettingsState {
 
     fn save_bar(&mut self, ui: &mut Ui, actions: &mut Vec<Action>) {
         let palette = Palette::of(ui);
-        let edited = self.draft != self.base
-            || self.base.as_ref().is_some_and(|base| {
-                lines_of(&self.link_to) != base.links.link_to
-                    || lines_of(&self.accept_from) != base.links.accept_from
-            });
+        let edited = self.is_dirty();
         if edited {
             self.saved = false;
         }
@@ -115,6 +128,13 @@ impl SettingsState {
         if let Some(error) = &self.error {
             ui.label(RichText::new(error).color(palette.danger));
         }
+        if self.conflict && ui.button("Load the file and lose my changes").clicked() {
+            actions.push(Action::ReloadSettings);
+        }
+        caption(
+            ui,
+            "A save writes lenka.toml again. lenka keeps other tables in the file, but it removes comments.",
+        );
         ui.add_space(4.0);
     }
 

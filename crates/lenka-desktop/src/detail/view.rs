@@ -382,6 +382,7 @@ impl DetailState {
             });
         }
         self.claim_and_blockers(ui, &palette, actions);
+        self.loop_controls(ui, &palette, actions);
         self.labels_and_dates(ui, &palette, actions);
         ui.add_space(6.0);
         let [description, requirements, acceptance, _] = &mut self.editors;
@@ -435,6 +436,43 @@ impl DetailState {
                 }
             });
         });
+    }
+
+    /// Shows a stop of the loop limit, and the mark that lets agents continue until the task is
+    /// done. Only a person sees this panel, and the service refuses the mark from an agent.
+    fn loop_controls(&self, ui: &mut Ui, palette: &Palette, actions: &mut Vec<Action>) {
+        let state = &self.data.meta.state;
+        if matches!(state.status, Status::Done | Status::Cancelled) {
+            return;
+        }
+        if state.loop_stopped {
+            notice(ui, palette.warning, palette.surface_alt, |ui| {
+                ui.label(
+                    RichText::new(
+                        "The loop limit stopped agents on this task. An agent cannot claim it until a person acts. Change the status, complete the stage, or select the option below.",
+                    )
+                    .color(palette.warning),
+                );
+            });
+        }
+        let mut until_done = state.loop_until_done;
+        if ui
+            .checkbox(
+                &mut until_done,
+                "Let agents repeat this task until it is done",
+            )
+            .changed()
+        {
+            actions.push(Action::Task(TaskOp::Update {
+                id: self.id,
+                patch: Box::new(TaskPatch {
+                    expected_version: state.version,
+                    loop_until_done: Some(until_done),
+                    ..TaskPatch::default()
+                }),
+                from_draft: false,
+            }));
+        }
     }
 
     fn claim_and_blockers(&self, ui: &mut Ui, palette: &Palette, actions: &mut Vec<Action>) {
