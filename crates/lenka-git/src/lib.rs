@@ -17,9 +17,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use lenka_core::gitdir;
 use lenka_core::init::{GIT_DATA_DIR, GITATTRIBUTES};
@@ -72,7 +75,25 @@ const CLEARED_ENV: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_PREFIX",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_NAMESPACE",
 ];
+
+/// The temporary directory of `enable` has this text after the name of the data directory.
+const CONNECT_SUFFIX: &str = ".new-";
+
+/// The time limit of a push in an agent call. A person can stop a push, and an agent cannot.
+const DEFAULT_PUSH_LIMIT: Duration = Duration::from_secs(60);
+const MAX_PUSH_LIMIT: Duration = Duration::from_secs(3600);
+/// Sets the time limit of a push in an agent call, in milliseconds.
+const PUSH_LIMIT_ENV: &str = "LENKA_GIT_PUSH_LIMIT_MS";
 
 /// Tells if `git` can ask a person for credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,7 +153,10 @@ impl Git {
             command.env_remove(name);
         }
         if self.prompt == Prompt::Denied {
-            command.env("GIT_TERMINAL_PROMPT", "0");
+            // An empty value turns off all programs that ask for a password.
+            command
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_ASKPASS", "");
         }
         // The hook path is outside the data, so that no data from a remote can become a hook.
         let mut hooks = OsString::from("core.hooksPath=");
@@ -159,6 +183,35 @@ impl Git {
                 format!("lenka cannot run git: {err}. Install Git, and try again."),
             )
         })
+    }
+
+    /// Runs a command that uses the network. An agent call has a time limit and no SSH prompt.
+    fn run_network(&self, what: &str, args: &[&str]) -> Result<()> {
+        let mut command = self.command();
+        command.args(args);
+        if self.prompt == Prompt::Allowed {
+            let output = command.output().map_err(|err| git_start_error(&err))?;
+            return check_output(what, &output);
+        }
+        // `GIT_TERMINAL_PROMPT` has no effect on the SSH client. A setting of the person stays.
+        if std::env::var_os("GIT_SSH_COMMAND").is_none()
+            && std::env::var_os("GIT_SSH").is_none()
+            && !self.passes(["config", "--get", "core.sshCommand"])?
+        {
+            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        }
+        let limit = parse_push_limit(std::env::var(PUSH_LIMIT_ENV).ok().as_deref());
+        let output = output_with_limit(command, limit).map_err(|err| git_start_error(&err))?;
+        match output {
+            Some(output) => check_output(what, &output),
+            None => Err(LenkaError::new(
+                ErrorCode::Io,
+                format!(
+                    "`git {what}` did not end in {} ms, so lenka stopped it. Run `lenka sync` to send the data.",
+                    limit.as_millis()
+                ),
+            )),
+        }
     }
 
     /// Runs a command that must pass, and returns its output text.
@@ -477,9 +530,9 @@ fn uses_lfs(git: &Git) -> Result<bool> {
 /// object does not stop the push, because `doctor` reports that artifact.
 fn push(git: &Git, remote: &str) -> Result<()> {
     if uses_lfs(git)? {
-        git.run(
+        git.run_network(
             "lfs push",
-            [
+            &[
                 "-c",
                 "lfs.allowincompletepush=true",
                 "lfs",
@@ -490,8 +543,73 @@ fn push(git: &Git, remote: &str) -> Result<()> {
         )?;
     }
     let refspec = format!("{BRANCH_REF}:{BRANCH_REF}");
-    git.run("push", ["push", "-q", remote, refspec.as_str()])?;
-    Ok(())
+    git.run_network("push", &["push", "-q", remote, refspec.as_str()])
+}
+
+fn git_start_error(err: &std::io::Error) -> LenkaError {
+    LenkaError::new(
+        ErrorCode::Io,
+        format!("lenka cannot run git: {err}. Install Git, and try again."),
+    )
+}
+
+fn check_output(what: &str, output: &Output) -> Result<()> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_error(what, output))
+    }
+}
+
+fn parse_push_limit(value: Option<&str>) -> Duration {
+    value
+        .and_then(|text| text.parse::<u64>().ok())
+        .map_or(DEFAULT_PUSH_LIMIT, Duration::from_millis)
+        .min(MAX_PUSH_LIMIT)
+}
+
+/// Runs a command, and stops it at a time limit. The result is `None` at the limit.
+fn output_with_limit(mut command: Command, limit: Duration) -> std::io::Result<Option<Output>> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = read_in_background(child.stdout.take());
+    let stderr = read_in_background(child.stderr.take());
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // A child of `git` can hold the pipe after `git` ends, so this wait has a limit too.
+            let collect = |bytes: Receiver<Vec<u8>>| {
+                bytes
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap_or_default()
+            };
+            return Ok(Some(Output {
+                status,
+                stdout: collect(stdout),
+                stderr: collect(stderr),
+            }));
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_in_background(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+    }
+    receiver
 }
 
 /// Downloads the Git LFS bytes of the current tree. A failure is not a failure of the merge,
@@ -576,8 +694,7 @@ pub struct EnableReport {
 }
 
 /// Connects a project to Git, stores the settings in the local Git configuration, and makes the
-/// first commit. A repeat call is safe. Stop other lenka processes of this project first, because the first call moves
-/// the data directory for a short time.
+/// first commit. A repeat call is safe, and other lenka processes can continue to write.
 ///
 /// For a data directory at `<common_dir>/lenka-data`, this function creates the branch with no
 /// change to the checkout of the user, and makes the directory a worktree of that branch. For any
@@ -608,12 +725,22 @@ pub fn enable(
             Some(common) => connect_worktree(common, &real_dir)?,
             None => init_repository(&dir)?,
         }
+    } else if let Some(common) = &linked_common {
+        // An `enable` can stop before its last step. A repair of a good worktree changes nothing.
+        let _ = clone_git(common).output([
+            OsStr::new("worktree"),
+            OsStr::new("repair"),
+            real_dir.as_os_str(),
+        ]);
     }
     let git = open_data_repo(project, Prompt::Allowed)?;
 
     let mut settings = LocalSettings::read(&git)?;
     if let Some(value) = &options.remote {
         settings.remote = configure_remote(&git, layout, value)?;
+        if layout == Layout::Repository {
+            refuse_data_of_another_machine(&git, &settings.remote)?;
+        }
     }
     settings.enabled = true;
     settings.push_on_finish = settings.push_on_finish || options.push_on_finish;
@@ -625,6 +752,24 @@ pub fn enable(
         remote: settings.remote,
         committed,
     })
+}
+
+/// The steps for a machine that needs the data of a separate repository.
+const RESTORE_STEPS: &str = "To use this data, run `git clone --branch lenka-data <url> <directory>` and `lenka init --dir <directory> --name <name>`.";
+
+/// Refuses a remote with data from another start of the project, because the two histories can
+/// never merge. A network failure does not stop the call, because the first sync reports it.
+fn refuse_data_of_another_machine(git: &Git, remote: &str) -> Result<()> {
+    let tracking = format!("refs/remotes/{remote}/{BRANCH}");
+    if git.passes(["show-ref", "--verify", "--quiet", tracking.as_str()])? {
+        return Ok(());
+    }
+    if git.passes(["ls-remote", "--exit-code", remote, BRANCH_REF])? {
+        return Err(LenkaError::invalid_argument(format!(
+            "The remote has the branch {BRANCH} from another machine, and this project has separate data. {RESTORE_STEPS}"
+        )));
+    }
+    Ok(())
 }
 
 fn configure_remote(git: &Git, layout: Layout, value: &str) -> Result<String> {
@@ -700,7 +845,7 @@ fn read_settings(git: &Git, revision: &str) -> Result<ProjectConfig> {
 fn check_same_project(local: &ProjectConfig, incoming: &ProjectConfig) -> Result<()> {
     if incoming.id != local.id || incoming.storage != local.storage {
         return Err(LenkaError::invalid_file(format!(
-            "The branch {BRANCH} of another clone changes the project ID or the storage settings. lenka did not merge it. Check that remote."
+            "The branch {BRANCH} of another clone changes the project ID or the storage settings. lenka did not merge it. Check that remote. {RESTORE_STEPS}"
         )));
     }
     Ok(())
@@ -741,6 +886,13 @@ fn check_incoming_tree(git: &Git, revision: &str, local: Option<&ProjectConfig>)
     )
 }
 
+/// Returns the data directory of a clone if it has a project. This call does not run Git.
+#[must_use]
+pub fn existing_data(cwd: &Path) -> Option<PathBuf> {
+    let dir = gitdir::locate(cwd)?.common_dir.join(GIT_DATA_DIR);
+    dir.join(PROJECT_FILE).is_file().then_some(dir)
+}
+
 /// Creates the branch with no change to the checkout, and makes the data directory a worktree.
 fn connect_worktree(common_dir: &Path, dir: &Path) -> Result<()> {
     let git = clone_git(common_dir);
@@ -768,31 +920,107 @@ fn connect_worktree(common_dir: &Path, dir: &Path) -> Result<()> {
         let commit = git.run("commit-tree", args)?;
         git.run("branch", ["branch", "--no-track", BRANCH, commit.as_str()])?;
     }
-    let mut aside = dir.as_os_str().to_owned();
-    aside.push(format!(".aside-{}", std::process::id()));
-    let aside = PathBuf::from(aside);
-    fs::rename(dir, &aside).map_err(|err| LenkaError::io("Move the data directory aside", &err))?;
-    let added = add_worktree(&git, dir);
-    if let Err(error) = added {
-        let _ = fs::remove_dir_all(dir);
-        fs::rename(&aside, dir)
-            .map_err(|err| LenkaError::io("Move the data directory back", &err))?;
-        return Err(error);
+    remove_old_connect_dirs(dir);
+    forget_absent_worktree(common_dir);
+    let mut temp = dir.as_os_str().to_owned();
+    temp.push(format!("{CONNECT_SUFFIX}{}", std::process::id()));
+    let temp = PathBuf::from(temp);
+    let connected = link_worktree(&git, &temp.join(GIT_DATA_DIR), dir);
+    let _ = fs::remove_dir_all(&temp);
+    connected
+}
+
+/// Connects an existing data directory to a new worktree, with no move of the data. A writer in
+/// another process can continue, and a stop at any step keeps all data at its normal path. The
+/// rename of the `.git` file is the last step that changes the meaning of the directory.
+fn link_worktree(git: &Git, temp: &Path, dir: &Path) -> Result<()> {
+    git.run(
+        "worktree add",
+        [
+            // The `.git` file moves, so it must hold an absolute path.
+            OsStr::new("-c"),
+            OsStr::new("worktree.useRelativePaths=false"),
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("-q"),
+            OsStr::new("--no-checkout"),
+            temp.as_os_str(),
+            OsStr::new(BRANCH),
+        ],
+    )?;
+    let linked = Git::new(temp, Prompt::Allowed);
+    linked.run("read-tree", ["read-tree", "HEAD"])?;
+    let mut work_tree = OsString::from("--work-tree=");
+    work_tree.push(dir);
+    // A file on the disk is newer than the branch, so only a missing file comes from the branch.
+    let listing = linked.output(["ls-files", "-z"])?;
+    for path in listing.stdout.split(|byte| *byte == 0) {
+        let path = String::from_utf8_lossy(path);
+        if !path.is_empty() && fs::symlink_metadata(dir.join(path.as_ref())).is_err() {
+            linked.run(
+                "checkout-index",
+                [
+                    work_tree.as_os_str(),
+                    OsStr::new("checkout-index"),
+                    OsStr::new("--"),
+                    OsStr::new(path.as_ref()),
+                ],
+            )?;
+        }
     }
-    move_contents(&aside, dir).map_err(|err| {
-        LenkaError::new(
-            ErrorCode::Io,
-            format!(
-                "Move the data back: {err}. The rest of the data is in {}.",
-                aside.display()
-            ),
-        )
-    })?;
-    fs::remove_dir_all(&aside).map_err(|err| LenkaError::io("Remove the empty directory", &err))
+    fs::rename(temp.join(".git"), dir.join(".git"))
+        .map_err(|err| LenkaError::io("Connect the data directory", &err))?;
+    git.run(
+        "worktree repair",
+        [
+            OsStr::new("worktree"),
+            OsStr::new("repair"),
+            dir.as_os_str(),
+        ],
+    )
+    .map(|_| ())
+}
+
+/// Removes the temporary directories of an `enable` that stopped. They hold no data.
+fn remove_old_connect_dirs(dir: &Path) {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else {
+        return;
+    };
+    let mut prefix = name.to_os_string();
+    prefix.push(CONNECT_SUFFIX);
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Removes the Git record of a data worktree that is absent, so that a new worktree can use the
+/// branch. `git worktree prune` is not safe here: it also removes the records of the worktrees of
+/// the person, and such a worktree can be absent for a short time.
+fn forget_absent_worktree(common_dir: &Path) {
+    let Ok(entries) = fs::read_dir(common_dir.join("worktrees")) else {
+        return;
+    };
+    let head = format!("ref: {BRANCH_REF}");
+    for entry in entries.flatten() {
+        let record = entry.path();
+        let holds_branch =
+            fs::read_to_string(record.join("HEAD")).is_ok_and(|text| text.trim() == head);
+        let absent = fs::read_to_string(record.join("gitdir"))
+            .is_ok_and(|target| fs::symlink_metadata(record.join(target.trim())).is_err());
+        if holds_branch && absent && !record.join("locked").exists() {
+            let _ = fs::remove_dir_all(&record);
+        }
+    }
 }
 
 fn add_worktree(git: &Git, dir: &Path) -> Result<()> {
-    git.run("worktree prune", ["worktree", "prune"])?;
+    forget_absent_worktree(&git.dir);
     git.run(
         "worktree add",
         [
@@ -804,27 +1032,6 @@ fn add_worktree(git: &Git, dir: &Path) -> Result<()> {
         ],
     )
     .map(|_| ())
-}
-
-/// Moves all entries of a directory into another directory. A file in the source replaces the
-/// file in the target, because the source holds the newest data.
-fn move_contents(from: &Path, to: &Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let target = to.join(entry.file_name());
-        match fs::symlink_metadata(&target) {
-            Ok(meta) if meta.is_dir() && entry.file_type()?.is_dir() => {
-                move_contents(&entry.path(), &target)?;
-                fs::remove_dir(entry.path())?;
-                continue;
-            }
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&target)?,
-            Ok(_) => fs::remove_file(&target)?,
-            Err(_) => {}
-        }
-        fs::rename(entry.path(), target)?;
-    }
-    Ok(())
 }
 
 /// Returns the tracking refs of the data branch, with `origin` first.
@@ -1228,24 +1435,5 @@ mod tests {
         for bad in ["", "--upload-pack=x", "-x", "a b", "a/b", "a;b"] {
             assert!(validate_remote_name(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn move_contents_merges_directories() -> std::io::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let from = temp.path().join("from");
-        let to = temp.path().join("to");
-        fs::create_dir_all(from.join("d"))?;
-        fs::create_dir_all(to.join("d"))?;
-        fs::write(from.join("d/new"), "new")?;
-        fs::write(from.join("same"), "ours")?;
-        fs::write(to.join("same"), "theirs")?;
-        fs::write(to.join("d/old"), "old")?;
-        move_contents(&from, &to)?;
-        assert_eq!(fs::read_to_string(to.join("d/new"))?, "new");
-        assert_eq!(fs::read_to_string(to.join("d/old"))?, "old");
-        assert_eq!(fs::read_to_string(to.join("same"))?, "ours");
-        assert_eq!(fs::read_dir(&from)?.count(), 0);
-        Ok(())
     }
 }

@@ -149,6 +149,18 @@ fn doc_path(id: MemoryId) -> Result<DocPath> {
     DocPath::new(format!("{MEMORY_DIR}/{id}.md"))
 }
 
+/// Counts the wanted words in a record. Some scripts have no space between words, so a word that
+/// is not ASCII can also be a part of a longer run.
+fn shared_words(wanted: &BTreeSet<String>, found: &BTreeSet<String>) -> usize {
+    wanted
+        .iter()
+        .filter(|word| {
+            found.contains(*word)
+                || (!word.is_ascii() && found.iter().any(|item| item.contains(word.as_str())))
+        })
+        .count()
+}
+
 fn words(text: &str) -> BTreeSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
@@ -282,6 +294,11 @@ impl MemoryService {
     /// Returns an error if the directory cannot be read.
     pub fn search(&self, query: &MemoryQuery) -> Result<Vec<MemoryRecord>> {
         let wanted = query.text.as_deref().map(words).unwrap_or_default();
+        // A text with only punctuation has no words, and it still asks for shared words.
+        let has_text = query
+            .text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
         let mut scored: Vec<(usize, MemoryRecord)> = self
             .list()?
             .into_iter()
@@ -292,9 +309,9 @@ impl MemoryService {
             .map(|record| {
                 let mut found = words(&record.text);
                 found.extend(record.tags.iter().flat_map(|tag| words(tag)));
-                (wanted.intersection(&found).count(), record)
+                (shared_words(&wanted, &found), record)
             })
-            .filter(|(score, _)| wanted.is_empty() || *score > 0)
+            .filter(|(score, _)| !has_text || *score > 0)
             .collect();
         scored.sort_by(|left, right| {
             right

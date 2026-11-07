@@ -234,7 +234,7 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
     };
     let ok = ExitCode::SUCCESS;
     match cli.command {
-        Command::Init(args) => init_command(&context, &args).map(|()| ok),
+        Command::Init(args) => init_command(&context, &args, plugins).map(|()| ok),
         Command::Project(ProjectCommand::Attach { name }) => attach(&context, &name).map(|()| ok),
         Command::Project(ProjectCommand::List) => list_projects(&context).map(|()| ok),
         Command::Hook {
@@ -276,7 +276,11 @@ fn run(cli: Cli, plugin_list: impl FnOnce() -> Builder) -> anyhow::Result<ExitCo
     }
 }
 
-fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
+fn init_command(
+    context: &RunContext,
+    args: &InitArgs,
+    plugins: impl FnOnce() -> anyhow::Result<Host>,
+) -> anyhow::Result<()> {
     let paths = Paths::from_env()?;
     let cwd = &context.cwd;
     let location = match (args.shared, &args.dir) {
@@ -286,7 +290,7 @@ fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
         (false, None) => Location::Default,
     };
     let restored = if location == Location::Default {
-        restore(cwd)?
+        restore(cwd, plugins)?
     } else {
         None
     };
@@ -327,12 +331,27 @@ fn init_command(context: &RunContext, args: &InitArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "git")]
-fn restore(cwd: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn restore(
+    cwd: &Path,
+    plugins: impl FnOnce() -> anyhow::Result<Host>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let host = plugins()?;
+    let git_is_on = host
+        .plugins()
+        .iter()
+        .any(|item| item.info.name == "git" && item.enabled);
+    // A plugin that is off must not create a branch and a worktree from data of a remote.
+    if !git_is_on {
+        return Ok(lenka_git::existing_data(cwd));
+    }
     Ok(lenka_git::restore(cwd)?)
 }
 
 #[cfg(not(feature = "git"))]
-fn restore(_cwd: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn restore(
+    _cwd: &Path,
+    _plugins: impl FnOnce() -> anyhow::Result<Host>,
+) -> anyhow::Result<Option<PathBuf>> {
     Ok(None)
 }
 

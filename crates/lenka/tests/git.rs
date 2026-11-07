@@ -1038,3 +1038,348 @@ fn a_merged_change_stops_a_finish_until_the_holder_reads_it() -> TestResult {
         .json(&second, &["task", "finish", &id, "--evidence", "It works."])?;
     Ok(())
 }
+
+/// A worktree of the person can be absent for a short time, and its record must stay.
+#[test]
+fn enable_keeps_the_record_of_an_absent_worktree_of_the_person() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.project("api")?;
+    let worktree = machine.root.join("wt");
+    let moved = machine.root.join("wt-moved");
+    let path = worktree.to_string_lossy().into_owned();
+    machine.git(&repo, &["worktree", "add", "-q", "-b", "feature", &path])?;
+    fs::rename(&worktree, &moved)?;
+
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    machine.ok(&repo, &["git", "enable"])?;
+    fs::rename(&moved, &worktree)?;
+    machine.git(&worktree, &["status", "-s"])?;
+
+    // A new restore finds the record of its own absent worktree, and it can use the branch.
+    let data = repo.join(".git/lenka-data");
+    fs::remove_dir_all(&data)?;
+    let restored = machine.json(&repo, &["init"])?;
+    assert_eq!(restored["restored"], true, "{restored}");
+    machine.json(&repo, &["task", "show", text(&task, "task")])?;
+    machine.git(&worktree, &["status", "-s"])?;
+    Ok(())
+}
+
+/// `enable` does not move the data. A stop at any step keeps the data at its normal path, and a
+/// writer in another process cannot lose a write.
+#[cfg(unix)]
+#[test]
+fn a_stopped_enable_keeps_the_data_and_can_run_again() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+
+    let real = machine.git(&repo, &["--exec-path"])?;
+    let real = format!("{}/git", real.trim());
+    let bin = machine.root.join("bin");
+    fs::create_dir_all(&bin)?;
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\n'{real}' \"$@\"\nstatus=$?\ncase \" $* \" in *\" worktree add \"*) kill -9 $PPID;; esac\nexit $status\n"
+        ),
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755))?;
+    let search = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let stopped = machine
+        .command(&repo, &["git", "enable"])
+        .env("PATH", search)
+        .output()?;
+    assert!(!stopped.status.success());
+
+    machine.json(&repo, &["task", "show", &id])?;
+    machine.ok(&repo, &["git", "enable"])?;
+    machine.json(&repo, &["task", "show", &id])?;
+    let data = repo.join(".git/lenka-data");
+    let files = machine.git(&data, &["ls-files"])?;
+    assert!(files.contains("lenka.toml"), "{files}");
+    let names: Vec<_> = fs::read_dir(repo.join(".git"))?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name.contains(".new-")),
+        "{names:?}"
+    );
+    Ok(())
+}
+
+/// A push from a finish cannot block an agent call for as long as the remote takes.
+#[cfg(unix)]
+#[test]
+fn a_stuck_push_in_an_agent_call_stops_at_the_time_limit() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.project("api")?;
+    machine.git(
+        &repo,
+        &["remote", "add", "origin", "ssh://example.invalid/data.git"],
+    )?;
+    machine.ok(&repo, &["git", "enable", "--push-on-finish"])?;
+    let stub = machine.root.join("stuck-ssh");
+    fs::write(&stub, "#!/bin/sh\nsleep 20\n")?;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))?;
+
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(&repo, &["task", "claim", &id])?;
+    let start = std::time::Instant::now();
+    let output = machine
+        .command(
+            &repo,
+            &["--json", "task", "finish", &id, "--evidence", "It works."],
+        )
+        .env("GIT_SSH_COMMAND", &stub)
+        .env("LENKA_GIT_PUSH_LIMIT_MS", "200")
+        .output()?;
+    assert!(start.elapsed().as_secs() < 15, "{:?}", start.elapsed());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("lenka stopped it"), "{stdout}\n{stderr}");
+    Ok(())
+}
+
+/// The SSH client ignores `GIT_TERMINAL_PROMPT`, so an agent call turns off its prompt.
+#[cfg(unix)]
+#[test]
+fn a_push_in_an_agent_call_turns_off_the_ssh_prompt() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.project("api")?;
+    machine.git(
+        &repo,
+        &["remote", "add", "origin", "ssh://example.invalid/data.git"],
+    )?;
+    machine.ok(&repo, &["git", "enable", "--push-on-finish"])?;
+    let bin = machine.root.join("bin");
+    fs::create_dir_all(&bin)?;
+    let record = machine.root.join("ssh-args");
+    fs::write(
+        bin.join("ssh"),
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", record.display()),
+    )?;
+    fs::set_permissions(bin.join("ssh"), fs::Permissions::from_mode(0o755))?;
+    let search = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(&repo, &["task", "claim", &id])?;
+    machine
+        .command(
+            &repo,
+            &["--json", "task", "finish", &id, "--evidence", "It works."],
+        )
+        .env("PATH", search)
+        .env_remove("GIT_SSH_COMMAND")
+        .env_remove("GIT_SSH")
+        .output()?;
+    let args = fs::read_to_string(&record)?;
+    assert!(args.contains("BatchMode=yes"), "{args}");
+    Ok(())
+}
+
+#[test]
+fn a_value_of_the_environment_does_not_change_the_target_of_a_push() -> TestResult {
+    let pair = pair()?;
+    let repo = publish(&pair.first, "api", &pair.remote)?;
+    pair.first.ok(&repo, &["git", "enable"])?;
+    let output = pair
+        .first
+        .command(&repo, &["sync"])
+        .env("GIT_NAMESPACE", "other")
+        .output()?;
+    assert!(output.status.success());
+    let refs = pair.first.git(&pair.remote, &["show-ref"])?;
+    assert!(refs.contains(" refs/heads/lenka-data"), "{refs}");
+    assert!(!refs.contains("namespaces"), "{refs}");
+    Ok(())
+}
+
+fn shared_with_remote(machine: &Machine, remote: &Path) -> TestResult<Value> {
+    let url = remote.to_string_lossy().into_owned();
+    machine.json(&machine.root, &["init", "--shared", "--name", "api"])?;
+    machine.json(
+        &machine.root,
+        &["--project", "api", "git", "enable", "--remote", &url],
+    )
+}
+
+/// A second machine must not start separate data on one remote, because the data cannot merge.
+#[test]
+fn a_second_machine_learns_how_to_use_the_shared_data() -> TestResult {
+    let pair = pair()?;
+    let url = pair.remote.to_string_lossy().into_owned();
+    shared_with_remote(&pair.first, &pair.remote)?;
+    let task = pair.first.json(
+        &pair.first.root,
+        &["--project", "api", "task", "create", "A task"],
+    )?;
+    pair.first
+        .ok(&pair.first.root, &["--project", "api", "sync"])?;
+    // A repeat call on the first machine is still safe.
+    shared_with_remote_again(&pair.first, &url)?;
+
+    let second = &pair.second;
+    second.json(&second.root, &["init", "--shared", "--name", "api"])?;
+    let refused = second.run(
+        &second.root,
+        &["--project", "api", "git", "enable", "--remote", &url],
+    )?;
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("git clone --branch lenka-data"),
+        "{message}"
+    );
+
+    // The steps in the message work.
+    let directory = second.root.join("shared-data");
+    let directory_text = directory.to_string_lossy().into_owned();
+    second.git(
+        &second.root,
+        &[
+            "clone",
+            "-q",
+            "--branch",
+            "lenka-data",
+            &url,
+            &directory_text,
+        ],
+    )?;
+    second.json(
+        &second.root,
+        &["init", "--dir", &directory_text, "--name", "from-remote"],
+    )?;
+    second.json(
+        &second.root,
+        &[
+            "--project",
+            "from-remote",
+            "task",
+            "show",
+            text(&task, "task"),
+        ],
+    )?;
+    Ok(())
+}
+
+fn shared_with_remote_again(machine: &Machine, url: &str) -> TestResult {
+    machine.json(
+        &machine.root,
+        &["--project", "api", "git", "enable", "--remote", url],
+    )?;
+    Ok(())
+}
+
+/// A remote can get a branch after the local enable. The sync then gives the steps.
+#[test]
+fn a_sync_with_data_from_another_start_gives_the_steps() -> TestResult {
+    let pair = pair()?;
+    shared_with_remote(&pair.first, &pair.remote)?;
+    shared_with_remote(&pair.second, &pair.remote)?;
+    pair.first
+        .ok(&pair.first.root, &["--project", "api", "sync"])?;
+    let output = pair
+        .second
+        .run(&pair.second.root, &["--project", "api", "sync"])?;
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("git clone --branch lenka-data"),
+        "{message}"
+    );
+    Ok(())
+}
+
+/// A plugin that is off must not run Git for the data of a remote.
+#[test]
+fn init_does_not_restore_while_the_git_plugin_is_off() -> TestResult {
+    let pair = pair()?;
+    let repo = publish(&pair.first, "api", &pair.remote)?;
+    pair.first.ok(&repo, &["git", "enable"])?;
+    pair.first.ok(&repo, &["sync"])?;
+    let second = &pair.second;
+    fs::remove_file(second.root.join("config/plugins.toml"))?;
+    let clone = fresh_clone(second, "api", &pair.remote)?;
+    second.git(&clone, &["fetch", "-q", "origin"])?;
+    let created = second.json(&clone, &["init", "--name", "api"])?;
+    assert_eq!(created["restored"], false, "{created}");
+    let worktrees = second.git(&clone, &["worktree", "list"])?;
+    assert_eq!(worktrees.lines().count(), 1, "{worktrees}");
+    Ok(())
+}
+
+/// A branch with no project file is not lenka data, so a new project must not start on it.
+#[test]
+fn a_branch_with_no_project_file_stops_each_init() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.repo("api")?;
+    let tree = machine.git(&repo, &["hash-object", "-w", "-t", "tree", "/dev/null"])?;
+    let commit = machine.git(&repo, &["commit-tree", tree.trim(), "-m", "Not lenka data"])?;
+    machine.git(&repo, &["branch", "lenka-data", commit.trim()])?;
+    for _ in 0..2 {
+        let output = machine.run(&repo, &["init"])?;
+        assert!(!output.status.success());
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(message.contains("it is not lenka data"), "{message}");
+    }
+    assert!(!repo.join(".git/lenka-data/lenka.toml").exists());
+    Ok(())
+}
+
+/// A file on the disk is newer than the branch, and a file that only the branch has comes back.
+#[test]
+fn enable_keeps_newer_files_and_adds_files_of_the_branch() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = machine.project("api")?;
+    machine.ok(&repo, &["git", "enable"])?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let memory = machine.json(&repo, &["memory", "add", "A note."])?;
+    machine.ok(&repo, &["sync"])?;
+    let data = repo.join(".git/lenka-data");
+    let full = |dir: &str, short: &str| -> TestResult<PathBuf> {
+        let found = fs::read_dir(data.join(dir))?
+            .flatten()
+            .find(|entry| entry.file_name().to_string_lossy().contains(short))
+            .ok_or("no such file")?;
+        Ok(found.path())
+    };
+    let task_dir = full("tasks", text(&task, "task"))?;
+    let memory_file = full("memory", text(&memory, "memory"))?;
+
+    fs::remove_file(data.join(".git"))?;
+    machine.git(&repo, &["worktree", "prune"])?;
+    fs::remove_file(&memory_file)?;
+    let newer = fs::read_to_string(task_dir.join("task.md"))?.replace("A task", "A newer title");
+    fs::write(task_dir.join("task.md"), &newer)?;
+
+    machine.ok(&repo, &["git", "enable"])?;
+    assert!(memory_file.exists(), "the file of the branch came back");
+    assert_eq!(fs::read_to_string(task_dir.join("task.md"))?, newer);
+    Ok(())
+}

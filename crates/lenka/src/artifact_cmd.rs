@@ -52,6 +52,8 @@ fn without_nulls(mut args: Value) -> Value {
 /// Runs an artifact command.
 pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyhow::Result<()> {
     let caller = context.person()?;
+    // A person expects a path from the current directory, and the tool uses the worktree root.
+    let from_cwd = |path: &str| context.cwd.join(path).to_string_lossy().into_owned();
     let (tool, args) = match command {
         ArtifactCommand::Create {
             path,
@@ -59,7 +61,7 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
             media_type,
         } => (
             "artifact.create",
-            json!({"path": path, "name": name, "media_type": media_type}),
+            json!({"path": from_cwd(&path), "name": name, "media_type": media_type}),
         ),
         ArtifactCommand::Update {
             artifact,
@@ -71,7 +73,7 @@ pub fn run(context: &RunContext, host: &Host, command: ArtifactCommand) -> anyho
         } => (
             "artifact.update",
             json!({
-                "artifact": artifact, "path": path, "version": version, "reason": reason,
+                "artifact": artifact, "path": from_cwd(&path), "version": version, "reason": reason,
                 "mode": mode, "claim": claim,
             }),
         ),

@@ -181,6 +181,10 @@ lenka protects against mistakes and untrusted files. It does not protect against
 - The only network use is the Git plugin through system Git, and only when you enable it.
 - Data from a remote is untrusted. `lenka sync` and `lenka init` accept a data branch only if each file has a known lenka path. They refuse a symlink, a `.runtime` directory, a `.gitignore` below the data root, a changed `.gitattributes`, a change of the project ID, and conflict markers in a task. A manual `git pull` in a data directory does not have these checks, so use `lenka sync`.
 - A commit holds only the known lenka paths. Other files stay in the clone, and `lenka sync` lists them. Git exclude rules cannot hide data from a commit.
+- `lenka git enable` needs Git 2.30 or later. It does not move the data, so a running lenka process can continue. A stopped call can run again.
+- A push in an agent call stops after 60 seconds, and the tool result reports this. `LENKA_GIT_PUSH_LIMIT_MS` changes the limit. The call also turns off the password questions of SSH, unless you set your own SSH command.
+- A write waits 30 seconds for the lock, and then fails with `busy`. `LENKA_LOCK_WAIT_MS` changes the limit.
+- A shared data directory (`--shared` or `--dir`) has one start. A second machine must get it from the remote: run `git clone --branch lenka-data <url> <directory>` and `lenka init --dir <directory> --name <name>`. `lenka git enable --remote` refuses a remote that already has separate data.
 - The Git settings of lenka are in the local Git configuration of each clone, in the keys `lenka.enabled`, `lenka.remote`, and `lenka.pushOnFinish`. A remote cannot change them. A merge can change other shared settings in `lenka.toml`, and `lenka sync` names the sections that changed.
 
 ## Known limits

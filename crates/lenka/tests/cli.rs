@@ -1721,3 +1721,45 @@ fn init_with_json_keeps_the_real_path() -> TestResult {
     assert_eq!(value["directory"], path_text.as_str(), "{value}");
     Ok(())
 }
+
+/// A person expects a path from the current directory, not from the root of the clone.
+#[test]
+fn a_relative_artifact_path_uses_the_current_directory() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let docs = repo.join("docs");
+    fs::create_dir_all(&docs)?;
+    fs::write(repo.join("note.txt"), "root file")?;
+    fs::write(docs.join("note.txt"), "docs file")?;
+    let created = machine.json(&docs, &["artifact", "create", "note.txt"])?;
+    let full = text(&created, "full_id").to_owned();
+    let stored = repo
+        .join(".git/lenka-data/artifacts")
+        .join(full)
+        .join("versions/000001/note.txt");
+    assert_eq!(fs::read_to_string(stored)?, "docs file");
+    Ok(())
+}
+
+#[test]
+fn a_memory_search_finds_a_part_of_a_run_and_nothing_for_punctuation() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    machine.json(
+        &repo,
+        &[
+            "memory",
+            "add",
+            "\u{65e5}\u{672c}\u{8a9e}\u{306e}\u{30c6}\u{30b9}\u{30c8}\u{3067}\u{3059}",
+        ],
+    )?;
+    machine.json(&repo, &["memory", "add", "Port 8080 is free."])?;
+    let count = |text: &str| -> TestResult<usize> {
+        let found = machine.json(&repo, &["memory", "search", text])?;
+        Ok(found["memories"].as_array().map_or(0, Vec::len))
+    };
+    assert_eq!(count("\u{65e5}\u{672c}\u{8a9e}")?, 1);
+    assert_eq!(count("***")?, 0);
+    assert_eq!(count("port")?, 1);
+    Ok(())
+}

@@ -693,7 +693,7 @@ impl ToolProvider for ArtifactTools {
         vec![
             ToolDef {
                 name: "artifact.create",
-                description: "Add an artifact from a file in the current worktree. Link it with task.update.",
+                description: "Add an artifact from a file in the current worktree. A relative path starts at the worktree root. Link it with task.update.",
                 input_schema: schema(
                     &["path"],
                     json!({"path": s(), "name": s(), "media_type": s()}),
