@@ -1424,6 +1424,23 @@ fn doctor_reports_old_leftovers_and_removes_them_on_request() -> TestResult {
 }
 
 /// A person can restore the record of an artifact that a task links to.
+/// A skip of a cleanup must not look like a run with nothing to remove.
+#[test]
+fn the_removal_of_leftovers_tells_why_it_skipped_a_step() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    let file = task_directory(&repo.join(".git/lenka-data"), &id)?.join("task.md");
+    std::fs::write(file, "not a task\n")?;
+    let value = doctor_of(&machine, &repo, &["--remove-leftovers"])?;
+    let reason = value["removal_skipped"].as_str().unwrap_or_default();
+    assert!(reason.contains("invalid files"), "{value}");
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(value["removal_skipped"].is_null(), "{value}");
+    Ok(())
+}
+
 #[test]
 fn the_removal_of_leftovers_keeps_the_bytes_of_a_linked_artifact() -> TestResult {
     let (_temp, machine) = machine()?;

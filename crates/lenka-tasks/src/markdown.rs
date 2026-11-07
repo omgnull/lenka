@@ -28,11 +28,11 @@ pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 ///
 /// Returns [`lenka_plugin_api::ErrorCode::InvalidFile`] if a line is a conflict marker.
 pub fn check_conflict_markers(what: &str, text: &str) -> Result<()> {
-    let found = text.lines().any(|line| {
-        line.starts_with("<<<<<<< ")
-            || line.starts_with(">>>>>>> ")
-            || line.trim_end_matches('\r') == "======="
-    });
+    // A line of `=======` alone is a valid Markdown heading underline. Git always writes the other
+    // two markers with it.
+    let found = text
+        .lines()
+        .any(|line| line.starts_with("<<<<<<< ") || line.starts_with(">>>>>>> "));
     if found {
         return Err(LenkaError::invalid_file(format!(
             "{what} has Git conflict markers. Resolve the conflict in the file, and run `lenka reindex`."
@@ -50,25 +50,17 @@ pub fn check_conflict_markers(what: &str, text: &str) -> Result<()> {
 /// a code fence, a code fence with no end, or a line that looks like a Git conflict marker.
 pub fn check_field_text(what: &str, text: &str) -> Result<()> {
     check_line_text(what, text)?;
-    let mut fence: Option<&str> = None;
-    for line in text.lines() {
-        let trimmed = line.trim_end();
-        let marker = trimmed.trim_start();
-        if let Some(open) = fence {
-            if marker.starts_with(open) {
-                fence = None;
-            }
-        } else if marker.starts_with("```") {
-            fence = Some("```");
-        } else if marker.starts_with("~~~") {
-            fence = Some("~~~");
-        } else if trimmed.starts_with("## ") {
-            return Err(LenkaError::invalid_argument(format!(
-                "{what} has a line that starts with `## `. Use `### ` for a heading in this text."
-            )));
-        }
+    let scan = scan_fences(text);
+    let lines = text.split_inclusive('\n').zip(&scan.fenced);
+    if lines
+        .into_iter()
+        .any(|(line, fenced)| !fenced && line.starts_with("## "))
+    {
+        return Err(LenkaError::invalid_argument(format!(
+            "{what} has a line that starts with `## `. Use `### ` for a heading in this field."
+        )));
     }
-    if fence.is_some() {
+    if scan.has_open_fence {
         return Err(LenkaError::invalid_argument(format!(
             "{what} has a code fence with no end. Close the fence."
         )));
@@ -159,19 +151,8 @@ impl Body {
             heading_line: String::new(),
             text: String::new(),
         }];
-        let mut fence: Option<&str> = None;
-        for line in text.split_inclusive('\n') {
-            let trimmed = line.trim_end();
-            let marker = trimmed.trim_start();
-            if let Some(open) = fence {
-                if marker.starts_with(open) {
-                    fence = None;
-                }
-            } else if marker.starts_with("```") {
-                fence = Some("```");
-            } else if marker.starts_with("~~~") {
-                fence = Some("~~~");
-            } else if let Some(heading) = trimmed.strip_prefix("## ") {
+        for (line, fenced) in text.split_inclusive('\n').zip(fenced_lines(text)) {
+            if !fenced && let Some(heading) = line.trim_end().strip_prefix("## ") {
                 sections.push(Section {
                     heading: Some(heading.trim().to_owned()),
                     heading_line: line.to_owned(),
@@ -186,6 +167,7 @@ impl Body {
         if sections.first().is_some_and(|first| first.text.is_empty()) {
             sections.remove(0);
         }
+        merge_repeated_sections(&mut sections);
         Self { sections }
     }
 
@@ -417,29 +399,91 @@ fn parse_criterion(line: &str) -> Option<Criterion> {
 /// Tells for each line of a section if it is inside a code fence. A fence with no end hides
 /// nothing, because a hand edit must not hide a criterion from the finish gate.
 fn fenced_lines(text: &str) -> Vec<bool> {
-    let mut fence: Option<&str> = None;
-    let mut result = Vec::new();
-    for line in text.split_inclusive('\n') {
-        let marker = line.trim();
-        if let Some(open) = fence {
-            result.push(true);
-            if marker.starts_with(open) {
-                fence = None;
+    scan_fences(text).fenced
+}
+
+/// The code fences of a text.
+#[derive(Debug)]
+struct FenceScan {
+    /// Tells for each line if the line is in a closed code fence.
+    fenced: Vec<bool>,
+    /// Tells if a fence has no end. The lines after it do not count as fenced, because a fence that
+    /// a hand edit forgot must not hide a section or a criterion.
+    has_open_fence: bool,
+}
+
+/// Finds code fences with the CommonMark rules: at most three spaces of indent, three or more equal
+/// marks, and an end with the same mark, at least the same count, and no other text.
+fn scan_fences(text: &str) -> FenceScan {
+    let mut fenced = Vec::new();
+    let mut open: Option<(u8, usize, usize)> = None;
+    for (number, line) in text.split_inclusive('\n').enumerate() {
+        let marks = fence_marks(line);
+        if let Some((mark, count, _)) = open {
+            fenced.push(true);
+            if marks.is_some_and(|(found, length, rest)| {
+                found == mark && length >= count && rest.trim().is_empty()
+            }) {
+                open = None;
             }
-        } else if marker.starts_with("```") {
-            fence = Some("```");
-            result.push(true);
-        } else if marker.starts_with("~~~") {
-            fence = Some("~~~");
-            result.push(true);
+        } else if let Some((mark, count, rest)) = marks
+            && (mark != b'`' || !rest.contains('`'))
+        {
+            open = Some((mark, count, number));
+            fenced.push(true);
         } else {
-            result.push(false);
+            fenced.push(false);
         }
     }
-    if fence.is_some() {
-        result.fill(false);
+    if let Some((_, _, start)) = open {
+        fenced[start..].fill(false);
     }
-    result
+    FenceScan {
+        fenced,
+        has_open_fence: open.is_some(),
+    }
+}
+
+/// Returns the mark, the count of marks, and the rest of a line that can start or end a fence.
+fn fence_marks(line: &str) -> Option<(u8, usize, &str)> {
+    let text = line.trim_end_matches(['\n', '\r']);
+    let indent = text.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &text[indent..];
+    let mark = *rest.as_bytes().first()?;
+    if !matches!(mark, b'`' | b'~') {
+        return None;
+    }
+    let count = rest.bytes().take_while(|byte| *byte == mark).count();
+    (count >= 3).then(|| (mark, count, &rest[count..]))
+}
+
+/// Merges a repeated fixed section into the first one. A hand edit can repeat a section, and each
+/// reader and writer must then see the same text.
+fn merge_repeated_sections(sections: &mut Vec<Section>) {
+    for name in [DESCRIPTION, REQUIREMENTS, ACCEPTANCE] {
+        let mut first = None;
+        let mut index = 0;
+        while index < sections.len() {
+            if !has_heading(&sections[index], name) {
+                index += 1;
+                continue;
+            }
+            let Some(target) = first else {
+                first = Some(index);
+                index += 1;
+                continue;
+            };
+            let repeated = sections.remove(index);
+            let text = &mut sections[target].text;
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&repeated.text);
+        }
+    }
 }
 
 /// Tells if two acceptance sections differ in more than their check marks.
@@ -665,16 +709,74 @@ Unknown heading stays.
     }
 
     #[test]
+    fn valid_markdown_forms_pass_the_field_check() {
+        for good in [
+            "````\n```\n## Inside\n```\n````\n",
+            "   ```\n## Inside\n   ```\n",
+            "    ```\nIndented code, and not a fence.\n",
+            "~~~~\n~~~\n## Inside\n~~~~\n",
+            "```\n## Inside\n``` \n",
+            "A heading\n=======\n",
+            "```\n~~~\n## Inside\n```\n",
+            "```\n``` text\n## Inside\n```\n",
+            "``` a`b\nNot a fence, because the first line has a mark in its text.\n",
+        ] {
+            assert!(check_field_text("f", good).is_ok(), "{good}");
+        }
+        for bad in [
+            "````\n```\n## Inside\n",
+            "```\n~~~\n## Inside\n",
+            "```\n``` text\n## Inside\n",
+            "``` a`b\n## Outside\n",
+        ] {
+            assert!(check_field_text("f", bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_long_fence_ends_only_at_a_long_mark() {
+        let body = Body::parse(
+            "## Acceptance criteria\n````\n- [ ] Example\n```\n- [ ] Also\n````\n- [ ] Real\n",
+        );
+        assert_eq!(body.criteria().len(), 1);
+    }
+
+    #[test]
+    fn a_fence_with_no_end_does_not_hide_a_section() {
+        let body = Body::parse("## Description\n```\ntext\n## Acceptance criteria\n- [ ] Real\n");
+        assert_eq!(body.criteria().len(), 1);
+        assert!(body.section("Acceptance criteria").is_some());
+    }
+
+    #[test]
+    fn a_repeated_section_has_one_text_for_each_reader() {
+        let text =
+            "## Acceptance criteria\n- [ ] A\n\n## Notes\nN\n\n## acceptance criteria\n- [ ] B\n";
+        let mut body = Body::parse(text);
+        assert_eq!(body.criteria().len(), 2);
+        let section = body.section("Acceptance criteria").unwrap_or_default();
+        assert!(
+            section.contains("- [ ] A") && section.contains("- [ ] B"),
+            "{section}"
+        );
+        body.set_section("Acceptance criteria", "- [x] New");
+        let criteria = body.criteria();
+        assert_eq!(criteria.len(), 1);
+        assert_eq!(criteria[0].text, "New");
+        assert!(body.to_text().contains("## Notes\nN"));
+    }
+
+    #[test]
     fn conflict_markers_are_found() {
         assert!(check_conflict_markers("f", "a\n<<<<<<< HEAD\nb").is_err());
-        assert!(check_conflict_markers("f", "a\n=======\nb").is_err());
+        assert!(check_conflict_markers("f", "a\n=======\nb").is_ok());
         assert!(check_conflict_markers("f", "a\n====\nb").is_ok());
         assert!(check_field_text("f", "a\n```\n## in a fence\n```\n### b\n").is_ok());
         for bad in [
             "## Requirements\nFAKE",
             "```\ncode",
             "~~~\ncode",
-            "a\n=======\nb",
+            "a\n>>>>>>> branch\nb",
         ] {
             assert!(check_field_text("f", bad).is_err(), "{bad}");
         }

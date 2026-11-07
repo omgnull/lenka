@@ -220,17 +220,19 @@ pub struct StoredBytes {
 
 /// The contract of an artifact store. The bytes stay as they are.
 pub trait ArtifactStore: Send + Sync + fmt::Debug {
-    /// Stores a version from a local file.
+    /// Stores a version from a local file. With an expected hash, the store compares the hash before
+    /// the bytes get their final name. A stop of the process then leaves no unchecked bytes there.
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be copied.
+    /// Returns an error if the file cannot be copied, or if the bytes do not have the expected hash.
     fn put_file(
         &self,
         id: ArtifactId,
         version: u64,
         name: &str,
         source: &Path,
+        expected_sha256: Option<&str>,
     ) -> Result<StoredBytes>;
 
     /// Stores a version from memory.

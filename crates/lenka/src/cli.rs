@@ -781,11 +781,12 @@ struct DoctorOptions {
 fn doctor(context: &RunContext, host: &Host, options: &DoctorOptions) -> anyhow::Result<ExitCode> {
     let project = host.project_for(&context.person()?, None)?;
     let service = lenka_tasks::service_of(&project)?;
-    let removed = if options.remove_leftovers {
+    let leftovers = if options.remove_leftovers {
         service.remove_leftovers()?
     } else {
-        Vec::new()
+        lenka_tasks::Leftovers::default()
     };
+    let removed = &leftovers.removed;
     let depth = if options.hashes {
         lenka_tasks::DoctorDepth::Hashes
     } else {
@@ -811,12 +812,16 @@ fn doctor(context: &RunContext, host: &Host, options: &DoctorOptions) -> anyhow:
         "clean": clean,
         "report": report,
         "removed": removed,
+        "removal_skipped": leftovers.skipped,
         "network_file_system": network,
         "lfs_not_downloaded": not_downloaded,
     });
     context.print(&value, |_| {
-        for item in &removed {
+        for item in removed {
             say!("Removed {item}");
+        }
+        if let Some(reason) = &leftovers.skipped {
+            say!("{reason}");
         }
         if clean {
             say!("The project {} has no problems.", project.name());

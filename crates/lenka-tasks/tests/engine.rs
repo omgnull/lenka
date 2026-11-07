@@ -4030,3 +4030,96 @@ fn each_operation_gives_the_expected_result_in_each_state() -> Result<()> {
     assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }
+
+/// A person can keep a value in the title with an override. An agent must still be able to check a
+/// criterion, because a check adds no new text.
+#[test]
+fn an_override_of_the_secret_check_does_not_stop_a_later_change() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let agent = fx.agent("a");
+    let new = NewTask {
+        title: secret_value(),
+        acceptance: "- [ ] One".to_owned(),
+        secret_policy: lenka_core::SecretPolicy::PersonOverride,
+        ..task("x")
+    };
+    let id = service.create(&human, new)?.id();
+    service.claim(&agent, Some(id), None, None)?;
+    let check = TaskPatch {
+        expected_version: 1,
+        check: vec![lenka_tasks::CheckItem {
+            index: 0,
+            done: true,
+        }],
+        ..TaskPatch::default()
+    };
+    let meta = service.update(&agent, id, check)?;
+    // A new secret in a field still fails.
+    let bad = TaskPatch {
+        expected_version: meta.state.version,
+        title: Some(format!("New {}", secret_value())),
+        reason: Some("A reason.".to_owned()),
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&agent, id, bad)),
+        ErrorCode::SecretDetected
+    );
+    let bad = TaskPatch {
+        expected_version: meta.state.version,
+        labels_add: vec![secret_value()],
+        ..TaskPatch::default()
+    };
+    assert_eq!(
+        code(service.update(&agent, id, bad)),
+        ErrorCode::SecretDetected
+    );
+    Ok(())
+}
+
+/// `task.show` cannot read a task with invalid files, so the message must offer another way.
+#[test]
+fn a_notice_about_an_invalid_task_names_a_way_out() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let human = fx.human();
+    let agent = fx.agent("a");
+    let parent = create(&service, &human, "Parent")?;
+    let new = NewTask {
+        parent: Some(parent),
+        ..task("Child")
+    };
+    let child = service.create(&human, new)?.id();
+    let claim = service.claim(&agent, Some(child), None, None)?;
+    let change = TaskPatch {
+        expected_version: 1,
+        description: Some("Changed.".to_owned()),
+        reason: Some("A reason.".to_owned()),
+        ..TaskPatch::default()
+    };
+    service.update(&human, parent, change)?;
+    write_file(&task_file(&fx, parent, "task.md"), "not a task\n")?;
+    let host = build_host(&fx.paths, &fx.clock)?;
+    let running = service_of(&host.open_by_name("api")?)?;
+    running.list(&agent, &ListFilter::default())?;
+    let done = Finish::Done {
+        evidence: "A check.".to_owned(),
+        unchecked_reason: None,
+    };
+    let handle = ClaimRef::Handle(claim.handle);
+    let Err(error) = running.finish(&agent, child, &handle, &done) else {
+        return Err(LenkaError::invalid_argument("The finish must fail."));
+    };
+    assert_eq!(error.code(), ErrorCode::UnreadChanges);
+    let message = error.to_string();
+    assert!(message.contains(&parent.to_string()), "{message}");
+    assert!(message.contains("ask a person"), "{message}");
+    assert!(
+        running
+            .finish(&agent, child, &handle, &Finish::Released)
+            .is_ok()
+    );
+    Ok(())
+}

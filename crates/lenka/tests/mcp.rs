@@ -602,6 +602,63 @@ async fn the_text_of_an_invalid_file_stays_in_untrusted_data() -> TestResult {
     Ok(())
 }
 
+/// After the agent removes the link from its task, a notice of the artifact has no effect on that
+/// task. Another task can still link to the artifact.
+#[tokio::test]
+async fn a_notice_of_an_artifact_stops_no_finish_after_the_link_goes() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    std::fs::write(repo.join("a.txt"), "First")?;
+    let artifact = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let artifact = text(&artifact, "artifact").to_owned();
+    let mut versions = Vec::new();
+    let mut ids = Vec::new();
+    for title in ["One", "Two"] {
+        let task = machine.json(&repo, &["task", "create", title])?;
+        let id = text(&task, "task").to_owned();
+        let link = [
+            "task",
+            "update",
+            &id,
+            "--version",
+            "1",
+            "--artifact-add",
+            &artifact,
+        ];
+        versions.push(machine.json(&repo, &link)?["version"].to_string());
+        ids.push(id);
+    }
+    let client = connect(&machine, &repo, None, Era::Initialize).await?;
+    let claim = call_ok(&client, "task.claim", json!({"task": ids[0]})).await?;
+    let handle = text(&claim, "claim").to_owned();
+    std::fs::write(repo.join("a.txt"), "Second")?;
+    let update = [
+        "artifact",
+        "update",
+        &artifact,
+        "a.txt",
+        "--version",
+        "1",
+        "--reason",
+        "A reason.",
+    ];
+    machine.json(&repo, &update)?;
+    let finish =
+        json!({"task": ids[0], "claim": handle, "outcome": "done", "evidence": "It works."});
+    let error = call_error(&client, "task.finish", finish.clone()).await?;
+    assert_eq!(error["code"], "unread_changes");
+    let unlink = json!({
+        "task": ids[0],
+        "version": versions[0].parse::<u64>()?,
+        "claim": handle,
+        "artifacts_remove": [artifact],
+    });
+    call_ok(&client, "task.update", unlink).await?;
+    call_ok(&client, "task.finish", finish).await?;
+    client.cancel().await?;
+    Ok(())
+}
+
 /// A task read closes a notice of an artifact. With no link to the artifact, no read can close the
 /// notice, so the notice must not stop a finish.
 #[tokio::test]

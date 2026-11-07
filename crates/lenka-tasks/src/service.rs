@@ -113,6 +113,15 @@ pub struct CheckItem {
     pub done: bool,
 }
 
+/// The result of a removal of leftovers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Leftovers {
+    /// The removed paths.
+    pub removed: Vec<String>,
+    /// The reason for a removal that lenka did not do.
+    pub skipped: Option<String>,
+}
+
 /// A change to a task. An empty field changes nothing.
 #[derive(Debug, Clone, Default)]
 pub struct TaskPatch {
@@ -1242,11 +1251,12 @@ impl TaskService {
                     ops.push(loop_count_op(self.project.driver(), &id.to_string(), now)?);
                 }
             }
-            let mut checks = vec![
-                TextCheck::new("title", front.title.clone()),
-                TextCheck::new("labels", front.labels.join("\n")),
-            ];
+            // Only new text gets the check. A person can keep a value with an override, and that
+            // value must not stop each later change of the task.
+            let mut checks = vec![TextCheck::new("labels", patch.labels_add.join("\n"))];
+            let new_title = patch.title.as_ref().filter(|title| **title != meta.front.title);
             for (name, text) in [
+                ("title", new_title),
                 ("description", patch.description.as_ref()),
                 ("requirements", patch.requirements.as_ref()),
                 ("acceptance criteria", patch.acceptance.as_ref()),
@@ -2898,13 +2908,18 @@ impl TaskService {
     /// # Errors
     ///
     /// Returns an error if the lock fails or a removal fails.
-    pub fn remove_leftovers(&self) -> Result<Vec<String>> {
+    pub fn remove_leftovers(&self) -> Result<Leftovers> {
         let mut removed = self.project.remove_old_temp_files()?;
+        let mut skipped = None;
         self.project.write_locked(|_locked| {
             let mut fresh = Index::default();
             fresh.scan(self.project.driver())?;
             // A task with invalid files can hold a link that this scan cannot see.
             if !fresh.invalid.is_empty() {
+                skipped = Some(format!(
+                    "lenka did not remove unlinked artifact directories, because {} tasks have invalid files. Repair these tasks, and run this command again.",
+                    fresh.invalid.len()
+                ));
                 return Ok(());
             }
             let linked: HashSet<ArtifactId> = fresh
@@ -2920,7 +2935,7 @@ impl TaskService {
             }
             Ok(())
         })?;
-        Ok(removed)
+        Ok(Leftovers { removed, skipped })
     }
 
     /// Checks the project, with a choice about the read of artifact bytes.
@@ -3356,18 +3371,32 @@ fn notice_subject_exists(
     }
 }
 
-/// A task read closes a notice of an artifact only if a task links to the artifact. A notice
-/// with no such task must not stop any work.
-fn notice_can_close(index: &Index, notice: &Notice) -> bool {
+/// A notice of an artifact stops a finish only while the claimed task links to the artifact. After
+/// the link goes, the artifact has no effect on this task, and a read of the task cannot close it.
+fn notice_applies_to_task(index: &Index, notice: &Notice, task: TaskId) -> bool {
     match &notice.subject {
         Subject::Task(_) => true,
         Subject::Artifact(id) => ArtifactId::parse(id).is_ok_and(|id| {
             index
                 .artifact_users
                 .get(&id)
-                .is_some_and(|users| !users.is_empty())
+                .is_some_and(|users| users.contains(&task))
         }),
     }
+}
+
+/// Returns the invalid tasks in a list of notices. `task.show` cannot read such a task.
+fn invalid_subjects(index: &Index, unread: &[&Notice]) -> Vec<String> {
+    unread
+        .iter()
+        .filter_map(|notice| match &notice.subject {
+            Subject::Task(id) => TaskId::parse(id).ok(),
+            Subject::Artifact(_) => None,
+        })
+        .filter(|id| index.invalid.contains_key(id))
+        .take(MAX_NAMES_IN_ERROR)
+        .map(|id| id.to_string())
+        .collect()
 }
 
 fn check_unread(
@@ -3383,11 +3412,21 @@ fn check_unread(
         .filter(|notice| {
             notice.claimed_task == task
                 && notice_subject_exists(index, driver, notice)
-                && notice_can_close(index, notice)
+                && notice_applies_to_task(index, notice, claim.task)
         })
         .collect();
     if unread.is_empty() {
         return Ok(());
+    }
+    let invalid = invalid_subjects(index, &unread);
+    if !invalid.is_empty() {
+        return Err(LenkaError::new(
+            ErrorCode::UnreadChanges,
+            format!(
+                "This agent has unread changes in tasks with invalid files: {}. task.show cannot read these tasks. Release this task with task.finish, or ask a person to repair the files.",
+                invalid.join(", ")
+            ),
+        ));
     }
     let names: Vec<String> = unread
         .iter()

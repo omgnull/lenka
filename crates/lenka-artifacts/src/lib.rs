@@ -279,7 +279,7 @@ impl ArtifactService {
     ) -> Result<StoredBytes> {
         let store = self.project.artifacts();
         let stored = match &prepared.content {
-            Content::Path(path) => store.put_file(id, version, &prepared.file, path)?,
+            Content::Path(path) => store.put_file(id, version, &prepared.file, path, checked)?,
             Content::Bytes(bytes) => store.put_bytes(id, version, &prepared.file, bytes)?,
         };
         if checked.is_some_and(|sha256| sha256 != stored.sha256) {

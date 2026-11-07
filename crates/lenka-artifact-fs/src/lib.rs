@@ -171,6 +171,7 @@ impl ArtifactStore for FsStore {
         version: u64,
         name: &str,
         source: &Path,
+        expected_sha256: Option<&str>,
     ) -> Result<StoredBytes> {
         let target = self.file_of(id, version, name)?;
         let mut input = files::open_regular(source, Links::Refuse)
@@ -205,11 +206,19 @@ impl ArtifactStore for FsStore {
             }
             size += count as u64;
         }
+        let sha256 = digest_text(hasher);
+        if expected_sha256.is_some_and(|expected| expected != sha256) {
+            #[expect(
+                clippy::let_underscore_must_use,
+                reason = "The compare already failed, and that error goes to the caller."
+            )]
+            let _ = fs::remove_file(&temp);
+            return Err(LenkaError::invalid_argument(
+                "The source file changed during this call, so lenka did not store it. Try again.",
+            ));
+        }
         self.finish_write(&temp, &target, &output)?;
-        Ok(StoredBytes {
-            size,
-            sha256: digest_text(hasher),
-        })
+        Ok(StoredBytes { size, sha256 })
     }
 
     fn put_bytes(
@@ -341,7 +350,14 @@ mod tests {
 
         let source = temp.path().join("source.bin");
         fs::write(&source, b"abc").map_err(|err| LenkaError::io("write", &err))?;
-        assert_eq!(store.put_file(id, 2, "b.bin", &source)?, stored);
+        assert_eq!(store.put_file(id, 2, "b.bin", &source, None)?, stored);
+        let same = Some(stored.sha256.as_str());
+        assert_eq!(store.put_file(id, 3, "c.bin", &source, same)?, stored);
+        assert!(store.put_file(id, 4, "d.bin", &source, Some("00")).is_err());
+        assert!(
+            store.get(id, 4, "d.bin").is_err(),
+            "changed bytes must not reach their final name"
+        );
 
         store.delete_version(id, 1)?;
         assert!(store.get(id, 1, "a.txt").is_err());
