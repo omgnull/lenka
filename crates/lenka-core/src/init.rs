@@ -81,6 +81,10 @@ pub fn clone_file_for(paths: &Paths, dir: &Path) -> PathBuf {
 #[must_use]
 pub fn find_clone_file(paths: &Paths, start: &Path) -> Option<PathBuf> {
     if let Some(location) = gitdir::locate(start) {
+        // A `.git` file from another author can name the Git directory of a real clone.
+        if !gitdir::is_made_by_git(&location.worktree) {
+            return None;
+        }
         let file = location.common_dir.join(CLONE_FILE);
         if file.is_file() {
             return Some(file);
@@ -961,6 +965,33 @@ mod tests {
         fs::create_dir_all(&evil).map_err(|err| LenkaError::io("mkdir", &err))?;
         fs::write(evil.join(".git"), format!("gitdir: {}\n", sub.display()))
             .map_err(|err| LenkaError::io("write", &err))?;
+        assert_eq!(find_clone_file(&paths, &evil), None);
+        let caller = caller_for(&paths, &evil, setup(Actor::Agent, None))?;
+        assert_eq!(caller.scope, ProjectScope::Listed(Vec::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_git_file_that_names_a_real_clone_selects_no_project() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).map_err(|err| LenkaError::io("mkdir", &err))?;
+        let made = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&work)
+            .status()
+            .map_err(|err| LenkaError::io("git", &err))?;
+        assert!(made.success());
+        create_project(&paths, &work, Some("api"), &Location::Shared)?;
+        assert!(find_clone_file(&paths, &work).is_some());
+        let evil = temp.path().join("downloads").join("evil");
+        fs::create_dir_all(&evil).map_err(|err| LenkaError::io("mkdir", &err))?;
+        fs::write(
+            evil.join(".git"),
+            format!("gitdir: {}\n", work.join(".git").display()),
+        )
+        .map_err(|err| LenkaError::io("write", &err))?;
         assert_eq!(find_clone_file(&paths, &evil), None);
         let caller = caller_for(&paths, &evil, setup(Actor::Agent, None))?;
         assert_eq!(caller.scope, ProjectScope::Listed(Vec::new()));

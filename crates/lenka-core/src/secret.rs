@@ -322,8 +322,12 @@ fn find_token(text: &str) -> Option<&'static str> {
             if fits {
                 return Some(name);
             }
+            // A later prefix in the run fails too, but only if the prefix has only token bytes.
+            // Otherwise a later prefix can start in the run and end after it, as in `SG.-SG.`.
             // The run has only ASCII bytes, so its end is a character boundary.
-            from = after + read;
+            if prefix.bytes().all(is_token_char) {
+                from = after + read;
+            }
         }
     }
     has_jwt(text).then_some("JSON web token")
@@ -589,7 +593,17 @@ mod tests {
         // increase, so that a quadratic cost fails the test in seconds and not in an hour.
         for size in [16, 64, 256, 1024].map(|kib| kib * 1024) {
             for unit in [
-                "sk-", "npm_", "hf_", "pypi-", "eyJ-", "eyJ_", "AKIA", "AKIA_",
+                "sk-",
+                "npm_",
+                "hf_",
+                "pypi-",
+                "eyJ-",
+                "eyJ_",
+                "AKIA",
+                "AKIA_",
+                "SG.-",
+                "ya29._",
+                "hooks.slack.com/services/T-",
             ] {
                 let text = unit.repeat(size / unit.len());
                 let started = std::time::Instant::now();
@@ -606,6 +620,17 @@ mod tests {
         for unit in ["sk-", "npm_", "hf_", "pypi-"] {
             let text = format!("{} {}", unit.repeat(100), fake(unit, 40));
             assert!(find_pattern(&text).is_some(), "{unit}");
+        }
+        // A prefix with a `.` or a `/` can start at the end of the run of an earlier prefix.
+        let key = "aB3dE6gH9jK2mN5pQ8sT";
+        for text in [
+            format!("SG.-SG.{key}"),
+            format!("ya29._ya29.{key}{key}"),
+            format!(
+                "https://hooks.slack.com/services/T-hooks.slack.com/services/T01234567/B01234567/{key}"
+            ),
+        ] {
+            assert!(find_pattern(&text).is_some(), "{text}");
         }
         let jwt = format!("eyJ{0}.eyJ{0}.{0}", "abcdefghijkl");
         assert!(find_pattern(&["eyJ-".repeat(100), jwt.clone()].concat()).is_some());

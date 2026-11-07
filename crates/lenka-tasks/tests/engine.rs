@@ -4614,6 +4614,25 @@ fn the_finish_gate_reads_each_form_of_the_criteria_heading() -> Result<()> {
     Ok(())
 }
 
+/// A box that a criterion mark cannot reach gets a message that names a text edit.
+#[test]
+fn the_finish_gate_names_a_criterion_that_task_show_does_not_list() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let new = NewTask {
+        description: "Text.\n\n### Acceptance criteria\n\n- [ ] From a template".to_owned(),
+        acceptance: "- [x] Real".to_owned(),
+        ..task("T")
+    };
+    let id = service.create(&human, new)?.id();
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let result = service.finish(&agent, id, &ClaimRef::Handle(claim.handle), &finish_done());
+    let message = result.err().map(|err| err.to_string()).unwrap_or_default();
+    assert!(message.contains("does not list"), "{message}");
+    Ok(())
+}
+
 /// A damaged old version record does not stop the record of a hand edit.
 #[test]
 fn a_hand_edit_over_a_damaged_version_record_becomes_a_version() -> Result<()> {
@@ -4666,7 +4685,7 @@ fn a_claim_with_no_task_skips_a_task_that_lenka_cannot_read() -> Result<()> {
 
 /// A version directory with a name that TOML cannot store is not the newest version.
 #[test]
-fn a_version_name_above_the_toml_limit_is_ignored() -> Result<()> {
+fn a_version_name_above_the_limit_is_ignored() -> Result<()> {
     let fx = fixture()?;
     let service = fx.project("api")?;
     let (agent, human) = (fx.agent("a"), fx.human());
@@ -4675,10 +4694,50 @@ fn a_version_name_above_the_toml_limit_is_ignored() -> Result<()> {
     fs::create_dir_all(versions.join("000002")).map_err(|err| LenkaError::io("mkdir", &err))?;
     fs::write(versions.join("000002/meta.toml"), "")
         .map_err(|err| LenkaError::io("write", &err))?;
-    fs::create_dir_all(versions.join("9223372036854775808"))
-        .map_err(|err| LenkaError::io("mkdir", &err))?;
+    for name in [
+        "9007199254740991",
+        "9223372036854775807",
+        "18446744073709551615",
+    ] {
+        fs::create_dir_all(versions.join(name)).map_err(|err| LenkaError::io("mkdir", &err))?;
+    }
     service.claim(&agent, Some(id), None, None)?;
     assert!(service.detail(id, &[])?.meta.state.version < 10);
+    Ok(())
+}
+
+/// A hand edit can set a version that has no next version. The task is invalid, and the other
+/// tasks still work.
+#[test]
+fn a_version_above_the_limit_makes_the_task_invalid() -> Result<()> {
+    for version in ["9007199254740992", "18446744073709551615"] {
+        let fx = fixture()?;
+        let service = fx.project("api")?;
+        let human = fx.human();
+        let id = create(&service, &human, "T")?;
+        let other = create(&service, &human, "Other")?;
+        hand_edit(
+            &fx,
+            id,
+            "state.toml",
+            "version = 1",
+            &format!("version = {version}"),
+        )?;
+        hand_edit(&fx, id, "task.md", "Text.", "Edited.")?;
+        let host = build_host(&fx.paths, &fx.clock)?;
+        let fresh = service_of(&host.open_by_name("api")?)?;
+        let detail = fresh.detail(id, &[])?;
+        assert_eq!(detail.meta.state.stage, "invalid", "{version}");
+        assert!(
+            detail
+                .warnings
+                .iter()
+                .any(|item| item.contains("above the limit")),
+            "{version}"
+        );
+        let claim = fresh.claim(&fx.agent("a"), None, None, None)?;
+        assert_eq!(claim.task, other, "{version}");
+    }
     Ok(())
 }
 

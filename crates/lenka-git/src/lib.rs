@@ -188,11 +188,16 @@ impl Git {
 
     /// Runs a command that uses the network. An agent call has a time limit and no SSH prompt.
     fn run_network(&self, what: &str, args: &[&str]) -> Result<()> {
+        check_output(what, &self.network_output(what, args)?)
+    }
+
+    /// Runs a command that uses the network, and gives its output. An agent call has a time limit
+    /// and no SSH prompt.
+    fn network_output(&self, what: &str, args: &[&str]) -> Result<Output> {
         let mut command = self.command();
         command.args(args);
         if self.prompt == Prompt::Allowed {
-            let output = command.output().map_err(|err| git_start_error(&err))?;
-            return check_output(what, &output);
+            return command.output().map_err(|err| git_start_error(&err));
         }
         // `GIT_TERMINAL_PROMPT` has no effect on the SSH client. A setting of the person stays.
         if std::env::var_os("GIT_SSH_COMMAND").is_none()
@@ -204,7 +209,7 @@ impl Git {
         let limit = parse_push_limit(std::env::var(PUSH_LIMIT_ENV).ok().as_deref());
         let output = output_with_limit(command, limit).map_err(|err| git_start_error(&err))?;
         match output {
-            Some(output) => check_output(what, &output),
+            Some(output) => Ok(output),
             None => Err(LenkaError::new(
                 ErrorCode::Io,
                 format!(
@@ -560,12 +565,27 @@ fn check_and_push(
     push(git, remote, &commit)
 }
 
-/// Returns the tracking ref of the data branch, if this clone has it.
-fn tracking_ref(git: &Git, remote: &str) -> Result<Option<String>> {
-    let tracking = format!("refs/remotes/{remote}/{BRANCH}");
+/// Returns the commit of the data branch on the remote, if this clone has that commit. A push
+/// then sends only the objects after it. With no result, the check reads all objects.
+fn remote_base(git: &Git, remote: &str) -> Result<Option<String>> {
+    let listing = git.network_output("ls-remote", &["ls-remote", "--heads", remote, BRANCH_REF])?;
+    check_output("ls-remote", &listing)?;
+    let text = String::from_utf8_lossy(&listing.stdout);
+    let Some(commit) = text
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(_, name)| *name == BRANCH_REF)
+        .map(|(commit, _)| commit.to_owned())
+    else {
+        return Ok(None);
+    };
+    if !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let object = format!("{commit}^{{commit}}");
     Ok(git
-        .passes(["rev-parse", "--verify", "-q", tracking.as_str()])?
-        .then_some(tracking))
+        .passes(["cat-file", "-e", object.as_str()])?
+        .then_some(commit))
 }
 
 /// Checks each object that a push sends: the files, the folders, and the commit messages. A write
@@ -1698,9 +1718,10 @@ impl GitHook {
         let git = open_data_repo(project, Prompt::Denied)?;
         commit_locked(project, &git, message)?;
         if finished && settings.push_on_finish && has_remote(&git, &settings.remote)? {
-            // The hook does not fetch, so the tracking ref can be old. Then the check reads more
-            // objects than the push sends.
-            let base = tracking_ref(&git, &settings.remote)?;
+            // The hook does not fetch, so the tracking ref can be old. A person can delete the
+            // branch on the remote, and the push then sends all objects. So the remote names the
+            // base.
+            let base = remote_base(&git, &settings.remote)?;
             check_and_push(
                 &git,
                 &settings.remote,

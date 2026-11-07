@@ -943,6 +943,34 @@ fn a_push_on_finish_does_not_push_a_secret() -> TestResult {
     Ok(())
 }
 
+/// A person can delete the branch on the remote to remove a secret. The tracking ref of the clone
+/// then names a commit that the remote no longer has, so the push at a finish must check all
+/// objects.
+#[test]
+fn a_push_on_finish_checks_all_objects_after_the_remote_lost_the_branch() -> TestResult {
+    let pair = pair()?;
+    let machine = &pair.first;
+    let repo = publish(machine, "api", &pair.remote)?;
+    machine.ok(&repo, &["git", "enable", "--push-on-finish"])?;
+    machine.json(&repo, &["sync"])?;
+    let edited = memory_with_token(machine, &repo)?;
+    machine.json(&repo, &["sync", "--allow-secret"])?;
+    assert!(remote_history(machine, &pair.remote)?.contains(&edited.token));
+    machine.git(&pair.remote, &["branch", "-D", "lenka-data"])?;
+
+    let task = machine.json(&repo, &["task", "create", "A task"])?;
+    let id = text(&task, "task").to_owned();
+    machine.json(&repo, &["task", "claim", &id])?;
+    let done = machine.json(&repo, &["task", "finish", &id, "--evidence", "It works."])?;
+    assert_eq!(done["status"], "done", "{done}");
+    assert!(done.to_string().contains("allow-secret"), "{done}");
+    assert!(
+        !remote_history(machine, &pair.remote)?.contains(&edited.token),
+        "the token reached the remote again"
+    );
+    Ok(())
+}
+
 #[test]
 fn a_failed_push_still_reports_the_merge_and_rebuilds_the_index() -> TestResult {
     let pair = pair()?;

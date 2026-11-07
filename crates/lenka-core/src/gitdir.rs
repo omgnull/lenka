@@ -99,17 +99,88 @@ pub fn main_worktree_of_linked(worktree: &Path) -> Option<PathBuf> {
     if list.file_name()? != "worktrees" || common.file_name()? != ".git" {
         return None;
     }
-    let back = read_text_limited(&git_dir.join("gitdir"), Links::Refuse, GIT_FILE_LIMIT).ok()?;
-    let back = Path::new(back.trim());
-    let back = if back.is_absolute() {
-        back.to_path_buf()
-    } else {
-        git_dir.join(back)
-    };
-    if real_path(&back).ok()? != real_path(&dot_git).ok()? {
+    if !is_made_by_git(&worktree) {
         return None;
     }
     common.parent().map(Path::to_path_buf)
+}
+
+/// Tells if Git made the `.git` entry of a worktree.
+///
+/// A `.git` directory is always from Git. A `.git` file can come from another author, and it can
+/// name the Git directory of a real clone. So a file counts only in two cases:
+///
+/// - A linked worktree: the file `gitdir` in the Git directory names this `.git` file.
+/// - A submodule: the setting `core.worktree` of the Git directory names this worktree.
+#[must_use]
+pub fn is_made_by_git(worktree: &Path) -> bool {
+    let Ok(worktree) = real_path(worktree) else {
+        return false;
+    };
+    let dot_git = worktree.join(".git");
+    let Ok(meta) = fs::symlink_metadata(&dot_git) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return true;
+    }
+    if !meta.is_file() {
+        return false;
+    }
+    let Some(git_dir) = read_git_file(&dot_git, &worktree) else {
+        return false;
+    };
+    let names = |text: Option<String>, base: &Path, target: &Path| {
+        text.and_then(|text| {
+            let path = Path::new(text.trim());
+            let full = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            };
+            real_path(&full).ok()
+        })
+        .is_some_and(|found| real_path(target).is_ok_and(|target| found == target))
+    };
+    let back = read_text_limited(&git_dir.join("gitdir"), Links::Refuse, GIT_FILE_LIMIT).ok();
+    if names(back, &git_dir, &dot_git) {
+        return true;
+    }
+    let config = read_text_limited(&git_dir.join("config"), Links::Refuse, GIT_FILE_LIMIT).ok();
+    names(
+        config.as_deref().and_then(core_worktree),
+        &git_dir,
+        &worktree,
+    )
+}
+
+/// Gives the value of `core.worktree` in the text of a Git configuration file.
+fn core_worktree(text: &str) -> Option<String> {
+    let mut in_core = false;
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.eq_ignore_ascii_case("[core]");
+            continue;
+        }
+        if !in_core {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("worktree") {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or(value);
+            // A later value replaces an earlier one, as in Git.
+            found = Some(value.to_owned());
+        }
+    }
+    found
 }
 
 fn read_git_file(file: &Path, base: &Path) -> Option<PathBuf> {
@@ -187,6 +258,69 @@ mod tests {
         assert_ne!(first.worktree, second.worktree);
         assert_eq!(first.worktree, real_path(&main)?);
         Ok(())
+    }
+
+    #[test]
+    fn only_a_git_file_from_git_counts() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let main = temp.path().join("main");
+        let library = temp.path().join("library");
+        fs::create_dir_all(&main)?;
+        fs::create_dir_all(&library)?;
+        git(&library, &["init", "-q"]);
+        git(&library, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(&main, &["init", "-q"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        git(&main, &["worktree", "add", "-q", "../linked"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &library.display().to_string(),
+                "lib",
+            ],
+        );
+        let linked = temp.path().join("linked");
+        assert!(is_made_by_git(&main));
+        assert!(is_made_by_git(&linked));
+        assert!(is_made_by_git(&main.join("lib")));
+        assert_eq!(main_worktree_of_linked(&linked), Some(real_path(&main)?));
+        assert_eq!(main_worktree_of_linked(&main.join("lib")), None);
+
+        // A `.git` file from another author names a real Git directory of each kind.
+        let git_dir = main.join(".git");
+        for target in [
+            git_dir.clone(),
+            git_dir.join("worktrees").join("linked"),
+            git_dir.join("modules").join("lib"),
+        ] {
+            let evil = temp.path().join("evil");
+            fs::create_dir_all(&evil)?;
+            fs::write(evil.join(".git"), format!("gitdir: {}\n", target.display()))?;
+            assert!(locate(&evil).is_some(), "{}", target.display());
+            assert!(!is_made_by_git(&evil), "{}", target.display());
+            assert_eq!(main_worktree_of_linked(&evil), None);
+            fs::remove_dir_all(&evil)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_worktree_setting_comes_from_the_core_section() {
+        assert_eq!(
+            core_worktree("[core]\n\tworktree = ../../../lib\n").as_deref(),
+            Some("../../../lib")
+        );
+        assert_eq!(
+            core_worktree("[Core]\nWorkTree=\"a b\"\n[core]\nworktree = c\n").as_deref(),
+            Some("c")
+        );
+        assert_eq!(core_worktree("[remote \"x\"]\nworktree = a\n"), None);
+        assert_eq!(core_worktree("worktree = a\n"), None);
     }
 
     #[test]

@@ -1218,7 +1218,7 @@ impl TaskService {
                 }
             }
 
-            let version = meta.state.version + 1;
+            let version = crate::index::next_version(meta.state.version)?;
             new_state.version = version;
             // A hand edit can add comments and unknown keys to the front matter, and they stay.
             let old_text = read_text(self.project.driver(), &format!("{}/task.md", root_of(id)))?
@@ -2206,8 +2206,16 @@ impl TaskService {
                         ));
                     }
                     let loaded = load_task(self.project.driver(), id)?;
-                    let unchecked = Body::parse(&loaded.body).unchecked_criteria();
+                    let body = Body::parse(&loaded.body);
+                    let unchecked = body.unchecked_criteria();
+                    let unlisted = unchecked - body.unchecked_listed().min(unchecked);
                     let reason = unchecked_reason.as_deref().map(str::trim).unwrap_or("");
+                    if unchecked > 0 && reason.is_empty() && unlisted > 0 {
+                        // A criterion mark cannot reach these boxes, so only a text edit can.
+                        return Err(LenkaError::invalid_argument(format!(
+                            "{unchecked} acceptance criteria are not checked. {unlisted} of them are below another heading \"Acceptance criteria\", or in a heading form that task.show does not list. Change that text with task.update, or give `unchecked_reason`."
+                        )));
+                    }
                     if unchecked > 0 && reason.is_empty() {
                         return Err(LenkaError::invalid_argument(format!(
                             "{unchecked} acceptance criteria are not checked. Check them with task.update, or give `unchecked_reason`."
@@ -2916,7 +2924,7 @@ impl TaskService {
             old_plan.as_deref(),
             current.plan.as_deref(),
         );
-        let version = old_version + 1;
+        let version = crate::index::next_version(old_version)?;
         let meta = VersionMeta {
             version,
             author: EXTERNAL_AUTHOR.to_owned(),
@@ -3778,7 +3786,6 @@ fn read_version_meta(
     toml::from_str(&text).ok()
 }
 
-/// Returns the newest stored version of a task. The usual case needs one file check.
 /// Treats a record with bad content as a missing record. A damaged old record must not stop the
 /// record of a new edit, and the edit then counts as new text. Other errors stay errors.
 fn readable(result: Result<Option<String>>) -> Result<Option<String>> {
@@ -3791,13 +3798,17 @@ fn readable(result: Result<Option<String>>) -> Result<Option<String>> {
     }
 }
 
+/// Returns the newest stored version of a task. The usual case needs one file check.
 fn newest_version(
     driver: &dyn lenka_plugin_api::StorageDriver,
     id: TaskId,
     known: u64,
 ) -> Result<u64> {
     let root = root_of(id);
-    let next = DocPath::new(format!("{root}/versions/{:06}/meta.toml", known + 1))?;
+    let Ok(next) = crate::index::next_version(known) else {
+        return Ok(known);
+    };
+    let next = DocPath::new(format!("{root}/versions/{next:06}/meta.toml"))?;
     if driver.stat(&next)?.is_none() {
         return Ok(known);
     }
@@ -3805,8 +3816,8 @@ fn newest_version(
     Ok(names
         .iter()
         .filter_map(|name| name.parse::<u64>().ok())
-        // TOML holds only a signed 64-bit number, so a larger name cannot be the version.
-        .filter(|version| i64::try_from(*version).is_ok())
+        // A larger name cannot be a version, and the next version after it must exist.
+        .filter(|version| *version < crate::index::MAX_VERSION)
         .fold(known, u64::max))
 }
 

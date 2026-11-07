@@ -332,6 +332,10 @@ enum EarlyLine {
 }
 
 fn early_line_kind(line: &[u8]) -> EarlyLine {
+    // `rmcp` removes a UTF-8 byte order mark at the start of each line.
+    let line = line
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(line);
     let Ok(Value::Object(message)) = serde_json::from_slice::<Value>(line) else {
         return EarlyLine::Other;
     };
@@ -463,6 +467,16 @@ mod tests {
         assert_eq!(kind(&meta("1999-01-01")), EarlyLine::Other);
         assert_eq!(kind(&meta("2026-07-28")), EarlyLine::SessionStart);
         assert_eq!(kind("not json"), EarlyLine::Other);
+        assert_eq!(
+            kind(
+                "\u{feff}{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"c\",\"version\":\"1\"}}}"
+            ),
+            EarlyLine::SessionStart
+        );
+        assert_eq!(
+            kind("\u{feff}{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\"}"),
+            EarlyLine::Drop
+        );
         assert_eq!(kind(r#"{"id":1,"result":{}}"#), EarlyLine::Drop);
     }
 

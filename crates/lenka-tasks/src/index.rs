@@ -32,6 +32,27 @@ const SNAPSHOT_FORMAT: u32 = 1;
 /// The longest parent chain that lenka follows.
 pub const MAX_DEPTH: usize = 256;
 
+/// The largest version of a task. Tool results give the version as a JSON number, and many
+/// clients read a larger integer with a loss of precision.
+pub(crate) const MAX_VERSION: u64 = (1 << 53) - 1;
+
+/// Gives the version after `version`.
+///
+/// # Errors
+///
+/// Returns [`LenkaError::invalid_file`] if the next version is above [`MAX_VERSION`]. Only a hand
+/// edit can make such a version.
+pub(crate) fn next_version(version: u64) -> Result<u64> {
+    version
+        .checked_add(1)
+        .filter(|next| *next <= MAX_VERSION)
+        .ok_or_else(|| {
+            LenkaError::invalid_file(format!(
+                "A task version is above the limit of {MAX_VERSION}."
+            ))
+        })
+}
+
 #[derive(Debug, Deserialize)]
 struct Snapshot {
     format: u32,
@@ -121,6 +142,11 @@ pub fn load_task(driver: &dyn StorageDriver, id: TaskId) -> Result<LoadedTask> {
     let state: State = toml::from_str(&state_text).map_err(|err| {
         LenkaError::invalid_file(format!("{state_path} is not valid: {}", err.message()))
     })?;
+    if state.version > MAX_VERSION {
+        return Err(LenkaError::invalid_file(format!(
+            "{state_path} has a version above the limit of {MAX_VERSION}."
+        )));
+    }
     // These names appear outside `untrusted_data` in tool results.
     if !lenka_core::input::is_safe_name(&front.kind)
         || !lenka_core::input::is_safe_name(&state.stage)
@@ -515,9 +541,12 @@ impl Index {
         let is_safe = |meta: &TaskMeta| {
             lenka_core::input::is_safe_name(&meta.front.kind)
                 && lenka_core::input::is_safe_name(&meta.state.stage)
+                && meta.state.version <= MAX_VERSION
         };
         if !snapshot.tasks.iter().all(is_safe) {
-            tracing::warn!("ignored an index snapshot with a type or a stage that is not valid");
+            tracing::warn!(
+                "ignored an index snapshot with a type, a stage, or a version that is not valid"
+            );
             return;
         }
         for meta in snapshot.tasks {

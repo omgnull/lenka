@@ -355,8 +355,16 @@ impl Body {
     /// higher of the two counts.
     #[must_use]
     pub fn unchecked_criteria(&self) -> usize {
-        let own = self.criteria().iter().filter(|item| !item.done).count();
-        own.max(unchecked_in_markdown(&self.to_text()))
+        self.unchecked_listed()
+            .max(unchecked_in_markdown(&self.to_text()))
+    }
+
+    /// Counts the open criteria that [`Body::criteria`] lists. A criterion mark can reach only
+    /// these. [`Body::unchecked_criteria`] can be higher, for example for a sub-heading
+    /// "Acceptance criteria" in the description.
+    #[must_use]
+    pub fn unchecked_listed(&self) -> usize {
+        self.criteria().iter().filter(|item| !item.done).count()
     }
 
     /// Sets the mark of one criterion. An index out of range changes nothing, and gives `false`.
@@ -435,9 +443,20 @@ fn unchecked_in_markdown(text: &str) -> usize {
                     words.push_str(&part);
                 }
             }
+            // A heading of the form with `---` below it can have its words on two lines.
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, words)) = &mut heading {
+                    words.push(' ');
+                }
+            }
             Event::End(TagEnd::Heading(_)) => {
+                // A renderer shows two spaces as one space.
                 if let Some((level, words)) = heading.take()
-                    && words.trim().eq_ignore_ascii_case(ACCEPTANCE)
+                    && words
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .eq_ignore_ascii_case(ACCEPTANCE)
                 {
                     section = Some(level);
                 }
@@ -902,6 +921,8 @@ Unknown heading stays.
             "### acceptance criteria",
             "Acceptance criteria\n---",
             "Acceptance criteria\n===",
+            "## Acceptance  criteria",
+            "Acceptance\ncriteria\n---",
         ] {
             let text =
                 format!("## Description\n\nText.\n\n{heading}\n\n- [ ] Must pass\n- [x] Done\n");
@@ -917,6 +938,17 @@ Unknown heading stays.
         assert_eq!(Body::parse(text).unchecked_criteria(), 1);
         let text = "## Acceptance criteria\n\n```\n- [ ] In a fence\n```\n";
         assert_eq!(Body::parse(text).unchecked_criteria(), 0);
+    }
+
+    #[test]
+    fn the_gate_tells_apart_the_criteria_that_lenka_lists() {
+        let text = "## Description\n\n### Acceptance criteria\n\n- [ ] From a template\n\n## Acceptance criteria\n\n- [x] Real\n";
+        let body = Body::parse(text);
+        assert_eq!(body.unchecked_criteria(), 1);
+        assert_eq!(body.unchecked_listed(), 0);
+        let body = Body::parse("## Acceptance criteria\n\n- [ ] Real\n");
+        assert_eq!(body.unchecked_criteria(), 1);
+        assert_eq!(body.unchecked_listed(), 1);
     }
 
     #[derive(Debug, PartialEq, Serialize, serde::Deserialize)]
