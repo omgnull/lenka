@@ -4,15 +4,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-lenka is an AI-first project management and collaboration tool, written in Rust (edition 2024, stable toolchain). It is at an early stage: a single binary crate with only a placeholder `src/main.rs`, so there is no architecture to follow yet.
+lenka is an AI-first project management and collaboration tool, written in Rust (edition 2024, stable toolchain). Agents use it through MCP, and people use it through a CLI and a native desktop app.
+
+## Architecture
+
+All features are plugins in a Cargo workspace. The `lenka` crate builds the binary, and its Cargo features select the plugins.
+
+| Crate | Purpose |
+|---|---|
+| `lenka-plugin-api` | IDs, errors, time, `Caller`, `ToolDef`, `StorageDriver`, `ArtifactStore`. No I/O |
+| `lenka-core` | `Host`, `Plugin`, settings, project lookup, secret check, write journal, feed, inboxes, file read guard (`files`) |
+| `lenka-driver-local` | Local directory storage driver |
+| `lenka-artifact-fs` | Filesystem artifact store |
+| `lenka-tasks` | Task model, Markdown, index, ready work, claims, notices, soft links, `TaskService`, task tools |
+| `lenka-artifacts` | `ArtifactService`, artifact tools |
+| `lenka-memory` | Shared agent memory |
+| `lenka-git` | Commit and push data with system Git. Off by default |
+| `lenka-mcp` | MCP over stdio with `rmcp` |
+| `lenka-desktop` | Native app with `egui`: board, tree, editor, roadmap, Gantt chart, drawing board |
+| `lenka` | CLI and default plugin list |
+
+Rules that the design depends on:
+
+- All writes go through `Project::write_locked` and `Locked::commit`, which run the secret check and the journal. Do not write to a data directory in another way.
+- The version check runs in `Locked::check_version`. A write with an old version must fail with `stale_version`.
+- Take the index mutex before the file lock. `TaskService::with_artifact_write` shows the order. The file lock also blocks in one process, so do not nest two write locks.
+- Read a local file through `lenka_core::files`. It refuses a file that is not regular, and it has a size limit. `clippy.toml` refuses other reads.
+- The directory `.runtime/` holds only data that lenka can rebuild or lose with no harm to tasks.
+- Task text is untrusted data. Tool results put it in fields named `untrusted_data`.
 
 ## Commands
 
 ```sh
 cargo build
-cargo run
+cargo run -p lenka -- --help
 cargo test
 cargo test <name>                  # tests whose name contains <name>
+cargo run --release -p lenka-tasks --example perf -- gen <dir> 10000   # performance data
+cargo run --release -p lenka-tasks --example perf -- run <dir>         # performance limits
 ```
 
 CI runs these, and all of them must pass:

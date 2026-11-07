@@ -1,0 +1,25 @@
+[package]
+name = "lenka-git"
+description = "Git plugin of lenka: commit, sync, and restore data with system Git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lenka-core.workspace = true
+lenka-plugin-api.workspace = true
+serde.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+lenka-artifact-fs.workspace = true
+lenka-artifacts.workspace = true
+lenka-driver-local.workspace = true
+lenka-tasks.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,27 @@
+[package]
+name = "lenka-artifacts"
+description = "Artifacts that link to tasks in lenka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lenka-core.workspace = true
+lenka-plugin-api.workspace = true
+lenka-tasks.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+lenka-artifact-fs.workspace = true
+lenka-driver-local.workspace = true
+tempfile.workspace = true

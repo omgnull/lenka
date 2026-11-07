@@ -1,6 +1,16 @@
 # Dependency policy checked by `cargo deny check`.
 # Reference: https://embarkstudios.github.io/cargo-deny/checks/cfg.html
 
+[advisories]
+# Each entry states why the advisory does not apply, and when to remove the entry.
+ignore = [
+  # These crates merged into zbus 6. They have no known vulnerability. accesskit_unix needs zbus 5
+  # for screen readers on Linux, so remove these entries when accesskit moves to zbus 6.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6, and accesskit_unix still needs zbus 5" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6, and accesskit_unix still needs zbus 5" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6, and accesskit_unix still needs zbus 5" },
+]
+
 [licenses]
 # Licenses that can be combined with GPL-3.0-only. lenka's own license is
 # listed because cargo-deny also checks the workspace crate.

@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Igor Pie and lenka contributors
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "Use lenka_core::files. It refuses a file that is not regular, and it has a size limit." },
+    { path = "std::fs::read_to_string", reason = "Use lenka_core::files. It refuses a file that is not regular, and it has a size limit." },
+    { path = "std::fs::File::open", reason = "Use lenka_core::files. It refuses a file that is not regular." },
+    { path = "std::env::args", reason = "It panics on an argument that is not UTF-8. Use std::env::args_os." },
+]

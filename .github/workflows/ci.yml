@@ -16,8 +16,14 @@ env:
 
 jobs:
   check:
-    name: Format, lint, test
-    runs-on: ubuntu-24.04
+    name: Format, lint, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Locks and renames differ between operating systems.
+        os: [ubuntu-24.04, macos-15, windows-2025]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -26,14 +32,41 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal -c clippy -c rustfmt --no-self-update
           rustup default stable
+      - name: Install GUI libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl-dev
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --all-features --locked
+      # A failure in one test binary must not hide the results of the others.
+      - run: cargo test --all-features --locked --no-fail-fast
+
+  features:
+    name: Build plugin (${{ matrix.features || 'none' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", tasks, artifacts, memory, git, mcp, desktop, "tasks,artifacts,mcp"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy --no-self-update
+          rustup default stable
+      - name: Install GUI libraries
+        if: matrix.features == 'desktop'
+        run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy -p lenka --no-default-features --features "${{ matrix.features }}" --locked -- -D warnings
 
   deny:
     name: Dependency policy
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,3 +74,54 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           rust-version: stable
+
+  mutants:
+    name: Mutation check of the changed engine lines
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    # A report only, for now. Make it block when the noise is low.
+    # 40 mutants in 2 jobs take about 20 minutes, if the tests take about one minute.
+    timeout-minutes: 75
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The diff needs the base branch.
+          fetch-depth: 0
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+      - name: Install GUI libraries
+        run: sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libgl-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: Find the changed lines
+        id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git diff "origin/${BASE_REF}...HEAD" -- crates/lenka-tasks crates/lenka-core crates/lenka-mcp crates/lenka/src/hook.rs > mutants.diff
+          count=$(cargo mutants --in-diff mutants.diff --list | wc -l)
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "The changed lines give ${count} mutants."
+      # One mutant takes about one minute, so a large change gets no run.
+      - name: Skip a large change
+        if: fromJSON(steps.diff.outputs.count) > 40
+        run: echo "::notice::The change gives ${{ steps.diff.outputs.count }} mutants, more than 40, so the mutation check does not run."
+      # A test of one crate often checks the code of another, so the run uses the tests of all
+      # crates. The desktop tests are slow, and they check only the desktop code.
+      - name: Test the mutants
+        if: fromJSON(steps.diff.outputs.count) > 0 && fromJSON(steps.diff.outputs.count) <= 40
+        run: >-
+          cargo mutants --in-diff mutants.diff --no-shuffle -j 2
+          --test-package lenka-plugin-api,lenka-core,lenka-driver-local,lenka-artifact-fs,lenka-tasks,lenka-artifacts,lenka-memory,lenka-git,lenka-mcp,lenka
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-out
+          path: mutants.out
+          if-no-files-found: ignore

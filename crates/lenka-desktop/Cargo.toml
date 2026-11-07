@@ -1,0 +1,34 @@
+[package]
+name = "lenka-desktop"
+description = "The native desktop app of lenka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+lenka-artifacts.workspace = true
+lenka-core.workspace = true
+lenka-plugin-api.workspace = true
+time = { workspace = true, features = ["local-offset"] }
+lenka-tasks.workspace = true
+pollster.workspace = true
+pulldown-cmark.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["snapshot", "wgpu"] }
+lenka-artifact-fs.workspace = true
+lenka-driver-local.workspace = true
+tempfile.workspace = true

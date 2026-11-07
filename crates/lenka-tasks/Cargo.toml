@@ -1,0 +1,29 @@
+[package]
+name = "lenka-tasks"
+description = "Tasks, plans, stages, claims, and soft links of lenka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+lenka-core.workspace = true
+lenka-plugin-api.workspace = true
+pulldown-cmark.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+lenka-artifact-fs.workspace = true
+lenka-driver-local.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

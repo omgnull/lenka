@@ -10,7 +10,7 @@ The IDs in parentheses refer to the sources at the end of this file. `C-` IDs co
 
 ## Lints
 
-- Set lint levels in the `[lints]` table of `Cargo.toml`.
+- Set lint levels in the `[workspace.lints]` table of the root `Cargo.toml`. Each crate has `[lints] workspace = true`.
 - Override a lint with `#[expect(lint, reason = "...")]`, not `#[allow]` (M-LINT-OVERRIDE-EXPECT). Generated code and macros can use `#[allow]`.
 - Do not add `unsafe` code. `Cargo.toml` forbids it, so discuss a change to this rule in an issue first.
 
