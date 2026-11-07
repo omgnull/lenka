@@ -1,0 +1,223 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# The settings of CodeRabbit reviews for lenka. CodeRabbit reads this file from the branch of the
+# pull request. The rules below repeat only what a reviewer needs. CLAUDE.md and docs/agents/ are
+# the source of these rules, so change them there first.
+
+language: en-US
+tone_instructions: >-
+  Be direct and brief. State the input, the wrong result, and the fix. Do not praise. Write in
+  Simplified Technical English: active voice, short sentences, and no -ing forms.
+early_access: false
+
+reviews:
+  # The path instructions add depth. A stricter profile adds mostly style comments.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  suggested_labels: false
+  suggested_reviewers: false
+  in_progress_fortune: false
+  poem: false
+  review_status: true
+  enable_prompt_for_ai_agents: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    # A large pull request gets many commits, and each commit needs a review.
+    auto_pause_after_reviewed_commits: 0
+    base_branches:
+      - "^main$"
+
+  path_filters:
+    - "!Cargo.lock"
+    - "!LICENSE"
+    - "!.claude/**"
+    - "!.idea/**"
+    - "!.agents/**"
+    - "!target/**"
+
+  path_instructions:
+    - path: "crates/**/*.rs"
+      instructions: |
+        lenka is an AI-first project tool. Agents use it through MCP, and people use it through a
+        CLI and a desktop app. Data is plain files in a directory, and Git can sync them.
+
+        Threat model, from the Security section of README.md:
+        - Task text, artifact bytes, memory text, and all data from a Git remote are untrusted.
+        - lenka does not protect against a malicious local process. Give a race that needs such a
+          process a low severity. A race that an honest writer or a second lenka process can hit is
+          a defect.
+
+        Report these items:
+        - A data write that does not use `Project::write_locked` and `Locked::commit`.
+        - A write with an old version that does not fail with `stale_version`.
+        - A wrong lock order. The index mutex comes before the file lock.
+        - Two nested write locks, or two nested calls of `Paths::with_user_lock`. Each lock also
+          blocks in one process.
+        - Task text in a tool result outside a field named `untrusted_data`.
+        - A secret or personal data in a log, an error message, or a test fixture.
+        - Outside data with no validation where it enters the program.
+
+        Apply docs/agents/rust.md:
+        - `#[expect(lint, reason = "...")]`, not `#[allow]`.
+        - No `unsafe` code. No `anyhow` in library crates.
+        - A custom type, not a `bool` argument, on a public function.
+        - A panic only for a programming bug, with a message that holds the relevant values.
+        - Rustdoc sections Errors and Panics on public items where they apply.
+        - Cargo features that are additive.
+
+        Do not report formatting or a lint that `cargo fmt` or `cargo clippy` finds, because CI
+        runs them with `-D warnings`. Do not ask for a new dependency if the standard library or an
+        existing dependency can do the work.
+
+        The section "Known limits" in README.md lists accepted limits. Do not report them as
+        defects, unless the change makes one worse.
+
+    - path: "crates/lenka-core/**/*.rs"
+      instructions: |
+        Check the crash safety of the journal. A process can stop at each step of a write, and the
+        next lock holder replays the journal. A replay must not lose or duplicate a line. Check
+        that a read never waits for a stopped writer, and that a write ends with the `busy` error
+        at the time limit.
+
+        Check that each read, change, and save of `projects.toml` or a clone file holds
+        `Paths::with_user_lock`.
+
+    - path: "crates/lenka-tasks/**/*.rs"
+      instructions: |
+        Check these rules of the task model:
+        - A closed task refuses all changes, except an explicit reopen.
+        - At the loop limit, an agent cannot claim or change the task until a person acts. A person
+          can mark a task so that an agent can continue until the task is done. An agent cannot
+          set this mark.
+        - A blocker with an unknown state still blocks.
+        - A claim holder must read a change notice before it can finish.
+        - A person needs `--override` to change a task that an agent holds in the same directory.
+        A task with no claim can get a change from an agent with the current version. This is by
+        design.
+
+    - path: "crates/lenka-git/**/*.rs"
+      instructions: |
+        Treat all remote content as hostile. Check that lenka accepts only known tree shapes, and
+        that it validates the same commit that it merges. Check that a Git command clears
+        environment values that can redirect it, and that a command for an agent cannot wait for a
+        prompt. An old `[git]` section in `lenka.toml` has no effect, because the remote is a
+        setting of each clone.
+
+    - path: "crates/lenka-{driver-local,artifact-fs}/**/*.rs"
+      instructions: |
+        Check that no path goes through a symlink, and that a write uses a new temporary file and
+        a rename. Check that a read refuses a path that is not a regular file, because the open of
+        a named pipe waits with no limit. Remember that Windows and macOS CI also run this code.
+
+    - path: "crates/lenka/src/**/*.rs"
+      instructions: |
+        All terminal output must use the macros in `output.rs`, which filter control characters.
+        Direct print calls are denied. A command with `--json` must give JSON, and the JSON must
+        keep the real value of a field. Check that the exit code matches the result.
+
+    - path: "crates/lenka-mcp/**/*.rs"
+      instructions: |
+        Agents are the main users. Check that a tool result never gives untrusted text the form of
+        an instruction, and that an error message for an agent holds no holder name and no text of
+        an invalid file.
+
+    - path: "crates/lenka-desktop/**/*.rs"
+      instructions: |
+        Report a path that loses unsaved work with no question: a project switch, a task switch, a
+        new drawing, or a window close. Report a panic from data in a file, and an index that can
+        be stale after a model change. Report a slow file or lock operation on the UI thread. The
+        app uses `egui`, so state changes must not depend on a widget that is out of view.
+
+    - path: "**/tests/**/*.rs"
+      instructions: |
+        A test must fail without the behavior that it names. Report a test that ignores a command
+        result, or that can pass for another reason. A value that looks like a secret must come
+        from code at run time, not from a literal. A test must use a temporary directory, and it
+        must never read the real user configuration. A test must work on Linux, macOS, and Windows,
+        or have a `cfg` for the system that it needs.
+
+    - path: "crates/lenka-desktop/src/ui_tests.rs"
+      instructions: |
+        Apply the rules for tests. A dialog takes a new place one frame after a new size, so a test
+        must run frames before a click if it changes the form state directly.
+
+    - path: "**/*.md"
+      instructions: |
+        Apply relaxed ASD-STE100 Simplified Technical English, as CLAUDE.md gives it. Report only a
+        real problem: a passive form, an -ing form, a sentence over 25 words, or a word with two
+        meanings. Check each claim against the code, because a wrong claim is worse than a style
+        problem. Check that each command in the text runs with those arguments.
+
+    - path: "{Cargo.toml,crates/*/Cargo.toml,deny.toml}"
+      instructions: |
+        Each dependency version must come from the workspace table. Each new license in the allow
+        list of `deny.toml` must be compatible with GPL-3.0-only. Features must stay additive.
+
+    - path: ".github/**"
+      instructions: |
+        Check that CI still runs `cargo fmt --all --check`, `cargo clippy --all-targets
+        --all-features --locked -- -D warnings`, `cargo test --all-features --locked`, and
+        `cargo deny check` on Linux, macOS, and Windows. Check that an action has a pinned version
+        and the fewest permissions.
+
+  pre_merge_checks:
+    # Rustdoc rules apply only to public items, so a percentage of all items gives wrong results.
+    docstrings:
+      mode: "off"
+    title:
+      mode: warning
+    description:
+      mode: warning
+    issue_assessment:
+      mode: "off"
+    custom_checks:
+      - name: "Tests for changed behavior"
+        mode: warning
+        instructions: >-
+          Pass if each change of behavior has a new or changed test that fails without the change.
+          Fail if a source change alters behavior and no test covers it. Ignore a change of
+          comments, documents, or formatting.
+      - name: "License headers"
+        mode: warning
+        instructions: >-
+          Pass if each new Rust source file starts with `// SPDX-License-Identifier: GPL-3.0-only`
+          and the copyright line from CONTRIBUTING.md. Fail if `LICENSE` changes.
+
+  tools:
+    clippy:
+      enabled: true
+    gitleaks:
+      enabled: true
+    actionlint:
+      enabled: true
+    zizmor:
+      enabled: true
+    markdownlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    github-checks:
+      enabled: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - "CONTRIBUTING.md"
+      - "docs/agents/*.md"
+
+chat:
+  art: false
+  auto_reply: true
