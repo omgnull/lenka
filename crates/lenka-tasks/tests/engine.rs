@@ -2117,10 +2117,22 @@ fn write_inbox(
     count: usize,
     reason: &str,
 ) -> Result<()> {
+    write_notices(fx, caller, subject, count, reason, 1)
+}
+
+/// Writes an inbox file with notices of one version of a task, directly on the disk.
+fn write_notices(
+    fx: &Fixture,
+    caller: &Caller,
+    subject: TaskId,
+    count: usize,
+    reason: &str,
+    version: u64,
+) -> Result<()> {
     let notice = lenka_core::Notice {
         id: lenka_plugin_api::NoticeId::generate(),
         subject: lenka_core::Subject::Task(subject.to_string()),
-        version: 1,
+        version,
         changed: vec!["description".to_owned()],
         author: "other".to_owned(),
         reason: reason.to_owned(),
@@ -4121,5 +4133,195 @@ fn a_notice_about_an_invalid_task_names_a_way_out() -> Result<()> {
             .finish(&agent, child, &handle, &Finish::Released)
             .is_ok()
     );
+    Ok(())
+}
+
+/// Adds a second stage to the type `task`.
+fn two_stages(service: &TaskService) -> Result<()> {
+    let mut config = (*service.project().config()).clone();
+    if let Some(def) = config.types.get_mut("task") {
+        let mut next = def.stages[0].clone();
+        next.name = "review".to_owned();
+        def.stages.push(next);
+    }
+    service.project().save_config(config)
+}
+
+#[test]
+fn a_stage_completion_by_a_person_resets_the_loop_count() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    two_stages(&service)?;
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    let change = service.advance(
+        &human,
+        id,
+        &ClaimRef::Implicit,
+        "A person checked it.",
+        None,
+    )?;
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let patch = TaskPatch {
+        claim: ClaimRef::Handle(claim.handle),
+        ..text_change(change.state.version)
+    };
+    assert!(
+        service.update(&agent, id, patch).is_ok(),
+        "the count starts again"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_loop_mark_resets_the_loop_count() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    let mark = |value: bool, version: u64| TaskPatch {
+        expected_version: version,
+        loop_until_done: Some(value),
+        ..TaskPatch::default()
+    };
+    let version = service.update(&human, id, mark(true, 6))?.state.version;
+    let version = service
+        .update(&human, id, mark(false, version))?
+        .state
+        .version;
+    assert!(
+        service.update(&agent, id, text_change(version)).is_ok(),
+        "the count starts again after the mark"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_notice_of_another_claim_does_not_stop_this_finish() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let first = create(&service, &human, "First")?;
+    let second = create(&service, &human, "Second")?;
+    service.claim(&agent, Some(first), None, None)?;
+    let claim = service.claim(&agent, Some(second), None, None)?;
+    service.update(
+        &human,
+        first,
+        TaskPatch {
+            claim: ClaimRef::Override,
+            ..text_change(1)
+        },
+    )?;
+    assert_eq!(service.call_notes(&agent)?.unread.len(), 1);
+    assert!(
+        service
+            .finish(
+                &agent,
+                second,
+                &ClaimRef::Handle(claim.handle),
+                &finish_done()
+            )
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn a_release_after_the_first_stage_gives_in_progress() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    two_stages(&service)?;
+    let id = create(&service, &agent, "T")?;
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    service.advance(
+        &agent,
+        id,
+        &ClaimRef::Handle(claim.handle),
+        "Step one works.",
+        None,
+    )?;
+    let claim = service.claim(&agent, Some(id), None, None)?;
+    let state = service.finish(
+        &agent,
+        id,
+        &ClaimRef::Handle(claim.handle),
+        &Finish::Released,
+    )?;
+    assert_eq!(state.state.status, Status::InProgress);
+    Ok(())
+}
+
+#[test]
+fn a_merge_notice_names_the_newest_material_change() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &human, "T")?;
+    let before = service.task_versions()?;
+    service.update(&human, id, text_change(1))?;
+    let title = TaskPatch {
+        expected_version: 2,
+        title: Some("A new title".to_owned()),
+        reason: Some("A title.".to_owned()),
+        ..TaskPatch::default()
+    };
+    assert_eq!(service.update(&human, id, title)?.state.version, 3);
+    service.claim(&agent, Some(id), None, None)?;
+    service.notify_merged_changes(&before)?;
+    let notes = service.call_notes(&agent)?;
+    assert_eq!(notes.unread.len(), 1);
+    assert_eq!(notes.unread[0].version, 2);
+    assert_eq!(notes.unread[0].reason, "A change.");
+    Ok(())
+}
+
+#[test]
+fn a_failed_call_that_wrote_data_updates_the_index() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = create(&service, &agent, "T")?;
+    reach_loop_limit(&service, &agent, id)?;
+    assert!(
+        !service.refresh()?,
+        "the index already holds the pause of the failed call"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_read_of_an_old_version_does_not_close_a_newer_notice() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, human) = (fx.agent("a"), fx.human());
+    let id = create(&service, &human, "T")?;
+    service.claim(&agent, Some(id), None, None)?;
+    // A write after the read of version 1 can add a notice before the read closes notices.
+    write_notices(&fx, &agent, id, 1, "A later change.", 2)?;
+    service.show(&agent, id, &[])?;
+    assert_eq!(service.call_notes(&agent)?.unread.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_patch_cannot_make_a_task_over_the_size_limit() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let agent = fx.agent("a");
+    let id = create(&service, &agent, "T")?;
+    let patch = TaskPatch {
+        description: Some("x".repeat(900 * 1024)),
+        requirements: Some("y".repeat(900 * 1024)),
+        ..text_change(1)
+    };
+    assert_eq!(
+        code(service.update(&agent, id, patch)),
+        ErrorCode::InvalidArgument
+    );
+    assert_eq!(service.detail(id, &[])?.meta.state.version, 1);
     Ok(())
 }
