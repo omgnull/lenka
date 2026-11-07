@@ -426,11 +426,28 @@ fn is_reference(value: &str) -> bool {
 }
 
 /// Tells if a value is a normal name with words between hyphens, such as `my-service-account-v2`.
+/// A name has a letter after `f`. Thus a UUID, which is a common form of an API key, is not a
+/// name.
 fn is_hyphen_name(value: &str) -> bool {
     value.split('-').count() >= 3
         && value
             .bytes()
             .all(|b| b == b'-' || b.is_ascii_lowercase() || b.is_ascii_digit())
+        && value.bytes().any(|b| matches!(b, b'g'..=b'z'))
+}
+
+/// Last words of a setting name that give a measure, such as `token_count`. Such a setting does
+/// not hold a secret.
+const MEASURE_WORDS: &[&str] = &[
+    "count", "len", "length", "limit", "max", "min", "size", "total",
+];
+
+/// Tells if the rest of a setting name ends in a measure word, as `_count` in `token_count`.
+fn is_measure_suffix(suffix: &str) -> bool {
+    suffix
+        .rsplit(['_', '-'])
+        .next()
+        .is_some_and(|word| MEASURE_WORDS.contains(&word.to_ascii_lowercase().as_str()))
 }
 
 /// The count of bytes of an assignment value that the check reads.
@@ -456,6 +473,9 @@ fn has_secret_assignment(text: &str) -> bool {
 fn assignment_value_is_secret(rest: &str) -> bool {
     // A name can continue, as in `SECRET_ACCESS_KEY`.
     let suffix = token_len(&rest.as_bytes()[..rest.len().min(MAX_NAME_SUFFIX_BYTES)]);
+    if is_measure_suffix(&rest[..suffix]) {
+        return false;
+    }
     let trimmed = rest[suffix..].trim_start_matches(['"', '\'', ' ', '\t']);
     let Some(value) = trimmed.strip_prefix(['=', ':']) else {
         return false;
@@ -673,6 +693,7 @@ mod tests {
     #[test]
     fn finds_common_forms_of_settings_and_tokens() {
         let long = value();
+        let uuid = ["3f2a9c1e", "8b4d", "4e2a", "9f1c", "7d3b2a1e0f9c"].join("-");
         let cases = [
             format!("AWS_SECRET_ACCESS_KEY={long}"),
             format!("aws_{}_access_key = {long}", "secret"),
@@ -700,6 +721,11 @@ mod tests {
             format!("https://hooks.slack.com/services/{long}"),
             format!("token-{}", fake("ghp_", 36)),
             format!("MY_{}", fake("ghp_", 36)),
+            // A UUID is a common form of an API key.
+            format!("HEROKU_API_KEY={uuid}"),
+            format!("api_key: {uuid}"),
+            // Only the last word of a name can make it a measure.
+            format!("secret_count_key = {long}"),
         ];
         for text in cases {
             let label = text.split_at(8.min(text.len())).0.to_owned();
@@ -724,6 +750,10 @@ mod tests {
             "Bearer <token>",
             "The bearer token goes in the header.",
             "max_tokens: 4096",
+            "token_count: 128000tokens",
+            "tokenCount: 128000tokens",
+            "secret_count: 1234567890abc",
+            "api_key_max_length = 64chars",
         ] {
             assert_eq!(find_pattern(text), None, "{text}");
         }
