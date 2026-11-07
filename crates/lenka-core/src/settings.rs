@@ -43,7 +43,7 @@ pub struct TypeDef {
 
 /// The limits and defaults of a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// The default claim timeout in minutes.
     pub claim_timeout_minutes: u32,
@@ -111,6 +111,41 @@ impl Default for StorageSettings {
             artifact_store: "fs".to_owned(),
         }
     }
+}
+
+/// The largest count of task types in a project.
+const MAX_TYPES: usize = 256;
+
+/// The largest count of stages in a task type.
+const MAX_STAGES: usize = 256;
+
+/// The sections of `lenka.toml` that lenka reads. An old `git` section has no effect, because the
+/// remote is a setting of each clone.
+const KNOWN_SECTIONS: [&str; 8] = [
+    "id",
+    "name",
+    "format_version",
+    "storage",
+    "limits",
+    "links",
+    "types",
+    "git",
+];
+
+/// Returns the sections of the text of `lenka.toml` that lenka does not read. A section with a
+/// wrong name has no effect, so a person must know about it.
+#[must_use]
+pub fn unknown_sections(text: &str) -> Vec<String> {
+    toml::from_str::<toml::Table>(text).map_or_else(
+        |_| Vec::new(),
+        |table| {
+            table
+                .keys()
+                .filter(|key| !KNOWN_SECTIONS.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        },
+    )
 }
 
 /// The contents of `lenka.toml`. This file holds no secrets.
@@ -204,10 +239,30 @@ impl ProjectConfig {
     ///
     /// Returns [`ErrorCode::InvalidFile`] if a type has no stages or a duplicate stage.
     pub fn validate(&self) -> Result<()> {
+        if self.format_version == 0 {
+            return Err(LenkaError::invalid_file(
+                "lenka.toml has the data format 0, which is not valid.",
+            ));
+        }
+        if self.limits.loop_limit == 0 || self.limits.claim_timeout_minutes == 0 {
+            return Err(LenkaError::invalid_file(
+                "lenka.toml has a limit of 0. `loop_limit` and `claim_timeout_minutes` must be 1 or more.",
+            ));
+        }
         if self.types.is_empty() {
             return Err(LenkaError::invalid_file("lenka.toml has no task types."));
         }
+        if self.types.len() > MAX_TYPES {
+            return Err(LenkaError::invalid_file(format!(
+                "lenka.toml has more than {MAX_TYPES} task types."
+            )));
+        }
         for (name, def) in &self.types {
+            if def.stages.len() > MAX_STAGES {
+                return Err(LenkaError::invalid_file(format!(
+                    "The type {name} in lenka.toml has more than {MAX_STAGES} stages."
+                )));
+            }
             let names = std::iter::once(name).chain(def.stages.iter().map(|stage| &stage.name));
             for checked in names {
                 if !crate::input::is_safe_name(checked) {
@@ -382,6 +437,9 @@ fn write_file(file: &Path, text: &str) -> Result<()> {
     fs::rename(&temp, file).map_err(|err| LenkaError::io("Replace a settings file", &err))
 }
 
+/// The limit of the wait for the lock of the user files.
+const USER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The user-level directories of lenka.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -397,10 +455,13 @@ impl Paths {
     ///
     /// Returns [`ErrorCode::Io`] if the OS has no standard location.
     pub fn from_env() -> Result<Self> {
+        // An empty value counts as no value. It must not select the current directory.
         let config_dir = std::env::var_os("LENKA_CONFIG_DIR")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| dirs::config_dir().map(|dir| dir.join("lenka")));
         let data_dir = std::env::var_os("LENKA_DATA_DIR")
+            .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .or_else(|| dirs::data_dir().map(|dir| dir.join("lenka")));
         match (config_dir, data_dir) {
@@ -413,6 +474,46 @@ impl Paths {
                 "The OS has no standard user directory. Set LENKA_CONFIG_DIR and LENKA_DATA_DIR.",
             )),
         }
+    }
+
+    /// Runs a change of the project list or a clone file under a lock of the user. These files
+    /// have no other protection, so two processes can otherwise lose an entry.
+    ///
+    /// Do not nest two calls: the lock also blocks in one process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::Busy`] if another process holds the lock for too long, or the error
+    /// of the closure.
+    pub fn with_user_lock<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        fs::create_dir_all(&self.config_dir)
+            .map_err(|err| LenkaError::io("Create the configuration directory", &err))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.config_dir.join("projects.lock"))
+            .map_err(|err| LenkaError::io("Open the lock of the project list", &err))?;
+        let start = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if start.elapsed() < USER_LOCK_WAIT => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(LenkaError::new(
+                        ErrorCode::Busy,
+                        "Another process holds the lock of the project list. Try again later, or stop that process.",
+                    ));
+                }
+                Err(fs::TryLockError::Error(err)) => {
+                    return Err(LenkaError::io("Take the lock of the project list", &err));
+                }
+            }
+        }
+        // The OS releases the lock when the file closes.
+        work()
     }
 
     /// Creates the paths from explicit directories.
@@ -467,6 +568,75 @@ pub fn validate_project_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_text(change: impl Fn(&mut toml::Table)) -> String {
+        let text = ProjectConfig::new("api").to_text().expect("text");
+        let mut table: toml::Table = toml::from_str(&text).expect("a table");
+        change(&mut table);
+        toml::to_string(&table).expect("text")
+    }
+
+    #[test]
+    fn settings_with_a_value_that_breaks_a_project_are_refused() {
+        let set_limit = |key: &'static str, value: i64| {
+            config_text(move |table| {
+                let limits = table
+                    .entry("limits")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                if let toml::Value::Table(limits) = limits {
+                    limits.insert(key.to_owned(), toml::Value::Integer(value));
+                }
+            })
+        };
+        for text in [
+            set_limit("loop_limit", 0),
+            set_limit("claim_timeout_minutes", 0),
+            set_limit("no_such_limit", 1),
+            config_text(|table| {
+                table.insert("format_version".to_owned(), toml::Value::Integer(0));
+            }),
+        ] {
+            assert_eq!(
+                ProjectConfig::parse(&text).err().map(|error| error.code()),
+                Some(ErrorCode::InvalidFile),
+                "{text}"
+            );
+        }
+        assert!(ProjectConfig::parse(&config_text(|_| ())).is_ok());
+    }
+
+    #[test]
+    fn a_type_with_too_many_stages_is_refused() {
+        let mut config = ProjectConfig::new("api");
+        let stage = |number: usize| Stage {
+            name: format!("s{number}"),
+            actor: Actor::Any,
+            unblocks: false,
+        };
+        config.types.insert(
+            "big".to_owned(),
+            TypeDef {
+                stages: (0..=MAX_STAGES).map(stage).collect(),
+            },
+        );
+        assert!(config.validate().is_err());
+        config.types.insert(
+            "big".to_owned(),
+            TypeDef {
+                stages: (0..MAX_STAGES).map(stage).collect(),
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn a_section_with_a_wrong_name_is_found() {
+        let text = config_text(|table| {
+            table.insert("limit".to_owned(), toml::Value::Table(toml::Table::new()));
+            table.insert("git".to_owned(), toml::Value::Table(toml::Table::new()));
+        });
+        assert_eq!(unknown_sections(&text), vec!["limit".to_owned()]);
+    }
 
     #[test]
     fn config_round_trip() -> Result<()> {

@@ -12,6 +12,7 @@
 //! as ext4 with `data=ordered`, also loses nothing. Another file system can lose the newest
 //! writes, so a project can set `strict_flush` in `lenka.toml`, which flushes each file.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lenka_plugin_api::{DocPath, LenkaError, Result, StorageDriver, WriteTxn};
@@ -105,7 +106,7 @@ pub fn run(txn: &mut dyn WriteTxn, ops: &[Op], crash: &CrashPoint) -> Result<()>
                 "Test stop in a write.",
             ));
         }
-        apply(txn, op, None)?;
+        apply(txn, op)?;
     }
     if crash.should_stop() {
         return Err(LenkaError::new(
@@ -131,8 +132,9 @@ pub fn repair(driver: &dyn StorageDriver, txn: &mut dyn WriteTxn) -> Result<bool
         txn.journal_clear()?;
         return Ok(false);
     };
+    let mut appends = replay_plan(driver, &ops)?;
     for op in &ops {
-        apply(txn, op, Some(driver)).map_err(|err| {
+        apply_replay(txn, op, &mut appends).map_err(|err| {
             LenkaError::new(
                 err.code(),
                 format!(
@@ -147,33 +149,90 @@ pub fn repair(driver: &dyn StorageDriver, txn: &mut dyn WriteTxn) -> Result<bool
     Ok(true)
 }
 
-fn apply(txn: &mut dyn WriteTxn, op: &Op, replay: Option<&dyn StorageDriver>) -> Result<()> {
+fn apply(txn: &mut dyn WriteTxn, op: &Op) -> Result<()> {
     match op {
         Op::Put { path, text } => txn.put(&DocPath::new(path.clone())?, text.as_bytes()),
         Op::Append { path, line } => {
-            let doc = DocPath::new(path.clone())?;
-            if let Some(driver) = replay
-                && ends_with_line(driver, &doc, line)?
-            {
-                return Ok(());
-            }
             let mut bytes = line.clone().into_bytes();
             bytes.push(b'\n');
-            txn.append(&doc, &bytes)
+            txn.append(&DocPath::new(path.clone())?, &bytes)
         }
         Op::Remove { path } => txn.remove(&DocPath::new(path.clone())?),
         Op::RemoveTree { path } => txn.remove_tree(&DocPath::new(path.clone())?),
     }
 }
 
-fn ends_with_line(driver: &dyn StorageDriver, doc: &DocPath, line: &str) -> Result<bool> {
-    let Some(stat) = driver.stat(doc)? else {
-        return Ok(false);
-    };
-    let wanted = line.len() as u64 + 1;
-    if stat.len < wanted {
-        return Ok(false);
+/// What a replay must do for one file that gets lines.
+#[derive(Debug, Default)]
+struct AppendPlan {
+    /// The count of lines that the stopped write added.
+    skip: usize,
+    /// Tells if the file ends in a part of a line. A new line must not join it.
+    needs_line_end: bool,
+}
+
+fn apply_replay(
+    txn: &mut dyn WriteTxn,
+    op: &Op,
+    plans: &mut HashMap<String, AppendPlan>,
+) -> Result<()> {
+    if let Op::Append { path, .. } = op
+        && let Some(plan) = plans.get_mut(path)
+    {
+        if plan.skip > 0 {
+            plan.skip -= 1;
+            return Ok(());
+        }
+        if plan.needs_line_end {
+            plan.needs_line_end = false;
+            txn.append(&DocPath::new(path.clone())?, b"\n")?;
+        }
     }
-    let tail = driver.read_from(doc, stat.len - wanted)?;
-    Ok(tail.strip_suffix(b"\n") == Some(line.as_bytes()))
+    apply(txn, op)
+}
+
+/// Compares each file that gets lines with the lines of the journal.
+fn replay_plan(driver: &dyn StorageDriver, ops: &[Op]) -> Result<HashMap<String, AppendPlan>> {
+    let mut lines: HashMap<&str, Vec<&str>> = HashMap::new();
+    for op in ops {
+        if let Op::Append { path, line } = op {
+            lines.entry(path).or_default().push(line);
+        }
+    }
+    let mut plans = HashMap::with_capacity(lines.len());
+    for (path, wanted) in lines {
+        let doc = DocPath::new(path)?;
+        let Some(stat) = driver.stat(&doc)? else {
+            continue;
+        };
+        // A torn line is shorter than the line in the journal, so two times the size is enough.
+        let size: u64 = wanted.iter().map(|line| line.len() as u64 + 1).sum();
+        let tail = driver.read_from(&doc, stat.len.saturating_sub(size.saturating_mul(2)))?;
+        plans.insert(path.to_owned(), plan_for_tail(&tail, &wanted));
+    }
+    Ok(plans)
+}
+
+/// Finds the lines that a file already has. The file can end in lines of the journal, in order,
+/// and after them in a part of a line.
+fn plan_for_tail(tail: &[u8], wanted: &[&str]) -> AppendPlan {
+    let whole = tail
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&tail[..0], |end| &tail[..=end]);
+    let skip = (0..=wanted.len())
+        .rev()
+        .find(|count| {
+            let mut expected = Vec::new();
+            for line in &wanted[..*count] {
+                expected.extend_from_slice(line.as_bytes());
+                expected.push(b'\n');
+            }
+            whole.ends_with(&expected)
+        })
+        .unwrap_or(0);
+    AppendPlan {
+        skip,
+        needs_line_end: tail.last().is_some_and(|byte| *byte != b'\n'),
+    }
 }

@@ -46,6 +46,8 @@ pub enum ErrorCode {
     LoopLimit,
     /// An input or output operation failed.
     Io,
+    /// Another process holds the write lock, and the wait reached its limit.
+    Busy,
 }
 
 impl ErrorCode {
@@ -71,6 +73,7 @@ impl ErrorCode {
             Self::ReasonRequired => "reason_required",
             Self::LoopLimit => "loop_limit",
             Self::Io => "io",
+            Self::Busy => "busy",
         }
     }
 }

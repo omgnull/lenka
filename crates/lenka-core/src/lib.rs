@@ -28,4 +28,6 @@ pub use lenka_plugin_api as api;
 pub use notices::{FeedEvent, FeedKind, Notice, ProjectEvent, Subject};
 pub use project::{Commit, LEFTOVER_AGE, Locked, Project, is_leftover};
 pub use secret::{SecretPolicy, TextCheck};
-pub use settings::{Paths, ProjectConfig, ProjectEntry, ProjectsFile, Stage, TypeDef};
+pub use settings::{
+    Paths, ProjectConfig, ProjectEntry, ProjectsFile, Stage, TypeDef, unknown_sections,
+};

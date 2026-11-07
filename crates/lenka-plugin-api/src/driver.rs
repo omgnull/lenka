@@ -186,8 +186,17 @@ pub trait StorageDriver: Send + Sync + fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns an error if the lock cannot be taken.
+    /// Returns [`crate::ErrorCode::Busy`] if another process holds the lock for too long, or
+    /// another error if the lock cannot be taken.
     fn begin(&self) -> Result<Box<dyn WriteTxn + '_>>;
+
+    /// Starts a write transaction if the write lock is free now. A read uses this for optional
+    /// work, because a read must not wait for a writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the check of the lock fails.
+    fn try_begin(&self) -> Result<Option<Box<dyn WriteTxn + '_>>>;
 
     /// Reads the journal. No journal, or an empty journal, gives `None`.
     ///

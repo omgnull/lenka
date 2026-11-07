@@ -428,6 +428,7 @@ impl MemoryService {
         if let Ok(id) = MemoryId::parse(text) {
             return Ok(id);
         }
+        lenka_plugin_api::check_short_id(text)?;
         let names = self.project.driver().list(&DocPath::new(MEMORY_DIR)?)?;
         let stems = names.iter().filter_map(|name| name.strip_suffix(".md"));
         let mut found = stems.filter(|stem| !text.is_empty() && stem.ends_with(text));
@@ -444,6 +445,7 @@ impl MemoryService {
     }
 
     fn resolve_task(&self, text: &str) -> Result<TaskId> {
+        lenka_plugin_api::check_short_id(text)?;
         let names = self.project.driver().list(&DocPath::new("tasks")?)?;
         let mut found = names
             .iter()

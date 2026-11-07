@@ -3,12 +3,12 @@
 
 //! The local directory storage driver. It makes no remote calls.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use lenka_core::{Plugin, PluginInfo, Registry};
 use lenka_plugin_api::{DocPath, DocStat, ErrorCode, LenkaError, Result, StorageDriver, WriteTxn};
@@ -44,6 +44,13 @@ const JOURNAL_PATH: &str = ".runtime/pending.json";
 
 /// The largest document that the driver reads.
 pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The default limit of the wait for the write lock. A normal write takes milliseconds, so a
+/// longer wait means that the holder has stopped or that it stores a very large file.
+const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// The largest limit that `LENKA_LOCK_WAIT_MS` can set.
+const MAX_LOCK_WAIT: Duration = Duration::from_secs(3600);
 
 /// The count of names that one write tries for a temporary file.
 const TEMP_ATTEMPTS: usize = 64;
@@ -104,9 +111,56 @@ impl LocalDriver {
     }
 }
 
+impl LocalDriver {
+    fn open_lock_file(&self) -> Result<File> {
+        let runtime = self.root.join(".runtime");
+        fs::create_dir_all(&runtime)
+            .map_err(|err| LenkaError::io("Create the runtime directory", &err))?;
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(runtime.join("lock"))
+            .map_err(|err| LenkaError::io("Open the lock file", &err))
+    }
+
+    /// Refuses a path that is not a regular file. The open of a named pipe waits with no limit.
+    fn check_regular_file(&self, path: &DocPath) -> Result<()> {
+        match fs::symlink_metadata(self.file_of(path)) {
+            Ok(meta) if !meta.is_file() => Err(LenkaError::invalid_file(format!(
+                "The path {path} is not a regular file, so lenka cannot read it."
+            ))),
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(LenkaError::io("Read file metadata", &err)),
+        }
+    }
+}
+
+/// Returns the limit of the wait for the write lock. `LENKA_LOCK_WAIT_MS` can change it.
+fn lock_wait_limit() -> Duration {
+    parse_lock_wait(std::env::var("LENKA_LOCK_WAIT_MS").ok().as_deref())
+}
+
+fn parse_lock_wait(text: Option<&str>) -> Duration {
+    text.and_then(|text| text.parse().ok())
+        .map_or(DEFAULT_LOCK_WAIT, Duration::from_millis)
+        .min(MAX_LOCK_WAIT)
+}
+
+/// Takes the lock if it is free, and tells if this call got it.
+fn try_lock(file: &File) -> Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(err)) => Err(LenkaError::io("Take the project write lock", &err)),
+    }
+}
+
 impl StorageDriver for LocalDriver {
     fn read(&self, path: &DocPath) -> Result<Option<Vec<u8>>> {
         self.check_no_symlink(path)?;
+        self.check_regular_file(path)?;
         let file = match File::open(self.file_of(path)) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -127,6 +181,7 @@ impl StorageDriver for LocalDriver {
 
     fn read_from(&self, path: &DocPath, offset: u64) -> Result<Vec<u8>> {
         self.check_no_symlink(path)?;
+        self.check_regular_file(path)?;
         let mut file = match File::open(self.file_of(path)) {
             Ok(file) => file,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -202,23 +257,19 @@ impl StorageDriver for LocalDriver {
     }
 
     fn begin(&self) -> Result<Box<dyn WriteTxn + '_>> {
-        let runtime = self.root.join(".runtime");
-        fs::create_dir_all(&runtime)
-            .map_err(|err| LenkaError::io("Create the runtime directory", &err))?;
-        let lock_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(runtime.join("lock"))
-            .map_err(|err| LenkaError::io("Open the lock file", &err))?;
-        lock_file
-            .lock()
-            .map_err(|err| LenkaError::io("Take the project write lock", &err))?;
-        Ok(Box::new(LocalTxn {
+        begin_with_limit(self, lock_wait_limit())
+    }
+
+    fn try_begin(&self) -> Result<Option<Box<dyn WriteTxn + '_>>> {
+        let lock_file = self.open_lock_file()?;
+        if !try_lock(&lock_file)? {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(LocalTxn {
             driver: self,
             lock_file,
             strict_flush: false,
-        }))
+        })))
     }
 
     fn journal_read(&self) -> Result<Option<Vec<u8>>> {
@@ -236,6 +287,30 @@ impl StorageDriver for LocalDriver {
     fn local_dir(&self) -> Option<&Path> {
         Some(&self.root)
     }
+}
+
+fn begin_with_limit(driver: &LocalDriver, limit: Duration) -> Result<Box<dyn WriteTxn + '_>> {
+    let lock_file = driver.open_lock_file()?;
+    let start = Instant::now();
+    let mut pause = Duration::from_millis(1);
+    while !try_lock(&lock_file)? {
+        if start.elapsed() >= limit {
+            return Err(LenkaError::new(
+                ErrorCode::Busy,
+                format!(
+                    "Another process has held the project write lock for {} seconds. Try again later, or stop that process.",
+                    limit.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+    Ok(Box::new(LocalTxn {
+        driver,
+        lock_file,
+        strict_flush: false,
+    }))
 }
 
 fn journal_path() -> Result<DocPath> {
@@ -261,10 +336,29 @@ impl Drop for LocalTxn<'_> {
 impl LocalTxn<'_> {
     fn ensure_parent(&self, file: &Path) -> Result<()> {
         if let Some(parent) = file.parent() {
+            let new_parts = if self.strict_flush {
+                missing_parents(parent)
+            } else {
+                Vec::new()
+            };
             fs::create_dir_all(parent).map_err(|err| LenkaError::io("Create a directory", &err))?;
+            // A new directory stays after a power failure only if its parent has a flush.
+            for part in new_parts {
+                if let Some(above) = part.parent() {
+                    sync_dir(above);
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Returns the parts of a path that do not exist, with the deepest part first.
+fn missing_parents(dir: &Path) -> Vec<PathBuf> {
+    dir.ancestors()
+        .take_while(|part| !part.exists())
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 /// Flushes a directory, so that a rename stays after a power failure. Windows cannot do this.
@@ -413,6 +507,122 @@ impl WriteTxn for LocalTxn<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lenka_core::Op;
+    use lenka_core::journal;
+
+    /// Writes a journal, and replays it as the next lock holder does.
+    fn replay(driver: &LocalDriver, lines: &[&str]) -> Result<()> {
+        let ops: Vec<Op> = lines
+            .iter()
+            .map(|line| Op::Append {
+                path: "feed.jsonl".to_owned(),
+                line: (*line).to_owned(),
+            })
+            .collect();
+        let bytes =
+            serde_json::to_vec(&ops).map_err(|err| LenkaError::invalid_file(err.to_string()))?;
+        let mut txn = driver.begin()?;
+        txn.journal_write(&bytes)?;
+        journal::repair(driver, txn.as_mut())?;
+        Ok(())
+    }
+
+    fn feed_text(temp: &tempfile::TempDir) -> String {
+        fs::read_to_string(temp.path().join("feed.jsonl")).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_replay_keeps_a_line_apart_from_a_torn_line() -> Result<()> {
+        let (temp, driver) = driver()?;
+        fs::write(temp.path().join("feed.jsonl"), "old\nnew li")
+            .map_err(|err| LenkaError::io("t", &err))?;
+        replay(&driver, &["new line"])?;
+        assert_eq!(feed_text(&temp), "old\nnew li\nnew line\n");
+        Ok(())
+    }
+
+    #[test]
+    fn a_replay_adds_only_the_lines_that_a_stopped_write_did_not_add() -> Result<()> {
+        for (start, expected) in [
+            ("old\n", "old\nx\ny\n"),
+            ("old\nx\n", "old\nx\ny\n"),
+            ("old\nx\ny\n", "old\nx\ny\n"),
+            ("old\nx\ny", "old\nx\ny\ny\n"),
+            ("", "x\ny\n"),
+        ] {
+            let (temp, driver) = driver()?;
+            fs::write(temp.path().join("feed.jsonl"), start)
+                .map_err(|err| LenkaError::io("t", &err))?;
+            replay(&driver, &["x", "y"])?;
+            assert_eq!(feed_text(&temp), expected, "from {start:?}");
+        }
+        Ok(())
+    }
+
+    /// A process that holds the lock must not stop other processes with no limit.
+    #[test]
+    fn a_held_lock_gives_a_busy_error_and_try_begin_gives_none() -> Result<()> {
+        let (temp, driver) = driver()?;
+        let other = LocalDriver::open(temp.path())?;
+        let _held = other.begin()?;
+        assert!(driver.try_begin()?.is_none());
+        let limit = Duration::from_millis(50);
+        let start = Instant::now();
+        let error = begin_with_limit(&driver, limit)
+            .err()
+            .map(|error| error.code());
+        assert_eq!(error, Some(ErrorCode::Busy));
+        assert!(start.elapsed() >= limit);
+        Ok(())
+    }
+
+    #[test]
+    fn a_free_lock_is_available_after_a_wait() -> Result<()> {
+        let (temp, driver) = driver()?;
+        let other = LocalDriver::open(temp.path())?;
+        let held = other.begin()?;
+        std::thread::scope(|scope| {
+            let waiter =
+                scope.spawn(|| begin_with_limit(&driver, Duration::from_secs(20)).map(|_| ()));
+            std::thread::sleep(Duration::from_millis(30));
+            drop(held);
+            waiter
+                .join()
+                .map_err(|_| LenkaError::invalid_argument("a panic"))?
+        })?;
+        assert!(driver.try_begin()?.is_some());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_gives_an_error_and_no_wait() -> Result<()> {
+        let (temp, driver) = driver()?;
+        let path = temp.path().join("pipe");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .map_err(|err| LenkaError::io("t", &err))?;
+        assert!(made.success());
+        let doc = DocPath::new("pipe")?;
+        assert_eq!(
+            driver.read(&doc).err().map(|e| e.code()),
+            Some(ErrorCode::InvalidFile)
+        );
+        assert_eq!(
+            driver.read_from(&doc, 0).err().map(|e| e.code()),
+            Some(ErrorCode::InvalidFile)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_wait_limit_of_the_environment_has_a_maximum() {
+        assert_eq!(parse_lock_wait(None), DEFAULT_LOCK_WAIT);
+        assert_eq!(parse_lock_wait(Some("not a number")), DEFAULT_LOCK_WAIT);
+        assert_eq!(parse_lock_wait(Some("25")), Duration::from_millis(25));
+        assert_eq!(parse_lock_wait(Some("99999999999")), MAX_LOCK_WAIT);
+    }
 
     fn driver() -> Result<(tempfile::TempDir, LocalDriver)> {
         let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;

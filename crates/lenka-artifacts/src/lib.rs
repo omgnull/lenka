@@ -520,6 +520,7 @@ impl ArtifactService {
         if let Ok(id) = ArtifactId::parse(text) {
             return Ok(id);
         }
+        lenka_plugin_api::check_short_id(text)?;
         let dir = DocPath::new("artifacts")?;
         let names = self.project.driver().list(&dir)?;
         let mut found = names.iter().filter(|name| name.ends_with(text));

@@ -2808,6 +2808,14 @@ impl TaskService {
             ..DoctorReport::default()
         };
         check_task_directories(driver, &fresh, &mut report)?;
+        if let Some(bytes) = driver.read(&DocPath::new("lenka.toml")?)? {
+            let text = String::from_utf8_lossy(&bytes);
+            for section in lenka_core::unknown_sections(&text) {
+                report.invalid_files.push(format!(
+                    "lenka.toml has the section {section}, and lenka does not read it."
+                ));
+            }
+        }
         check_artifacts(&self.project, depth, &mut report)?;
         report.temp_files = self.project.old_temp_files();
         report.oversize_inboxes = lenka_core::notices::oversize_inboxes(driver)?;
@@ -2864,7 +2872,7 @@ fn resolve_in(index: &Index, text: &str) -> Result<TaskId> {
         }
         return Err(task_missing(id));
     }
-    let valid_short = text.len() >= 4
+    let valid_short = text.len() >= 8
         && text.len() < 36
         && text
             .bytes()

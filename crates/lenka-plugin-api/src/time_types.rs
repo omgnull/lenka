@@ -15,6 +15,11 @@ use crate::error::{LenkaError, Result};
 #[serde(try_from = "String", into = "String")]
 pub struct Timestamp(i64);
 
+/// The first time that the text form can hold: 0000-01-01T00:00:00Z.
+const FIRST_UNIX_MS: i64 = -62_167_219_200_000;
+/// The last time that the text form can hold: 9999-12-31T23:59:59.999Z.
+const LAST_UNIX_MS: i64 = 253_402_300_799_999;
+
 impl Timestamp {
     /// Returns the current system time.
     #[must_use]
@@ -26,7 +31,7 @@ impl Timestamp {
     /// Creates a timestamp from milliseconds after the Unix epoch.
     #[must_use]
     pub fn from_unix_ms(ms: i64) -> Self {
-        Self(ms)
+        Self(ms.clamp(FIRST_UNIX_MS, LAST_UNIX_MS))
     }
 
     /// Returns the milliseconds after the Unix epoch.
@@ -38,7 +43,7 @@ impl Timestamp {
     /// Returns this time plus some milliseconds.
     #[must_use]
     pub fn plus_ms(self, ms: i64) -> Self {
-        Self(self.0.saturating_add(ms))
+        Self::from_unix_ms(self.0.saturating_add(ms))
     }
 
     /// Parses the RFC 3339 form.
@@ -49,9 +54,13 @@ impl Timestamp {
     pub fn parse(text: &str) -> Result<Self> {
         let value = OffsetDateTime::parse(text, &Rfc3339)
             .map_err(|_| LenkaError::invalid_argument("The time is not valid RFC 3339."))?;
-        Ok(Self(
-            i64::try_from(value.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX),
-        ))
+        let ms = i64::try_from(value.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);
+        if !(FIRST_UNIX_MS..=LAST_UNIX_MS).contains(&ms) {
+            return Err(LenkaError::invalid_argument(
+                "The time must be in the years 0000 to 9999.",
+            ));
+        }
+        Ok(Self(ms))
     }
 }
 
@@ -188,6 +197,17 @@ impl From<Day> for String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_keeps_its_value_in_a_round_trip() {
+        for ms in [i64::MAX, i64::MIN, FIRST_UNIX_MS, LAST_UNIX_MS, 0] {
+            let time = Timestamp::from_unix_ms(ms);
+            assert_eq!(Timestamp::parse(&time.to_string()).ok(), Some(time), "{ms}");
+        }
+        let far = Timestamp::from_unix_ms(LAST_UNIX_MS).plus_ms(i64::MAX);
+        assert_eq!(far.unix_ms(), LAST_UNIX_MS);
+        assert!(Timestamp::parse("9999-12-31T23:59:59-23:59").is_err());
+    }
 
     #[test]
     fn timestamp_round_trip() {

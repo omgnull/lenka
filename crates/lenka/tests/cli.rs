@@ -1502,3 +1502,94 @@ fn artifact_list_names_an_invalid_record() -> TestResult {
     );
     Ok(())
 }
+
+/// A process that holds the lock must not stop a read, and a write must end with an error.
+#[test]
+fn a_held_lock_stops_no_read_and_gives_a_write_a_busy_error() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let lock_file = repo.join(".git/lenka-data/.runtime/lock");
+    let task = machine.json(&repo, &["task", "create", "One"])?;
+    let id = text(&task, "task").to_owned();
+    let held = fs::File::options().write(true).open(&lock_file)?;
+    held.lock()?;
+    // A writer that stopped in its write leaves a journal, and a read must still work.
+    fs::write(lock_file.with_file_name("pending.json"), "[]")?;
+    let run = |args: &[&str]| -> TestResult<std::process::Output> {
+        let mut command = machine.command(&repo, args);
+        command.env("LENKA_LOCK_WAIT_MS", "100");
+        Ok(command.output()?)
+    };
+    // This read has the default limit of the wait, so a wait for the lock takes 30 seconds.
+    let start = std::time::Instant::now();
+    let read = machine
+        .command(&repo, &["--json", "task", "show", &id])
+        .output()?;
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(15),
+        "a read must not wait"
+    );
+    let list = run(&["--json", "task", "list"])?;
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let write = run(&["--json", "task", "create", "Two"])?;
+    assert!(!write.status.success());
+    let error: Value =
+        serde_json::from_slice(&write.stdout).or_else(|_| serde_json::from_slice(&write.stderr))?;
+    assert_eq!(error["code"], "busy", "{error}");
+    held.unlock()?;
+    machine.json(&repo, &["task", "create", "Two"])?;
+    Ok(())
+}
+
+#[test]
+fn doctor_names_a_settings_section_with_a_wrong_name() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    let file = repo.join(".git/lenka-data/lenka.toml");
+    let old = fs::read_to_string(&file)?;
+    fs::write(&file, format!("{old}\n[limit]\nstrict_flush = true\n"))?;
+    let value = doctor_of(&machine, &repo, &[])?;
+    assert!(
+        value["report"]["invalid_files"]
+            .to_string()
+            .contains("limit"),
+        "{value}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_short_id_under_eight_characters_selects_nothing() -> TestResult {
+    let (_temp, machine) = machine()?;
+    let repo = machine.project("api")?;
+    fs::write(repo.join("a.txt"), "first")?;
+    let created = machine.json(&repo, &["artifact", "create", "a.txt"])?;
+    let short = text(&created, "artifact").to_owned();
+    let empty = serde_json::json!({ "artifact": "" }).to_string();
+    let code = machine.fails(&repo, &["call", "artifact.delete", &empty])?;
+    assert_eq!(code, "invalid_argument");
+    let one = serde_json::json!({ "artifact": &short[7..] }).to_string();
+    let code = machine.fails(&repo, &["call", "artifact.delete", &one])?;
+    assert_eq!(code, "invalid_argument");
+    assert_eq!(
+        machine.json(&repo, &["artifact", "list"])?["artifacts"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let memory = machine.json(&repo, &["memory", "add", "A memory."])?;
+    let full = text(&memory, "full_id").to_owned();
+    let one = serde_json::json!({ "id": &full[full.len() - 1..] }).to_string();
+    let code = machine.fails(&repo, &["call", "memory.delete", &one])?;
+    assert_eq!(code, "invalid_argument");
+    Ok(())
+}

@@ -19,6 +19,9 @@ use crate::notices::ProjectEvent;
 use crate::secret::{self, SecretPolicy, TextCheck};
 use crate::settings::{PROJECT_FILE, ProjectConfig};
 
+/// The count of tries of a repair in a read, with 10 milliseconds between them.
+const REPAIR_TRIES: usize = 20;
+
 /// The age after which a temporary file or an artifact directory with no record has no writer.
 pub const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -125,10 +128,20 @@ impl Project {
     ///
     /// Returns an error if the repair fails.
     pub fn repair_if_needed(&self) -> Result<()> {
-        if self.driver.journal_read()?.is_some() {
-            let mut txn = self.driver.begin()?;
-            journal::repair(self.driver.as_ref(), txn.as_mut())?;
+        // A live writer finishes in milliseconds, and a stopped holder must not stop a read. The
+        // next write repairs what this read did not repair.
+        for _ in 0..REPAIR_TRIES {
+            if self.driver.journal_read()?.is_none() {
+                return Ok(());
+            }
+            if let Some(mut txn) = self.driver.try_begin()? {
+                txn.set_strict_flush(self.config().limits.strict_flush);
+                journal::repair(self.driver.as_ref(), txn.as_mut())?;
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        tracing::warn!("another process holds the write lock, so a read skipped a repair");
         Ok(())
     }
 
@@ -302,13 +315,17 @@ impl Project {
         &self.peers
     }
 
-    /// Stores a cache document that a rebuild can create again. It skips the journal.
+    /// Stores a cache document that a rebuild can create again. It skips the journal. A busy lock
+    /// skips the store, because a read must not wait for a writer.
     ///
     /// # Errors
     ///
     /// Returns an error if the write fails.
     pub fn put_cache(&self, path: &DocPath, bytes: &[u8]) -> Result<()> {
-        self.driver.begin()?.put(path, bytes)
+        match self.driver.try_begin()? {
+            Some(mut txn) => txn.put(path, bytes),
+            None => Ok(()),
+        }
     }
 
     /// Returns the test control for stops in a write.

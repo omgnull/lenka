@@ -131,7 +131,7 @@ pub(crate) fn apply_filter(
                 && (!filter.ready_only || is_ready(row, config, actor))
                 && (text.is_empty()
                     || front.title.to_lowercase().contains(&text)
-                    || front.id.matches_short(&text))
+                    || front.id.to_string().ends_with(&text))
         })
         .map(|(index, _)| index)
         .collect()

@@ -12,6 +12,20 @@ use crate::error::{LenkaError, Result};
 /// The number of characters in the short form of an ID.
 const SHORT_LEN: usize = 8;
 
+/// Refuses a short ID that is too short to select one record with safety.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCode::InvalidArgument`] if the text has fewer than eight characters.
+pub fn check_short_id(text: &str) -> crate::Result<()> {
+    if text.len() < SHORT_LEN {
+        return Err(crate::LenkaError::invalid_argument(
+            "An ID must be a full ID or a short ID from a tool result.",
+        ));
+    }
+    Ok(())
+}
+
 macro_rules! id_type {
     ($(#[$doc:meta])* $name:ident, $label:literal) => {
         $(#[$doc])*
@@ -51,10 +65,11 @@ macro_rules! id_type {
                 text[text.len() - SHORT_LEN..].to_owned()
             }
 
-            /// Tells if the text is the short form of this ID.
+            /// Tells if the text is the short form of this ID. A shorter text never matches,
+            /// because it can select the wrong record.
             #[must_use]
             pub fn matches_short(&self, short: &str) -> bool {
-                self.0.hyphenated().to_string().ends_with(short)
+                short.len() >= SHORT_LEN && self.0.hyphenated().to_string().ends_with(short)
             }
         }
 
@@ -157,6 +172,10 @@ mod tests {
         let id = TaskId::generate();
         assert_eq!(id.short().len(), SHORT_LEN);
         assert!(id.matches_short(&id.short()));
+        assert!(!id.matches_short(""));
+        assert!(!id.matches_short(&id.short()[1..]));
+        assert!(check_short_id("").is_err());
+        assert!(check_short_id(&id.short()).is_ok());
     }
 
     #[test]

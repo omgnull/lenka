@@ -110,7 +110,7 @@ pub trait EventHook: Send + Sync + Debug {
 
 /// The contents of `plugins.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct PluginSettings {
     /// Plugins to turn off.
     disabled: Vec<String>,
@@ -169,11 +169,10 @@ impl Builder {
         let mut states = Vec::new();
         for plugin in &self.plugins {
             let info = plugin.info();
-            let on = if info.sensitive {
-                settings.enabled.iter().any(|name| name == info.name)
-            } else {
-                !settings.disabled.iter().any(|name| name == info.name)
-            };
+            // A plugin in both lists stays off, because that is the safe result.
+            let off = settings.disabled.iter().any(|name| name == info.name);
+            let on =
+                !off && (!info.sensitive || settings.enabled.iter().any(|name| name == info.name));
             if on {
                 plugin.register(&mut registry);
             }

@@ -122,8 +122,24 @@ impl FsStore {
             .map_err(|err| LenkaError::io("Store the artifact", &err));
         if result.is_err() {
             let _ = fs::remove_file(temp);
+        } else if cfg!(unix)
+            && let Some(dir) = target.parent()
+            && let Ok(handle) = File::open(dir)
+        {
+            // A record must not name bytes that a power failure removes with the rename.
+            let _ = handle.sync_all();
         }
         result
+    }
+}
+
+/// Refuses a path that is not a regular file. The open of a named pipe waits with no limit.
+fn check_regular_file(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.is_file() => Err(LenkaError::invalid_file(
+            "An artifact path is not a regular file, so lenka cannot read it.",
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -208,12 +224,14 @@ impl ArtifactStore for FsStore {
                 "An artifact file is a symlink, and lenka refuses symlinks in the data directory.",
             ));
         }
+        check_regular_file(&file)?;
         fs::read(&file).map_err(|err| LenkaError::io("Read the artifact", &err))
     }
 
     fn sha256(&self, id: ArtifactId, version: u64, name: &str) -> Result<String> {
         let path = self.file_of(id, version, name)?;
         self.check_no_symlink(&path)?;
+        check_regular_file(&path)?;
         let mut input =
             File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
         let mut hasher = Sha256::new();
@@ -239,6 +257,7 @@ impl ArtifactStore for FsStore {
     ) -> Result<Vec<u8>> {
         let path = self.file_of(id, version, name)?;
         self.check_no_symlink(&path)?;
+        check_regular_file(&path)?;
         let file =
             fs::File::open(&path).map_err(|err| LenkaError::io("Read the artifact", &err))?;
         let mut bytes = Vec::new();

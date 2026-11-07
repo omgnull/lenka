@@ -2057,6 +2057,7 @@ version = "0.1.0"
 dependencies = [
  "lenka-core",
  "lenka-plugin-api",
+ "serde_json",
  "tempfile",
  "tracing",
 ]

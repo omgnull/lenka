@@ -195,7 +195,21 @@ pub fn create_project_with(
     // Other processes start in other directories, so the entry holds an absolute path.
     let directory = std::path::absolute(&directory)
         .map_err(|err| LenkaError::io("Find the directory", &err))?;
+    let directory = without_dot_parts(&directory);
+    // The lock also covers the check for `lenka.toml`, so two processes cannot make two IDs.
+    paths.with_user_lock(|| create_locked(paths, cwd, name, directory, attach))
+}
+
+fn create_locked(
+    paths: &Paths,
+    cwd: &Path,
+    name: String,
+    directory: PathBuf,
+    attach: Attach,
+) -> Result<Created> {
     let mut projects = ProjectsFile::load(paths)?;
+    refuse_nested_project(&projects, &name, &directory)?;
+    refuse_symlink(&directory)?;
     if let Some(entry) = projects.projects.get(&name)
         && entry.directory != directory
     {
@@ -209,7 +223,7 @@ pub fn create_project_with(
             .map_err(|err| LenkaError::io("Read lenka.toml", &err))?;
         ProjectConfig::parse(&text)?
     } else {
-        if matches!(location, Location::Directory(_)) && holds_files(&directory)? {
+        if holds_other_files(&directory)? {
             return Err(LenkaError::invalid_argument(
                 "This directory holds other files, but no lenka project. Select an empty directory or a new one.",
             ));
@@ -250,13 +264,71 @@ pub fn create_project_with(
     })
 }
 
-/// Tells if a directory has entries. A missing directory has none.
-fn holds_files(directory: &Path) -> Result<bool> {
-    match fs::read_dir(directory) {
-        Ok(mut entries) => Ok(entries.next().is_some()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(LenkaError::io("Read the data directory", &err)),
+/// Removes `.` and `..` from an absolute path, so that one directory has one form.
+fn without_dot_parts(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            other => clean.push(other),
+        }
     }
+    clean
+}
+
+/// Refuses a data directory in another data directory, or around one.
+fn refuse_nested_project(projects: &ProjectsFile, name: &str, directory: &Path) -> Result<()> {
+    for (other, entry) in &projects.projects {
+        let different = other != name && entry.directory != directory;
+        if different
+            && (directory.starts_with(&entry.directory) || entry.directory.starts_with(directory))
+        {
+            return Err(LenkaError::invalid_argument(format!(
+                "This directory overlaps the data directory of the project {other}. Select another directory."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a symlink before the first write, because all later commands refuse it.
+fn refuse_symlink(directory: &Path) -> Result<()> {
+    match fs::symlink_metadata(directory) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(LenkaError::invalid_argument(
+            "The data directory must be a real directory, not a symlink.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Tells if a directory has files that a stopped `lenka init` and the OS did not make. A retry can
+/// then continue in that directory.
+fn holds_other_files(directory: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(LenkaError::io("Read the data directory", &err)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|err| LenkaError::io("Read the data directory", &err))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let allowed = match name.as_ref() {
+            ".gitignore" | ".gitattributes" | ".runtime" | ".DS_Store" | "Thumbs.db"
+            | "desktop.ini" => true,
+            "tasks" | "artifacts" | "memory" => {
+                fs::read_dir(entry.path()).is_ok_and(|mut inner| inner.next().is_none())
+            }
+            other => other.starts_with(crate::layout::TEMP_PREFIX),
+        };
+        if !allowed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn write_new_project(directory: &Path, config: &ProjectConfig) -> Result<()> {
@@ -276,7 +348,14 @@ fn write_new_project(directory: &Path, config: &ProjectConfig) -> Result<()> {
         (PROJECT_FILE, config.to_text()?),
     ];
     for (name, text) in files {
-        fs::write(directory.join(name), text)
+        // `lenka.toml` comes last, and a rename makes it complete or absent.
+        let temp = directory.join(format!(
+            "{}init-{}",
+            crate::layout::TEMP_PREFIX,
+            std::process::id()
+        ));
+        fs::write(&temp, text)
+            .and_then(|()| fs::rename(&temp, directory.join(name)))
             .map_err(|err| LenkaError::io("Write a project file", &err))?;
     }
     Ok(())
@@ -298,17 +377,19 @@ pub fn register_existing(
     let config = ProjectConfig::parse(&text)?;
     let name = name.map_or_else(|| config.name.clone(), str::to_owned);
     validate_project_name(&name)?;
-    let mut projects = ProjectsFile::load(paths)?;
-    projects.projects.insert(
-        name.clone(),
-        ProjectEntry {
-            id: config.id,
-            driver: config.storage.driver.clone(),
-            directory: directory.to_path_buf(),
-        },
-    );
-    projects.save(paths)?;
-    let clone_file = attach_to_clone(cwd, &name)?;
+    let clone_file = paths.with_user_lock(|| {
+        let mut projects = ProjectsFile::load(paths)?;
+        projects.projects.insert(
+            name.clone(),
+            ProjectEntry {
+                id: config.id,
+                driver: config.storage.driver.clone(),
+                directory: directory.to_path_buf(),
+            },
+        );
+        projects.save(paths)?;
+        attach_to_clone(cwd, &name)
+    })?;
     Ok(Created {
         name,
         directory: directory.to_path_buf(),
@@ -323,6 +404,10 @@ pub fn register_existing(
 ///
 /// Returns [`ErrorCode::ProjectNotAvailable`] if the project is not in the user list.
 pub fn attach(paths: &Paths, cwd: &Path, name: &str) -> Result<PathBuf> {
+    paths.with_user_lock(|| attach_locked(paths, cwd, name))
+}
+
+fn attach_locked(paths: &Paths, cwd: &Path, name: &str) -> Result<PathBuf> {
     let projects = ProjectsFile::load(paths)?;
     if !projects.projects.contains_key(name) {
         let names: Vec<&str> = projects.projects.keys().map(String::as_str).collect();
@@ -456,6 +541,129 @@ mod tests {
         let below = caller_for(&sub, setup(Actor::Agent, None))?;
         assert_eq!(root.agent_key, below.agent_key);
         assert_eq!(root.worktree, below.worktree);
+        Ok(())
+    }
+
+    /// Each process reads, changes, and saves the list, so a process with no lock loses entries.
+    #[test]
+    fn parallel_creates_keep_all_projects_and_one_id() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        fs::create_dir_all(&cwd).map_err(|err| LenkaError::io("mkdir", &err))?;
+        std::thread::scope(|scope| {
+            for number in 0..12 {
+                let (paths, cwd) = (&paths, &cwd);
+                scope.spawn(move || {
+                    create_project(paths, cwd, Some(&format!("p{number}")), &Location::Shared)
+                        .expect("a project");
+                    // One name in all threads must give one ID.
+                    create_project(paths, cwd, Some("same"), &Location::Shared).expect("a project");
+                });
+            }
+        });
+        let list = ProjectsFile::load(&paths)?;
+        assert_eq!(list.projects.len(), 13);
+        let same = &list.projects["same"];
+        let text = fs::read_to_string(same.directory.join("lenka.toml"))
+            .map_err(|err| LenkaError::io("read", &err))?;
+        assert_eq!(ProjectConfig::parse(&text)?.id, same.id);
+        let clone = CloneFile::load(&clone_file_for(&cwd))?
+            .ok_or_else(|| LenkaError::not_found("clone"))?;
+        assert_eq!(clone.projects.len(), 13);
+        Ok(())
+    }
+
+    #[test]
+    fn a_stopped_create_can_run_again() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let target = temp.path().join("target");
+        for part in ["tasks", "artifacts", "memory", ".runtime/inbox"] {
+            fs::create_dir_all(target.join(part)).map_err(|err| LenkaError::io("mkdir", &err))?;
+        }
+        for name in [".gitignore", ".tmp-init-1", ".DS_Store"] {
+            fs::write(target.join(name), "x").map_err(|err| LenkaError::io("write", &err))?;
+        }
+        let created = create_project(
+            &paths,
+            temp.path(),
+            Some("api"),
+            &Location::Directory(target),
+        )?;
+        assert!(created.directory.join("lenka.toml").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_with_data_of_another_kind_is_refused_at_each_location() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().join("work");
+        fs::create_dir_all(cwd.join("lenka-data/tasks/old"))
+            .map_err(|err| LenkaError::io("mkdir", &err))?;
+        let refused = create_project(&paths, &cwd, Some("api"), &Location::Default);
+        assert_eq!(
+            refused.err().map(|error| error.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+        let other = temp.path().join("other");
+        fs::create_dir_all(&other).map_err(|err| LenkaError::io("mkdir", &err))?;
+        fs::write(other.join("notes.txt"), "x").map_err(|err| LenkaError::io("write", &err))?;
+        let refused = create_project(&paths, &cwd, Some("b"), &Location::Directory(other));
+        assert_eq!(
+            refused.err().map(|error| error.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_as_the_data_directory_is_refused_before_a_write() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let real = temp.path().join("real");
+        fs::create_dir_all(&real).map_err(|err| LenkaError::io("mkdir", &err))?;
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).map_err(|err| LenkaError::io("link", &err))?;
+        let refused = create_project(&paths, temp.path(), Some("api"), &Location::Directory(link));
+        assert_eq!(
+            refused.err().map(|error| error.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
+        assert_eq!(
+            fs::read_dir(&real)
+                .map_err(|err| LenkaError::io("read", &err))?
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_path_has_one_form_and_a_project_cannot_nest_in_another() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let cwd = temp.path().to_path_buf();
+        let plain = Location::Directory(PathBuf::from("a/../data"));
+        let first = create_project(&paths, &cwd, Some("n"), &plain)?;
+        assert_eq!(
+            first.directory,
+            std::path::absolute(cwd.join("data")).map_err(|err| LenkaError::io("path", &err))?
+        );
+        create_project(
+            &paths,
+            &cwd,
+            Some("n"),
+            &Location::Directory(PathBuf::from("data")),
+        )?;
+        let inner = Location::Directory(PathBuf::from("data/tasks/inner"));
+        let refused = create_project(&paths, &cwd, Some("inner"), &inner);
+        assert_eq!(
+            refused.err().map(|error| error.code()),
+            Some(ErrorCode::InvalidArgument)
+        );
         Ok(())
     }
 
