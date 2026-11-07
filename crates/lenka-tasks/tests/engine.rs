@@ -4431,6 +4431,79 @@ fn a_link_that_a_hand_edit_removes_gets_a_notice() -> Result<()> {
     Ok(())
 }
 
+/// An event hook that does nothing. With a hook, a finish records all hand edits first.
+#[derive(Debug)]
+struct NoHook;
+
+impl lenka_core::EventHook for NoHook {
+    fn on_event(
+        &self,
+        _project: &lenka_core::Project,
+        _event: &lenka_core::ProjectEvent,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct NoHookPlugin;
+
+impl lenka_core::Plugin for NoHookPlugin {
+    fn info(&self) -> lenka_core::PluginInfo {
+        lenka_core::PluginInfo {
+            name: "no-hook",
+            description: "An event hook that does nothing.",
+            sensitive: false,
+        }
+    }
+
+    fn register(&self, registry: &mut lenka_core::Registry) {
+        registry.hook(Arc::new(NoHook));
+    }
+}
+
+#[test]
+fn a_finish_with_a_hook_records_a_hand_edit_that_keeps_the_file_stamps() -> Result<()> {
+    let fx = fixture()?;
+    fx.project("api")?;
+    let host = Builder::new()
+        .plugin(lenka_driver_local::plugin())
+        .plugin(lenka_artifact_fs::plugin())
+        .plugin(lenka_tasks::plugin())
+        .plugin(NoHookPlugin)
+        .paths(fx.paths.clone())
+        .clock(Arc::clone(&fx.clock) as Arc<dyn lenka_core::Clock>)
+        .build()?;
+    let service = service_of(&host.open_by_name("api")?)?;
+    let agent = fx.agent("a");
+    let edited = create(&service, &agent, "Edited")?;
+    let finished = create(&service, &agent, "Finished")?;
+    let claim = service.claim(&agent, Some(finished), None, None)?;
+
+    // Only a compare of the text finds an edit with the same size and the same time.
+    let file = task_file(&fx, edited, "task.md");
+    let io = |err: std::io::Error| LenkaError::io("hand edit", &err);
+    let text = fs::read_to_string(&file).map_err(io)?;
+    let time = fs::metadata(&file)
+        .and_then(|meta| meta.modified())
+        .map_err(io)?;
+    fs::write(&file, text.replace("Text.", "Edit.")).map_err(io)?;
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .and_then(|handle| handle.set_modified(time))
+        .map_err(io)?;
+
+    service.finish(
+        &agent,
+        finished,
+        &ClaimRef::Handle(claim.handle),
+        &finish_done(),
+    )?;
+    assert_eq!(service.detail(edited, &[])?.meta.state.version, 2);
+    Ok(())
+}
+
 #[test]
 fn a_claim_takes_the_next_task_when_a_hand_edit_closed_the_top_task() -> Result<()> {
     let fx = fixture()?;

@@ -2673,10 +2673,31 @@ impl TaskService {
     /// Returns an error if the data cannot be read or written.
     pub fn record_all_external_edits(&self) -> Result<()> {
         let driver = self.project.driver();
+        // The compare of the text reads each task, so it runs before the lock, and other writers
+        // do not wait for it. Under the lock, only the found tasks and new tasks get a check.
+        // An edit can also come after the release of the lock and before the Git commit, so a
+        // compare under the lock cannot find all edits either.
+        let mut known = HashMap::new();
+        let mut edited = HashSet::new();
+        for (id, meta) in &self.read_index()?.tasks {
+            known.insert(*id, meta.state.version);
+            if stamps_differ(driver, meta) {
+                edited.insert(*id);
+            }
+        }
+        for (id, version) in &known {
+            if differs_from_version(driver, *id)
+                || newest_version(driver, *id, *version).ok() != Some(*version)
+            {
+                edited.insert(*id);
+            }
+        }
         self.with_write(|locked, index, now| {
             index.scan(driver)?;
             for id in index.order.clone() {
-                self.ingest_if_changed(locked, index, id, now)?;
+                if edited.contains(&id) || !known.contains_key(&id) {
+                    self.ingest_if_changed(locked, index, id, now)?;
+                }
             }
             Ok(())
         })

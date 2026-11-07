@@ -14,10 +14,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lenka_core::init::{Location, create_project};
-use lenka_core::{Builder, Host, Paths};
+use lenka_core::{
+    Builder, EventHook, Host, Paths, Plugin, PluginInfo, Project, ProjectEvent, Registry,
+};
 use lenka_plugin_api::{Actor, Caller, LenkaError, ProjectScope, Result, TaskId, Timestamp};
 use lenka_tasks::{
-    ListFilter, State, Status, TaskFront, TaskPatch, TaskService, markdown, service_of,
+    ClaimRef, Finish, ListFilter, State, Status, TaskFront, TaskPatch, TaskService, markdown,
+    service_of,
 };
 
 fn host(dir: &Path) -> Result<Host> {
@@ -25,6 +28,43 @@ fn host(dir: &Path) -> Result<Host> {
         .plugin(lenka_driver_local::plugin())
         .plugin(lenka_artifact_fs::plugin())
         .plugin(lenka_tasks::plugin())
+        .paths(paths(dir))
+        .build()
+}
+
+/// An event hook that does nothing. With a hook, a finish first records all hand edits.
+#[derive(Debug)]
+struct NoHook;
+
+impl EventHook for NoHook {
+    fn on_event(&self, _project: &Project, _event: &ProjectEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct NoHookPlugin;
+
+impl Plugin for NoHookPlugin {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            name: "perf-hook",
+            description: "An event hook that does nothing.",
+            sensitive: false,
+        }
+    }
+
+    fn register(&self, registry: &mut Registry) {
+        registry.hook(Arc::new(NoHook));
+    }
+}
+
+fn host_with_hook(dir: &Path) -> Result<Host> {
+    Builder::new()
+        .plugin(lenka_driver_local::plugin())
+        .plugin(lenka_artifact_fs::plugin())
+        .plugin(lenka_tasks::plugin())
+        .plugin(NoHookPlugin)
         .paths(paths(dir))
         .build()
 }
@@ -220,6 +260,28 @@ fn run(dir: &Path) -> Result<()> {
         percentile(&mut times, 0.5),
         percentile(&mut times, 0.95)
     );
+    let hooked_host = host_with_hook(dir)?;
+    let hooked = service_of(&hooked_host.open_by_name("perf")?)?;
+    for (label, tasks) in [
+        ("with no event hook", &service),
+        ("with an event hook", &hooked),
+    ] {
+        let mut times = sample(10, |_| {
+            let claim = tasks.claim(&who, None, None, None)?;
+            let done = Finish::Done {
+                evidence: "benchmark".to_owned(),
+                unchecked_reason: Some("benchmark".to_owned()),
+            };
+            tasks
+                .finish(&who, claim.task, &ClaimRef::Handle(claim.handle), &done)
+                .map(|_| ())
+        })?;
+        println!(
+            "claim and finish {label}: p50 {:?}, p95 {:?}",
+            percentile(&mut times, 0.5),
+            percentile(&mut times, 0.95)
+        );
+    }
     let start = Instant::now();
     let count = service.reindex(&who)?;
     println!("full rebuild of {count} tasks: {:?}", start.elapsed());
