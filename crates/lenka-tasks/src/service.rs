@@ -2804,11 +2804,14 @@ impl TaskService {
         let root = root_of(id);
         let old_version = current.meta.state.version;
         let old_dir = format!("{root}/versions/{old_version:06}");
-        let Some(old_text) = read_text(driver, &format!("{old_dir}/task.md"))? else {
-            return Ok(());
+        // A lost record of the old version must not hide the edit. The edit is then new text.
+        let old_text = read_text(driver, &format!("{old_dir}/task.md"))?;
+        let old_plan = match old_text {
+            Some(_) => read_text(driver, &format!("{old_dir}/plan.md"))?,
+            None => None,
         };
-        let old_plan = read_text(driver, &format!("{old_dir}/plan.md"))?;
-        let old_body = split_front::<TaskFront>("task.md", &old_text)
+        let old_body = old_text
+            .and_then(|text| split_front::<TaskFront>("task.md", &text).ok())
             .map(|(_, body)| Body::parse(&body))
             .unwrap_or_default();
         let new_body = Body::parse(&current.body);
@@ -3702,11 +3705,12 @@ fn differs_from_version(driver: &dyn lenka_plugin_api::StorageDriver, id: TaskId
     };
     let dir = format!("{root}/versions/{:06}", state.version);
     let read = |path: String| read_text(driver, &path).ok().flatten();
+    let current = read(format!("{root}/task.md"));
+    // With no record of the version, nothing shows that the files are the same.
     let Some(old_task) = read(format!("{dir}/task.md")) else {
-        return false;
+        return current.is_some();
     };
-    read(format!("{root}/task.md")) != Some(old_task)
-        || read(format!("{root}/plan.md")) != read(format!("{dir}/plan.md"))
+    current != Some(old_task) || read(format!("{root}/plan.md")) != read(format!("{dir}/plan.md"))
 }
 
 fn read_last_valid(

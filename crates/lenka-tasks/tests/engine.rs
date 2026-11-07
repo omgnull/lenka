@@ -4364,3 +4364,24 @@ fn a_write_keeps_the_front_matter_of_a_hand_edit() -> Result<()> {
     assert_eq!(service.detail(id, &[])?.meta.front.title, "New title");
     Ok(())
 }
+
+/// A lost record of the old version does not hide a hand edit.
+#[test]
+fn a_hand_edit_with_no_record_of_the_old_version_becomes_a_version() -> Result<()> {
+    let fx = fixture()?;
+    let service = fx.project("api")?;
+    let (agent, other) = (fx.agent("a"), fx.agent("b"));
+    let id = described(&service, &agent, "T")?;
+    service.claim(&other, Some(id), None, None)?;
+    fs::remove_dir_all(task_file(&fx, id, "versions/000001"))
+        .map_err(|err| LenkaError::io("remove", &err))?;
+    hand_edit(&fx, id, "task.md", "Text.", "Edited.")?;
+    let detail = service.detail(id, &["versions"])?;
+    assert_eq!(detail.meta.state.version, 2);
+    assert_eq!(detail.description, "Edited.");
+    let versions: Vec<u64> = detail.versions.iter().map(|item| item.version).collect();
+    assert_eq!(versions, [2]);
+    assert!(detail.versions[0].material);
+    assert_eq!(service.call_notes(&other)?.unread.len(), 1);
+    Ok(())
+}
