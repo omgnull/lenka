@@ -255,12 +255,26 @@ fn token_fits(prefix: &str, min_len: usize, rest: &[u8]) -> (bool, usize) {
     (fits, len)
 }
 
-/// A certificate can mention a private key in other text, so the two parts share one line.
+/// A certificate can mention a private key in other text, so the two parts share one line. A PGP
+/// key has the form `-----BEGIN PGP PRIVATE KEY BLOCK-----`.
 fn has_private_key_block(text: &str) -> bool {
     text.lines().any(|line| {
-        line.find("-----BEGIN ")
-            .is_some_and(|start| line[start..].contains("PRIVATE KEY-----"))
+        line.find("-----BEGIN ").is_some_and(|start| {
+            let rest = &line[start..];
+            rest.contains("PRIVATE KEY-----") || rest.contains("PRIVATE KEY BLOCK-----")
+        })
     })
+}
+
+/// Gives the length of the run of `token68` characters at the start of the bytes (RFC 7235,
+/// section 2.1). Base64 values and OAuth tokens use `+`, `/`, `=`, `.`, and `~`.
+fn token68_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| {
+            is_token_char(**byte) || matches!(**byte, b'.' | b'~' | b'+' | b'/' | b'=')
+        })
+        .count()
 }
 
 fn has_bearer_token(text: &str) -> bool {
@@ -276,7 +290,7 @@ fn has_bearer_token(text: &str) -> bool {
                 while let Some(position) = lower[from..].find(word) {
                     let after = from + position + word.len();
                     from = after;
-                    let len = token_len(&line.as_bytes()[after..]);
+                    let len = token68_len(&line.as_bytes()[after..]);
                     if len >= 20
                         && looks_random(&line.as_bytes()[after..after + len])
                         && !is_placeholder(&line[after..after + len])
@@ -501,6 +515,39 @@ mod tests {
         assert!(find_pattern(&format!("AccountKey={value}")).is_some());
         // The word `basic` is common in text, so this form needs the name of the header.
         assert_eq!(find_pattern(&format!("The basic {value} form.")), None);
+    }
+
+    #[test]
+    fn a_header_token_with_base64_or_url_characters_is_a_secret() {
+        // These characters are in the first 20 characters, so a shorter run was too short.
+        let basic = ["dXNlcjpw", "/YXNzd29y", "ZDEyMzQ1Njc4OTA="].concat();
+        let bearer = ["abc+def/ghi", "12345678901234567890"].concat();
+        let oauth = ["a1B2.c3D4", "~e5F6-g7H8_i9J0.k1L2"].concat();
+        for text in [
+            format!("Authorization: Basic {basic}"),
+            format!("Authorization: Bearer {bearer}"),
+            format!("Bearer {oauth}"),
+        ] {
+            let label = text.split_at(16).0.to_owned();
+            assert!(find_pattern(&text).is_some(), "no match: {label}");
+        }
+        assert_eq!(
+            find_pattern("The bearer docs/api/authentication.html page."),
+            None
+        );
+    }
+
+    #[test]
+    fn a_pgp_private_key_block_is_a_secret() {
+        let word = "PRIVATE";
+        let block = format!(
+            "-----BEGIN PGP {word} KEY BLOCK-----\n\nlQOYBF1x9mEBCADm2Yq7\n-----END PGP {word} KEY BLOCK-----"
+        );
+        assert_eq!(find_pattern(&block), Some("private key block"));
+        assert_eq!(
+            find_pattern("-----BEGIN PGP PUBLIC KEY BLOCK-----\n\nmQENBF1x9mEBCADm2Yq7"),
+            None
+        );
     }
 
     #[test]
