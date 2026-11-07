@@ -27,6 +27,14 @@ Dependabot updates the pinned SHAs. CI installs Rust with `rustup` from the runn
 
 `--all-features` does not find a feature combination that fails to compile. CI therefore also builds the minimal feature set and each plugin alone. Add a new plugin feature to the `features` job in `.github/workflows/ci.yml`.
 
+## Mutation check in CI
+
+The `mutants` job runs `cargo mutants --in-diff` on a pull request. It covers only the changed lines of `lenka-tasks`, `lenka-core`, `lenka-mcp`, and `crates/lenka/src/hook.rs`. It uses the tests of all crates except `lenka-desktop`.
+
+- The job is a report, and a missed mutant does not stop the pull request.
+- The job skips a change with more than 40 mutants, because each mutant takes about one minute.
+- Add a path to the `git diff` in the job when a new crate holds engine rules.
+
 ## Lints in CI
 
 CI runs clippy with `-D warnings`, so a lint at the `warn` level stops CI when it fires. Run the clippy command in [`CLAUDE.md`](../../CLAUDE.md#commands) after you add a lint to `Cargo.toml`.

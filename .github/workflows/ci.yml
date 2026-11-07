@@ -76,11 +76,12 @@ jobs:
           rust-version: stable
 
   mutants:
-    name: Mutation check of the changed lines
+    name: Mutation check of the changed engine lines
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
     # A report only, for now. Make it block when the noise is low.
+    # 40 mutants in 2 jobs take about 20 minutes, if the tests take about one minute.
+    timeout-minutes: 75
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -116,7 +117,7 @@ jobs:
       - name: Test the mutants
         if: fromJSON(steps.diff.outputs.count) > 0 && fromJSON(steps.diff.outputs.count) <= 40
         run: >-
-          cargo mutants --in-diff mutants.diff --no-shuffle -j 2 --timeout 300
+          cargo mutants --in-diff mutants.diff --no-shuffle -j 2
           --test-package lenka-plugin-api,lenka-core,lenka-driver-local,lenka-artifact-fs,lenka-tasks,lenka-artifacts,lenka-memory,lenka-git,lenka-mcp,lenka
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

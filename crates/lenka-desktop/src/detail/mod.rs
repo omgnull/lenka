@@ -228,16 +228,8 @@ impl DetailState {
         if keep_dates {
             // A person can be in the middle of a date, so only a changed date replaces the text.
             let front = &self.data.meta.front;
-            merge_field(
-                &mut self.start_input,
-                &day_text(old_front.start),
-                &day_text(front.start),
-            );
-            merge_field(
-                &mut self.due_input,
-                &day_text(old_front.due),
-                &day_text(front.due),
-            );
+            merge_day_field(&mut self.start_input, old_front.start, front.start);
+            merge_day_field(&mut self.due_input, old_front.due, front.due);
         } else {
             self.fill_date_inputs();
         }
@@ -344,11 +336,26 @@ pub(crate) fn has_section_heading(text: &str) -> bool {
     false
 }
 
-/// Takes a new text unless the person edited the old text.
+/// Formats a day for a date field. A field with no day is empty.
 fn day_text(day: Option<lenka_plugin_api::Day>) -> String {
     day.map_or_else(String::new, |day| day.to_string())
 }
 
+/// Merges a new day into a date field. A text that gives the new day, such as the text of the
+/// person after a save, takes the stored form, so that it does not count as unsaved text.
+fn merge_day_field(
+    draft: &mut String,
+    old: Option<lenka_plugin_api::Day>,
+    new: Option<lenka_plugin_api::Day>,
+) {
+    if crate::timeline::parse_day_field(draft).is_ok_and(|day| day == new) {
+        *draft = day_text(new);
+        return;
+    }
+    merge_field(draft, &day_text(old), &day_text(new));
+}
+
+/// Takes a new text unless the person edited the old text.
 fn merge_field(draft: &mut String, old: &str, new: &str) {
     if draft == old {
         new.clone_into(draft);

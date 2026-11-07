@@ -90,8 +90,14 @@ pub fn find_clone_file(paths: &Paths, start: &Path) -> Option<PathBuf> {
         if plain.is_file() {
             return Some(plain);
         }
-        // A linked worktree uses the connection of the main worktree.
-        let main = paths.plain_clone_file(location.common_dir.parent()?);
+        // A linked worktree uses the connection of the main worktree, only if Git made the link.
+        // The connection of the home directory applies only to the home directory.
+        let main = gitdir::main_worktree_of_linked(&location.worktree)?;
+        let home = std::env::home_dir().and_then(|home| gitdir::real_path(&home).ok());
+        if home.as_deref() == Some(main.as_path()) {
+            return None;
+        }
+        let main = paths.plain_clone_file(&main);
         return main.is_file().then_some(main);
     }
     plain_project_root(paths, start).map(|root| paths.plain_clone_file(&root))
@@ -938,6 +944,25 @@ mod tests {
                 agent: None,
             },
         )?;
+        assert_eq!(caller.scope, ProjectScope::Listed(Vec::new()));
+        Ok(())
+    }
+
+    /// A `.git` file from another author must not connect a directory to a plain project.
+    #[test]
+    fn a_git_file_that_git_did_not_make_selects_no_plain_project() -> Result<()> {
+        let temp = tempfile::tempdir().map_err(|err| LenkaError::io("temp", &err))?;
+        let paths = Paths::new(temp.path().join("config"), temp.path().join("data"));
+        let work = temp.path().join("work");
+        let sub = work.join("sub");
+        fs::create_dir_all(&sub).map_err(|err| LenkaError::io("mkdir", &err))?;
+        create_project(&paths, &work, Some("api"), &Location::Shared)?;
+        let evil = temp.path().join("downloads").join("evil");
+        fs::create_dir_all(&evil).map_err(|err| LenkaError::io("mkdir", &err))?;
+        fs::write(evil.join(".git"), format!("gitdir: {}\n", sub.display()))
+            .map_err(|err| LenkaError::io("write", &err))?;
+        assert_eq!(find_clone_file(&paths, &evil), None);
+        let caller = caller_for(&paths, &evil, setup(Actor::Agent, None))?;
         assert_eq!(caller.scope, ProjectScope::Listed(Vec::new()));
         Ok(())
     }

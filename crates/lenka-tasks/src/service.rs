@@ -3203,7 +3203,6 @@ fn holder_for<'a>(claim: &'a Claim, caller: &Caller) -> &'a str {
     }
 }
 
-/// Refuses a change of a closed task. Only [`TaskService::set_status`] opens a closed task.
 /// Describes a status change for a notice. A status change has no version file.
 fn status_change_meta(
     state: &State,
@@ -3224,6 +3223,7 @@ fn status_change_meta(
     }
 }
 
+/// Refuses a change of a closed task. Only [`TaskService::set_status`] opens a closed task.
 fn check_not_closed(meta: &TaskMeta) -> Result<()> {
     if meta.state.status.is_closed() {
         return Err(LenkaError::invalid_argument(format!(

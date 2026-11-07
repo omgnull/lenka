@@ -9,10 +9,10 @@ use crate::files::{Links, read_text_limited};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The Git location of a directory.
 /// The limit of a small file that Git keeps for a worktree.
 const GIT_FILE_LIMIT: u64 = 64 * 1024;
 
+/// The Git location of a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitLocation {
     /// The top directory of the worktree.
@@ -80,6 +80,36 @@ pub fn locate(start: &Path) -> Option<GitLocation> {
         }
     }
     None
+}
+
+/// Returns the main worktree of a linked worktree, only if Git made the link.
+///
+/// A `.git` file can come from another author, and it can name any directory. So the file must
+/// name `<main>/.git/worktrees/<name>`, and the file `gitdir` there must name this `.git` file.
+#[must_use]
+pub fn main_worktree_of_linked(worktree: &Path) -> Option<PathBuf> {
+    let worktree = real_path(worktree).ok()?;
+    let dot_git = worktree.join(".git");
+    if !fs::symlink_metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let git_dir = read_git_file(&dot_git, &worktree)?;
+    let list = git_dir.parent()?;
+    let common = list.parent()?;
+    if list.file_name()? != "worktrees" || common.file_name()? != ".git" {
+        return None;
+    }
+    let back = read_text_limited(&git_dir.join("gitdir"), Links::Refuse, GIT_FILE_LIMIT).ok()?;
+    let back = Path::new(back.trim());
+    let back = if back.is_absolute() {
+        back.to_path_buf()
+    } else {
+        git_dir.join(back)
+    };
+    if real_path(&back).ok()? != real_path(&dot_git).ok()? {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
 }
 
 fn read_git_file(file: &Path, base: &Path) -> Option<PathBuf> {

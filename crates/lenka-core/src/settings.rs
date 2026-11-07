@@ -40,6 +40,10 @@ pub struct TypeDef {
 }
 
 /// The limits and defaults of a project.
+///
+/// An unknown key is an error, so that a wrong name such as `strict_flsh` does not pass in
+/// silence. An older lenka also refuses a new key. So a new key needs a new `format_version`, or
+/// a merge from a newer clone stops the older clones.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {

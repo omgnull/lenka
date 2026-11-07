@@ -262,13 +262,24 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
     let mut line = Vec::new();
     loop {
         line.clear();
-        match input.read_until(b'\n', &mut line).await {
+        match (&mut *input)
+            .take(EARLY_LINE_LIMIT + 1)
+            .read_until(b'\n', &mut line)
+            .await
+        {
             Ok(count) if count > 0 => {}
             _ => return,
+        }
+        // `rmcp` drops a line over its limit, so a longer line has no use. Skip the rest of it.
+        if line.len() as u64 > EARLY_LINE_LIMIT && line.last() != Some(&b'\n') {
+            if !skip_line(input).await {
+                return;
+            }
+            continue;
         }
         let kind = early_line_kind(&line);
         if kind != EarlyLine::Drop && writer.write_all(&line).await.is_err() {
@@ -283,6 +294,31 @@ where
         reason = "The end of the input ends the session, also after a read error."
     )]
     let _ = tokio::io::copy_buf(input, writer).await;
+}
+
+/// The longest line before the session starts. `rmcp` has the same limit for a line.
+const EARLY_LINE_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Reads to the end of a line with no copy. Returns `false` at the end of the input.
+async fn skip_line<R>(input: &mut R) -> bool
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt as _;
+    loop {
+        let Ok(buffer) = input.fill_buf().await else {
+            return false;
+        };
+        if buffer.is_empty() {
+            return false;
+        }
+        if let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+            input.consume(end + 1);
+            return true;
+        }
+        let length = buffer.len();
+        input.consume(length);
+    }
 }
 
 /// What a line of the client means before the session starts.
@@ -310,22 +346,36 @@ fn early_line_kind(line: &[u8]) -> EarlyLine {
     if !message.contains_key("id") {
         return EarlyLine::Drop;
     }
-    // `rmcp` answers a request with wrong parameters, and the session does not start.
-    let has = |key: &str| {
-        message
-            .get("params")
-            .and_then(|params| params.get(key))
-            .is_some()
-    };
-    let starts = match method {
-        "ping" | "server/discover" => false,
-        "initialize" => has("protocolVersion") && has("capabilities") && has("clientInfo"),
-        _ => has("_meta"),
-    };
-    if starts {
+    if method == "ping" || method == "server/discover" {
+        return EarlyLine::Other;
+    }
+    if starts_session(line) {
         EarlyLine::SessionStart
     } else {
         EarlyLine::Other
+    }
+}
+
+/// Tells if `rmcp` starts the session with this request. `rmcp` answers a request that it refuses,
+/// and it waits for the next line. So this check uses the types and the rules of `rmcp` 3.9.
+fn starts_session(line: &[u8]) -> bool {
+    use rmcp::model::{ClientJsonRpcMessage, ClientRequest, GetMeta as _};
+    let Ok(ClientJsonRpcMessage::Request(request)) =
+        serde_json::from_slice::<ClientJsonRpcMessage>(line)
+    else {
+        return false;
+    };
+    match &request.request {
+        ClientRequest::InitializeRequest(_) => true,
+        ClientRequest::PingRequest(_) | ClientRequest::DiscoverRequest(_) => false,
+        other => {
+            let meta = other.get_meta();
+            meta.missing_required_keys(&ProtocolVersion::V_2026_07_28)
+                .is_empty()
+                && meta
+                    .protocol_version()
+                    .is_some_and(|version| VERSIONS.contains(&version))
+        }
     }
 }
 
@@ -337,7 +387,7 @@ mod tests {
     fn notifications_pass_after_the_session_starts() -> Result<()> {
         let text = concat!(
             "{\"method\":\"notifications/a\"}\n",
-            "{\"id\":1,\"method\":\"tools/list\",\"params\":{\"_meta\":{}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"c\",\"version\":\"1\"}}}\n",
             "{\"method\":\"notifications/b\"}\n",
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -347,8 +397,27 @@ mod tests {
         runtime.block_on(copy_session_input(&mut text.as_bytes(), &mut output));
         let output = String::from_utf8_lossy(&output);
         assert!(!output.contains("notifications/a"), "{output}");
-        assert!(output.contains("tools/list"), "{output}");
+        assert!(output.contains("initialize"), "{output}");
         assert!(output.contains("notifications/b"), "{output}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_dropped_with_no_copy() -> Result<()> {
+        let long = "x".repeat(usize::try_from(EARLY_LINE_LIMIT).unwrap_or(usize::MAX) + 10);
+        let text = format!(
+            "{long}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|err| LenkaError::io("Start the runtime", &err))?;
+        let mut output = Vec::new();
+        runtime.block_on(copy_session_input(&mut text.as_bytes(), &mut output));
+        assert_eq!(
+            String::from_utf8_lossy(&output),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n"
+        );
         Ok(())
     }
 
@@ -366,9 +435,16 @@ mod tests {
         );
         assert_eq!(
             kind(
-                r#"{"id":1,"method":"initialize","params":{"protocolVersion":"x","capabilities":{},"clientInfo":{}}}"#
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}"#
             ),
             EarlyLine::SessionStart
+        );
+        // `rmcp` refuses these requests, and it waits for the next line.
+        assert_eq!(
+            kind(
+                r#"{"id":1,"method":"initialize","params":{"protocolVersion":1,"capabilities":{},"clientInfo":{}}}"#
+            ),
+            EarlyLine::Other
         );
         assert_eq!(
             kind(r#"{"id":1,"method":"initialize","params":{}}"#),
@@ -377,8 +453,15 @@ mod tests {
         assert_eq!(kind(r#"{"id":1,"method":"tools/list"}"#), EarlyLine::Other);
         assert_eq!(
             kind(r#"{"id":1,"method":"tools/list","params":{"_meta":{}}}"#),
-            EarlyLine::SessionStart
+            EarlyLine::Other
         );
+        let meta = |version: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"{version}","io.modelcontextprotocol/clientCapabilities":{{}}}}}}}}"#
+            )
+        };
+        assert_eq!(kind(&meta("1999-01-01")), EarlyLine::Other);
+        assert_eq!(kind(&meta("2026-07-28")), EarlyLine::SessionStart);
         assert_eq!(kind("not json"), EarlyLine::Other);
         assert_eq!(kind(r#"{"id":1,"result":{}}"#), EarlyLine::Drop);
     }

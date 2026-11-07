@@ -2316,6 +2316,59 @@ fn a_date_that_a_person_types_stays_after_another_change() {
     assert_eq!(detail.start_input_text(), "2026-0");
 }
 
+/// A saved date with a space around it is not unsaved text.
+#[test]
+fn a_saved_date_with_a_space_is_not_unsaved() {
+    let (_fixture, mut harness, _ids) = start_with_tasks(&["A task"]);
+    open_detail(&mut harness, "A task");
+    type_into(&mut harness, "Start", " 2026-05-01");
+    // A click in the other date field ends the focus of the start field, and the app saves.
+    harness.get_by_label("Due").click();
+    harness.run();
+    wait_until(&mut harness, "the date saves", |harness| {
+        harness
+            .state()
+            .app()
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.data.meta.front.start.is_some())
+    });
+    let detail = harness.state().app().detail.as_ref().expect("a panel");
+    assert_eq!(detail.start_input_text(), "2026-05-01");
+    assert!(!detail.has_unsaved_text());
+}
+
+/// A date that another writer changed replaces a date field that the person did not touch.
+#[test]
+fn a_changed_date_replaces_an_untouched_date_field() {
+    let (fixture, mut harness, ids) = start_with_tasks(&["A task"]);
+    open_detail(&mut harness, "A task");
+    let (_host, tasks) = fixture.other_process();
+    tasks
+        .update(
+            &fixture.person(),
+            ids[0],
+            TaskPatch {
+                expected_version: 1,
+                start: Some(Some(
+                    lenka_plugin_api::Day::parse("2026-05-01").expect("a day"),
+                )),
+                ..TaskPatch::default()
+            },
+        )
+        .expect("a change");
+    wait_until(&mut harness, "the new version loads", |harness| {
+        harness
+            .state()
+            .app()
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.data.meta.state.version == 2)
+    });
+    let detail = harness.state().app().detail.as_ref().expect("a panel");
+    assert_eq!(detail.start_input_text(), "2026-05-01");
+}
+
 /// The text of each small field counts as unsaved work, so that the app asks before it loses it.
 #[test]
 fn text_in_a_small_field_counts_as_unsaved() {
