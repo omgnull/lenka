@@ -1944,13 +1944,14 @@ fn a_release_refuses_evidence() -> TestResult {
 fn a_closed_output_pipe_causes_no_panic() -> TestResult {
     let (_temp, machine) = machine()?;
     let repo = machine.project("api")?;
-    let mut child = machine
+    // The read end closes before the start, so each write of the child fails.
+    let (reader, writer) = std::io::pipe()?;
+    drop(reader);
+    let output = machine
         .command(&repo, &["plugins"])
-        .stdout(std::process::Stdio::piped())
+        .stdout(writer)
         .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    drop(child.stdout.take());
-    let output = child.wait_with_output()?;
+        .output()?;
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(!message.contains("panicked"), "{message}");
     assert_ne!(output.status.code(), Some(101));
