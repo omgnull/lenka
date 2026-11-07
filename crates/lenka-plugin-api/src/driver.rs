@@ -109,6 +109,15 @@ pub trait WriteTxn: fmt::Debug {
     /// Returns an error if the write fails.
     fn journal_clear(&mut self) -> Result<()>;
 
+    /// Flushes the empty journal to the disk. Call this before a program other than lenka changes
+    /// the documents. Without the flush, a power failure can bring back an old journal, and its
+    /// replay can then replace the changes of that program.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush fails.
+    fn journal_flush(&mut self) -> Result<()>;
+
     /// Selects if each `put` and `append` also flushes to the disk.
     fn set_strict_flush(&mut self, strict: bool);
 

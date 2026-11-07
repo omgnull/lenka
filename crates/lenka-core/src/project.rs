@@ -71,6 +71,26 @@ impl Locked<'_> {
         secret::check(&commit.checks, commit.secret_policy)?;
         journal::run(self.txn.as_mut(), &commit.ops, &self.project.crash)
     }
+
+    /// Makes the empty journal safe against a power failure. Call this before another program,
+    /// such as `git merge`, changes the documents under this lock.
+    ///
+    /// Without the flush, a power failure can bring back the journal of an earlier write. Its
+    /// replay then puts the old text over the changes of the other program. The flush does not
+    /// remove the recovery of the earlier write:
+    ///
+    /// - With `strict_flush`, the earlier write flushed each document before it emptied the
+    ///   journal.
+    /// - A file system that keeps the order of writes also stores the earlier documents first.
+    /// - On another file system, a write can already lose its newest changes, as the
+    ///   [`journal`] module tells.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flush fails.
+    pub fn flush_journal(&mut self) -> Result<()> {
+        self.txn.journal_flush()
+    }
 }
 
 /// An open project.

@@ -409,6 +409,24 @@ impl WriteTxn for LocalTxn<'_> {
         Ok(())
     }
 
+    fn journal_flush(&mut self) -> Result<()> {
+        let path = journal_path()?;
+        self.driver.check_no_symlink(&path)?;
+        // Windows flushes a file only through a handle with write access.
+        let handle = match OpenOptions::new()
+            .write(true)
+            .open(self.driver.file_of(&path))
+        {
+            Ok(handle) => handle,
+            // With no journal file, a power failure cannot bring back a journal.
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(LenkaError::io("Open the journal", &err)),
+        };
+        handle
+            .sync_all()
+            .map_err(|err| LenkaError::io("Flush the journal", &err))
+    }
+
     fn set_strict_flush(&mut self, strict: bool) {
         self.strict_flush = strict;
     }
@@ -663,6 +681,37 @@ mod tests {
             txn.journal_clear()?;
         }
         assert_eq!(driver.journal_read()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_journal_flush_works_with_and_without_a_journal_file() -> Result<()> {
+        let (temp, driver) = driver()?;
+        let mut txn = driver.begin()?;
+        txn.journal_flush()?;
+        assert!(!temp.path().join(JOURNAL_PATH).exists());
+        txn.journal_write(b"[]")?;
+        txn.journal_clear()?;
+        txn.journal_flush()?;
+        drop(txn);
+        assert_eq!(driver.journal_read()?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_flush_refuses_a_symlink() -> Result<()> {
+        let (temp, driver) = driver()?;
+        let journal = temp.path().join(JOURNAL_PATH);
+        if let Some(parent) = journal.parent() {
+            fs::create_dir_all(parent).map_err(|err| LenkaError::io("test", &err))?;
+        }
+        let outside = temp.path().join("outside");
+        fs::write(&outside, "x").map_err(|err| LenkaError::io("test", &err))?;
+        std::os::unix::fs::symlink(&outside, &journal)
+            .map_err(|err| LenkaError::io("test", &err))?;
+        let mut txn = driver.begin()?;
+        assert!(txn.journal_flush().is_err());
         Ok(())
     }
 

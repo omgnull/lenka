@@ -1306,8 +1306,10 @@ pub fn sync(project: &Project, secrets: OutgoingSecrets) -> Result<SyncReport> {
                 "fetch",
                 ["fetch", "-q", "--no-tags", remote, refspec.as_str()],
             )?;
-            project.write_locked(|_| {
+            project.write_locked(|locked| {
                 report.note_commit(commit_all(&git, "lenka: sync")?);
+                // The merge changes documents, and an old journal must not come back over them.
+                locked.flush_journal()?;
                 merge(&git, &tracking, &mut report)
             })?;
             if report.has_conflict() {
